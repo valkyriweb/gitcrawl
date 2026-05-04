@@ -4,6 +4,13 @@
 
 - Force embedding refreshes when the embedding input rune cap changes, so stale larger-cap vectors are not reused.
 
+## 0.1.2 - 2026-05-01
+
+- Polish the TUI cluster browser interaction model, including separate cluster/member action menus, softer row state colors, stable viewport refresh, bidirectional age sorting, and buffered trackpad scrolling.
+- Add OpenAI embedding retry handling for transient failures and cap oversized embedding inputs before sending them upstream.
+- Improve GitHub pagination and retry behavior by surfacing page totals and honoring retry and rate-limit response headers.
+- Harden human-key hash parsing and tidy the module graph.
+
 ## 0.1.1 - 2026-04-30
 
 - Fix portable store refreshes when local Git pull configuration tries to rebase onto multiple branch merge refs.
