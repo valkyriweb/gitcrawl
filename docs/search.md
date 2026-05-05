@@ -100,7 +100,7 @@ There are two ways to run cached searches:
 | `gitcrawl search issues|prs ...` | Human use; mixes naturally with the rest of the gitcrawl CLI |
 | `gitcrawl gh search issues|prs ...` | Agents and scripts that call `gh` directly — symlinked as `gh` or `gitcrawl-gh` it is invisible to callers |
 
-Both paths share the same local cache and produce gh-shaped JSON. The shim adds the additional `gh issue/pr view`, `gh issue/pr list`, `gh pr checks`, `gh run`, and `xcache` surface — see [gh shim](./gh-shim).
+Both paths share the same local cache and produce gh-shaped JSON. The shim adds the additional `gh issue/pr view`, `gh issue/pr list`, `gh pr checks`, `gh run`, and `xcache` surface — see [gh shim](/gh-shim/).
 
 ## Combining with sync
 

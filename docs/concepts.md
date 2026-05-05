@@ -17,7 +17,7 @@ The handful of nouns gitcrawl uses, and how they connect.
 
 A **repository** is the `owner/repo` you sync. Every gitcrawl command takes one, and most state in SQLite is keyed by it. You can mirror as many repos as you like into a single `gitcrawl.db`; commands always scope to the one you name.
 
-The mirror is metadata-first: titles, bodies, authors, labels, state, timestamps, and IDs land in SQLite immediately. Comments, reviews, review comments, and full PR detail (files, commits, checks, workflow runs) are opt-in on a per-sync basis (see [Sync](./sync)).
+The mirror is metadata-first: titles, bodies, authors, labels, state, timestamps, and IDs land in SQLite immediately. Comments, reviews, review comments, and full PR detail (files, commits, checks, workflow runs) are opt-in on a per-sync basis (see [Sync](/sync/)).
 
 ## Thread
 
@@ -78,7 +78,7 @@ Per-cluster maintainer overrides let you correct what the algorithm produced wit
 - **Member exclusion** (`exclude-cluster-member`/`include-cluster-member`) — pulls a specific thread out of a cluster and remembers why.
 - **Canonical member** (`set-cluster-canonical`) — pins which thread represents the cluster.
 
-See [Governance](./governance) for the full workflow.
+See [Governance](/governance/) for the full workflow.
 
 ## Run
 
@@ -88,7 +88,7 @@ Every sync, embed, and cluster operation records a **run** in `run_records` with
 
 A **portable store** is a Git-backed publish target for a `gitcrawl.db` plus its derived bodies, designed for sharing a local cache across agents or machines without a hosted service.
 
-`gitcrawl init --portable-store https://github.com/org/repo` clones a portable store into `~/.config/gitcrawl/portable/`, points the runtime at it, and `gitcrawl portable prune --body-chars 256` keeps the published payload small. Read-only commands run against portable stores refresh the checkout before reading. See [Portable stores](./portable-stores).
+`gitcrawl init --portable-store https://github.com/org/repo` clones a portable store into `~/.config/gitcrawl/portable/`, points the runtime at it, and `gitcrawl portable prune --body-chars 256` keeps the published payload small. Read-only commands run against portable stores refresh the checkout before reading. See [Portable stores](/portable-stores/).
 
 ## Cache
 
@@ -97,4 +97,4 @@ The `cache/` directory under `~/.config/gitcrawl/` holds:
 - `cache/gh-shim/` — the short-lived fallthrough cache for the `gh` shim, keyed by config path, CWD, `GH_HOST`, `GH_REPO`, and command args. Inspect or clean it with `gitcrawl gh xcache stats|keys|gc|flush`.
 - `cache/pr/` — hydrated PR detail blobs used to answer `gh pr view`, `gh pr checks`, and `gh run` reads from local SQLite.
 
-See [gh shim](./gh-shim) for the cache key composition and TTL behavior.
+See [gh shim](/gh-shim/) for the cache key composition and TTL behavior.

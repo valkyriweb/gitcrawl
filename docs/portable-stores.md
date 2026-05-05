@@ -108,5 +108,5 @@ Other agents and machines pull the new commit on their next read-only command.
 
 ## See also
 
-- [Sync](./sync) — what gets written into the database that ends up in the portable store
-- [gh shim](./gh-shim) — agents reading a shared portable store benefit doubly from the shim's local-first answers
+- [Sync](/sync/) — what gets written into the database that ends up in the portable store
+- [gh shim](/gh-shim/) — agents reading a shared portable store benefit doubly from the shim's local-first answers

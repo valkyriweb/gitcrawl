@@ -12,7 +12,7 @@ permalink: /
 A local-first GitHub issue and pull request crawler for maintainer triage. Sync, search, cluster, and review related threads from a SQLite cache that lives entirely on your machine.
 {: .fs-6 .fw-300 }
 
-[Quickstart](./quickstart){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
+[Quickstart](/quickstart/){: .btn .btn-primary .fs-5 .mb-4 .mb-md-0 .mr-2 }
 [View on GitHub](https://github.com/openclaw/gitcrawl){: .btn .fs-5 .mb-4 .mb-md-0 }
 
 ---
@@ -34,16 +34,16 @@ A local-first GitHub issue and pull request crawler for maintainer triage. Sync,
 <div class="code-example" markdown="1">
 
 ### I want to try it
-[Quickstart](./quickstart) walks you from `git clone` to a populated cluster view in five minutes.
+[Quickstart](/quickstart/) walks you from `git clone` to a populated cluster view in five minutes.
 
 ### I want to wire up an agent
-The [`gh` shim](./gh-shim) is the fastest way to cut GitHub API load — point your agent at `gitcrawl-gh`, keep the agent's `gh` calls intact.
+The [`gh` shim](/gh-shim/) is the fastest way to cut GitHub API load — point your agent at `gitcrawl-gh`, keep the agent's `gh` calls intact.
 
 ### I want to triage a busy repo
-Read [Sync](./sync) to bring data local, then [Clustering](./clustering) and the [TUI](./tui) for the maintainer workflow.
+Read [Sync](/sync/) to bring data local, then [Clustering](/clustering/) and the [TUI](/tui/) for the maintainer workflow.
 
 ### I want the full reference
-[Commands](./commands) lists every flag and JSON field. [Configuration](./configuration) covers env vars and paths.
+[Commands](/commands/) lists every flag and JSON field. [Configuration](/configuration/) covers env vars and paths.
 
 </div>
 

@@ -23,14 +23,16 @@ The shim never adds GitHub write behavior. Mutating commands (`gh issue close`, 
 
 ```bash
 # Side-by-side: agents opt in by calling `gitcrawl-gh`.
-ln -s "$(command -v gitcrawl)" /usr/local/bin/gitcrawl-gh
+mkdir -p "$HOME/bin"
+ln -sf "$(command -v gitcrawl)" "$HOME/bin/gitcrawl-gh"
 
 # Or replace the global `gh` so every caller picks up the cache automatically.
-ln -s "$(command -v gitcrawl)" /usr/local/bin/gh
-export GITCRAWL_GH_PATH=/opt/homebrew/bin/gh   # tell the shim where the real gh is
+REAL_GH="$(command -v gh)"              # capture this before shadowing gh
+ln -sf "$(command -v gitcrawl)" "$HOME/bin/gh"
+export GITCRAWL_GH_PATH="$REAL_GH"      # tell the shim where the real gh is
 ```
 
-If `GITCRAWL_GH_PATH` is unset, the shim probes common Homebrew paths and then `PATH`. Set it explicitly when you replace the global `gh` so the shim does not recurse into itself.
+Make sure `~/bin` is on `PATH` before the original `gh` location if you want the shim to be picked up as `gh`. If `GITCRAWL_GH_PATH` is unset, the shim probes common Homebrew paths and then `PATH`. Set it explicitly when you replace the global `gh` so the shim does not recurse into itself.
 
 ## Supported local reads
 
@@ -138,8 +140,8 @@ All accept `--json` for scripting.
     "pass_through_writes": 4
   },
   "commands": {
-    "gh pr view": { "entries": 30, "bytes": 184320 },
-    "gh search issues": { "entries": 14, "bytes": 18230 }
+    "pr diff": { "entries": 30, "bytes": 184320 },
+    "release view": { "entries": 14, "bytes": 18230 }
   }
 }
 ```
@@ -172,4 +174,4 @@ Pattern: replace `gh` with `gitcrawl-gh` (or symlink to `gh`) for every agent in
 
 For best results, schedule a periodic `gitcrawl refresh owner/repo` (every few minutes per repo, depending on activity) so the local mirror stays warm. The shim's `--sync-if-stale` (via `gitcrawl search`) and auto-hydration handle the rest.
 
-See [Automation](./automation) for full agent recipes and JSON contracts.
+See [Automation](/automation/) for full agent recipes and JSON contracts.

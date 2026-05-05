@@ -19,7 +19,8 @@ Five minutes from clean machine to a populated cluster view.
 # Build (or download a release archive — see Installation).
 git clone https://github.com/openclaw/gitcrawl.git
 cd gitcrawl
-go build -o /usr/local/bin/gitcrawl ./cmd/gitcrawl
+mkdir -p "$HOME/bin"
+go build -o "$HOME/bin/gitcrawl" ./cmd/gitcrawl
 
 # Create config + database under ~/.config/gitcrawl.
 gitcrawl init
@@ -36,16 +37,16 @@ Defaults written:
 ## 2. Set credentials
 
 ```bash
-export GITHUB_TOKEN=ghp_xxx                         # required for sync
-export OPENAI_API_KEY=sk-xxx                        # required for embeddings
+export GITHUB_TOKEN="<github-token>"                 # required for sync
+export OPENAI_API_KEY="<openai-api-key>"             # required for embeddings
 ```
 
 Either set them in your shell profile or store them in `~/.config/gitcrawl/config.toml`:
 
 ```toml
 [env]
-GITHUB_TOKEN = "ghp_xxx"
-OPENAI_API_KEY = "sk-xxx"
+GITHUB_TOKEN = "<github-token>"
+OPENAI_API_KEY = "<openai-api-key>"
 ```
 
 `gitcrawl doctor` confirms the credentials are visible and reports their source.
@@ -72,7 +73,7 @@ The `refresh` command runs sync → embed → cluster end to end:
 gitcrawl refresh openclaw/gitcrawl
 ```
 
-You can run the stages individually if you want finer control — see [Refresh and embed](./refresh-and-embed) and [Clustering](./clustering).
+You can run the stages individually if you want finer control — see [Refresh and embed](/refresh-and-embed/) and [Clustering](/clustering/).
 
 ## 5. Browse clusters
 
@@ -116,17 +117,18 @@ Add `--sync-if-stale 5m` to refresh the local mirror first when it is older than
 ## 7. Wire up the `gh` shim (optional)
 
 ```bash
-ln -s "$(command -v gitcrawl)" /usr/local/bin/gitcrawl-gh
+mkdir -p "$HOME/bin"
+ln -sf "$(command -v gitcrawl)" "$HOME/bin/gitcrawl-gh"
 gitcrawl-gh search issues "download stalls" -R openclaw/gitcrawl --json number,title,url
 gitcrawl-gh pr view 123 -R openclaw/gitcrawl --json number,title,state,url
 gitcrawl-gh xcache stats
 ```
 
-Most read-only `gh` calls answer locally, mutating commands pass straight through to the real `gh`. See [gh shim](./gh-shim) for the full surface.
+Most read-only `gh` calls answer locally, mutating commands pass straight through to the real `gh`. See [gh shim](/gh-shim/) for the full surface.
 
 ## Where to next
 
-- [Concepts](./concepts) — what threads, durable clusters, and embeddings actually mean
-- [Sync](./sync) — every flag for hydrating the local store
-- [Clustering](./clustering) — tuning the cluster graph for a specific repo
-- [Automation](./automation) — JSON contracts for agents and scripts
+- [Concepts](/concepts/) — what threads, durable clusters, and embeddings actually mean
+- [Sync](/sync/) — every flag for hydrating the local store
+- [Clustering](/clustering/) — tuning the cluster graph for a specific repo
+- [Automation](/automation/) — JSON contracts for agents and scripts

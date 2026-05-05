@@ -127,4 +127,4 @@ The thread stays open on GitHub; only your local triage view hides it.
 
 - It does not edit, label, comment on, or close GitHub issues. Use `gh` for that.
 - It does not retrain embeddings or reshape the underlying graph — it overlays decisions on top of the algorithm output.
-- It does not propagate to other gitcrawl installations unless you publish your database via a [portable store](./portable-stores).
+- It does not propagate to other gitcrawl installations unless you publish your database via a [portable store](/portable-stores/).

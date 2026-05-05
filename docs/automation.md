@@ -23,7 +23,7 @@ gitcrawl clusters owner/repo --json --sort size --min-size 5 \
   | jq '.clusters[] | {id, members: .member_count, latest: .latest_thread_number}'
 ```
 
-For the full per-command JSON shapes, see the individual feature pages and the [Commands reference](./commands).
+For the full per-command JSON shapes, see the individual feature pages and the [Commands reference](/commands/).
 
 ## Exit codes
 
@@ -51,7 +51,7 @@ Best for ad-hoc agent tools that should bound staleness but minimize sync calls.
 
 ### Auto-hydration via the gh shim
 
-Symlink the gitcrawl binary as `gh` (or `gitcrawl-gh`) and let the shim pull a single PR's detail when an agent calls `gh pr view` or `gh pr checks` against an unhydrated PR. See [gh shim → auto-hydration](./gh-shim#auto-hydration).
+Symlink the gitcrawl binary as `gh` (or `gitcrawl-gh`) and let the shim pull a single PR's detail when an agent calls `gh pr view` or `gh pr checks` against an unhydrated PR. See [gh shim → auto-hydration](/gh-shim/#auto-hydration).
 
 This is the lowest-overhead pattern for fleets of agents — no scheduling required.
 
@@ -61,7 +61,7 @@ Run `gitcrawl refresh owner/repo` on a cron, systemd timer, or `launchd` agent e
 
 ```cron
 # Every 5 minutes, refresh the active repos.
-*/5 * * * * /usr/local/bin/gitcrawl refresh openclaw/gitcrawl --json > /tmp/gitcrawl.openclaw.json 2>&1
+*/5 * * * * $HOME/bin/gitcrawl refresh openclaw/gitcrawl --json > /tmp/gitcrawl.openclaw.json 2>&1
 ```
 
 For multiple repos, loop in a small shell script — gitcrawl is happy to run sequentially against a shared SQLite file.

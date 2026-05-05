@@ -58,7 +58,7 @@ gitcrawl sync owner/repo --numbers 123,456 --include-comments
 
 `--numbers` is the safest way to refresh specific issues or PRs — it bypasses list ordering and the updated-time window, fetching exactly the rows you ask for. Pair it with `--include-comments` and/or `--include-pr-details` to hydrate the conversation and PR-only data at the same time.
 
-This is also what the `gh` shim uses internally for [auto-hydration](./gh-shim#auto-hydration).
+This is also what the `gh` shim uses internally for [auto-hydration](/gh-shim/#auto-hydration).
 
 ## Hydration depth
 
@@ -68,7 +68,7 @@ This is also what the `gh` shim uses internally for [auto-hydration](./gh-shim#a
 | `--include-pr-details` | PR files, commits, status checks, workflow runs |
 | `--with pr-details` | Same as `--include-pr-details` (gh-style flag) |
 
-PR details land in `pr_files`, `pr_commits`, `pr_checks`, and `pr_runs` tables and back the `gh pr view`, `gh pr checks`, and `gh run list/view` shim paths. See [gh shim](./gh-shim).
+PR details land in `pr_files`, `pr_commits`, `pr_checks`, and `pr_runs` tables and back the `gh pr view`, `gh pr checks`, and `gh run list/view` shim paths. See [gh shim](/gh-shim/).
 
 `--include-code` is accepted for compatibility but is currently a no-op.
 
@@ -150,6 +150,6 @@ gitcrawl sync owner/repo --numbers "$NUMS" --with pr-details
 
 ## See also
 
-- [Refresh and embed](./refresh-and-embed) — the wrapper that runs sync, embed, and cluster end to end
-- [gh shim](./gh-shim) — how synced PR details power `gh pr view` / `gh pr checks` / `gh run` from local cache
-- [Portable stores](./portable-stores) — sharing the synced cache across machines
+- [Refresh and embed](/refresh-and-embed/) — the wrapper that runs sync, embed, and cluster end to end
+- [gh shim](/gh-shim/) — how synced PR details power `gh pr view` / `gh pr checks` / `gh run` from local cache
+- [Portable stores](/portable-stores/) — sharing the synced cache across machines

@@ -26,13 +26,16 @@ Each tagged release publishes archives for `darwin_amd64`, `darwin_arm64`, `linu
 
 ```bash
 # Replace VERSION and PLATFORM with the values you want.
-curl -L "https://github.com/openclaw/gitcrawl/releases/download/v0.1.2/gitcrawl_0.1.2_darwin_arm64.tar.gz" \
-  | tar -xz -C /usr/local/bin gitcrawl
+VERSION=v0.1.2
+PLATFORM=darwin_arm64
+mkdir -p "$HOME/bin"
+curl -L "https://github.com/openclaw/gitcrawl/releases/download/${VERSION}/gitcrawl_${VERSION#v}_${PLATFORM}.tar.gz" \
+  | tar -xz -C "$HOME/bin" gitcrawl
 
 gitcrawl --version
 ```
 
-Browse the [releases page](https://github.com/openclaw/gitcrawl/releases) for the latest tag and the full asset list.
+Browse the [releases page](https://github.com/openclaw/gitcrawl/releases) for the latest tag and the full asset list. Use a directory that is already on your `PATH`; `~/bin` and `~/.local/bin` avoid needing elevated permissions.
 
 ## Install from source
 
@@ -54,14 +57,16 @@ The shim is the same binary. Symlink it as `gh` (replacing the real CLI) or as `
 
 ```bash
 # Side-by-side install — agents can opt in by calling `gitcrawl-gh`.
-ln -s "$(command -v gitcrawl)" /usr/local/bin/gitcrawl-gh
+mkdir -p "$HOME/bin"
+ln -sf "$(command -v gitcrawl)" "$HOME/bin/gitcrawl-gh"
 
 # Or replace the global `gh` so every agent picks up the cache automatically.
-ln -s "$(command -v gitcrawl)" /usr/local/bin/gh
-export GITCRAWL_GH_PATH="$(command -v /opt/homebrew/bin/gh)"   # point shim at the real gh
+REAL_GH="$(command -v gh)"              # capture this before shadowing gh
+ln -sf "$(command -v gitcrawl)" "$HOME/bin/gh"
+export GITCRAWL_GH_PATH="$REAL_GH"      # point shim at the real gh
 ```
 
-When invoked as `gh` or `gitcrawl-gh`, the binary auto-detects shim mode. See [the gh shim guide](./gh-shim) for details.
+When invoked as `gh` or `gitcrawl-gh`, the binary auto-detects shim mode. See [the gh shim guide](/gh-shim/) for details.
 
 ## Verify the install
 

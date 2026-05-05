@@ -91,7 +91,7 @@ Member actions:
 - Local close / reopen this thread
 - Exclude from cluster
 
-These map directly onto the [governance](./governance) commands. Anything you can do interactively, you can also script.
+These map directly onto the [governance](/governance/) commands. Anything you can do interactively, you can also script.
 
 ## Display rules
 

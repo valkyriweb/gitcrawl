@@ -62,6 +62,7 @@ Override the config root with `--config <path>` or `GITCRAWL_CONFIG`.
 | `GITCRAWL_GH_PATH` | _(probed)_ | Path to the real `gh` binary |
 | `GITCRAWL_GH_AUTO_HYDRATE` | _(on)_ | Set `0` to disable PR auto-hydration on cache miss |
 | `GITCRAWL_GH_CACHE_TTL` | `30s` for most commands | Override fallthrough cache TTL (e.g., `5m`, `1h`) |
+| `GITCRAWL_GH_CACHE_ERRORS` | _(on)_ | Set `0` to avoid caching non-zero read-only fallthroughs |
 
 ## Configuration defaults
 
@@ -158,7 +159,7 @@ stderr always carries error messages. stdout is reserved for command output.
 
 ## See also
 
-- [Configuration](./configuration) — narrative version of this reference
-- [Commands](./commands) — every command and flag, in one table
+- [Configuration](/configuration/) — narrative version of this reference
+- [Commands](/commands/) — every command and flag, in one table
 - [SPEC.md](https://github.com/openclaw/gitcrawl/blob/main/SPEC.md) — product contract
 - [CHANGELOG.md](https://github.com/openclaw/gitcrawl/blob/main/CHANGELOG.md) — what shipped recently

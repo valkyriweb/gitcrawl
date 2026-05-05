@@ -142,7 +142,7 @@ Or slice it manually:
 gitcrawl exclude-cluster-member owner/repo --id 12 --number 456 --reason "different repro"
 ```
 
-See [Governance](./governance) for the full override workflow.
+See [Governance](/governance/) for the full override workflow.
 
 ## Re-clustering and stable IDs
 
@@ -155,6 +155,6 @@ Cluster runs are recorded in `run_records` and visible via `gitcrawl runs --kind
 
 ## See also
 
-- [Governance](./governance) — close clusters, exclude members, set canonical
-- [TUI](./tui) — the interactive cluster browser
-- [Concepts](./concepts#cluster) — durable clusters and cluster kinds
+- [Governance](/governance/) — close clusters, exclude members, set canonical
+- [TUI](/tui/) — the interactive cluster browser
+- [Concepts](/concepts/#cluster) — durable clusters and cluster kinds

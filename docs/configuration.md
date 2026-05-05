@@ -47,8 +47,8 @@ embed_dimensions = 1024
 embedding_basis = "title_original"
 
 [env]
-GITHUB_TOKEN = "ghp_xxx"
-OPENAI_API_KEY = "sk-xxx"
+GITHUB_TOKEN = "<github-token>"
+OPENAI_API_KEY = "<openai-api-key>"
 
 [portable_store]
 url = "https://github.com/org/portable-store.git"
@@ -102,6 +102,7 @@ checkout_dir = "/Users/me/.config/gitcrawl/portable"
 | `GITCRAWL_GH_PATH` | Path to the real `gh` binary used for fallthrough |
 | `GITCRAWL_GH_AUTO_HYDRATE` | Set to `0` to disable PR auto-hydration on cache miss |
 | `GITCRAWL_GH_CACHE_TTL` | Override fallthrough cache TTL (e.g., `5m`, `1h`) |
+| `GITCRAWL_GH_CACHE_ERRORS` | Set to `0` to avoid caching non-zero read-only fallthroughs |
 
 If `GITCRAWL_GH_PATH` is unset, the shim probes common Homebrew install paths and then your `PATH`. Set it explicitly when you symlink the gitcrawl binary as `gh` (otherwise the shim will recurse into itself).
 

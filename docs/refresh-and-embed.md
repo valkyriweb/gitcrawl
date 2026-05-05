@@ -21,7 +21,7 @@ gitcrawl refresh owner/repo
 
 By default this performs:
 
-1. **Sync** — open + recently closed issues and PRs (see [Sync](./sync))
+1. **Sync** — open + recently closed issues and PRs (see [Sync](/sync/))
 2. **Embed** — fill `thread_vectors` for any thread whose document changed
 3. **Cluster** — rebuild durable clusters with the standard thresholds
 
@@ -127,4 +127,4 @@ Each row carries `started_at`, `finished_at`, `status`, and `stats_json` — use
 
 - **GitHub.** Sync uses standard REST endpoints; the API quota is the dominant cost on busy repos. Use `--include-comments` and `--with pr-details` selectively.
 - **OpenAI.** `text-embedding-3-small` is inexpensive but not free. `embed` is bounded by `--limit` if you want to stay under a budget on initial backfills.
-- **Disk.** Vectors and PR detail blobs grow with the repo. The portable-store flow includes `gitcrawl portable prune` to keep published payloads small — see [Portable stores](./portable-stores).
+- **Disk.** Vectors and PR detail blobs grow with the repo. The portable-store flow includes `gitcrawl portable prune` to keep published payloads small — see [Portable stores](/portable-stores/).
