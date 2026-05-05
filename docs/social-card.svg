@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">gitcrawl social card</title>
+  <desc id="desc">Local-first GitHub issue and pull request crawler for maintainer triage.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="0.48" stop-color="#eef6ff"/>
+      <stop offset="1" stop-color="#f5f7fb"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#0b1020"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#14b8a6"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="22" stdDeviation="22" flood-color="#0f172a" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <path d="M76 512C201 462 311 473 421 545C531 617 681 600 804 529C943 449 1034 456 1128 507V630H76Z" fill="#e1eefb"/>
+  <path d="M910 64h190v10H910zM910 94h144v10H910zM910 124h166v10H910z" fill="#d6e2f0"/>
+
+  <g transform="translate(76 72)">
+    <rect x="0" y="0" width="118" height="118" rx="26" fill="#0f1115"/>
+    <circle cx="38" cy="38" r="9" fill="#60a5fa"/>
+    <circle cx="38" cy="80" r="9" fill="#2dd4bf"/>
+    <circle cx="80" cy="59" r="9" fill="#93c5fd"/>
+    <path d="M38 47v24M46 41c12 6 20 10 34 17M46 77c12-6 20-10 34-17" stroke="#c7f9ff" stroke-width="6" stroke-linecap="round" fill="none"/>
+  </g>
+
+  <g transform="translate(76 232)">
+    <text x="0" y="0" fill="#0f172a" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="88" font-weight="800" letter-spacing="0">gitcrawl</text>
+    <text x="3" y="68" fill="#334155" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="32" font-weight="600" letter-spacing="0">Local-first GitHub triage.</text>
+    <text x="3" y="121" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="25" font-weight="500" letter-spacing="0">Search locally. Cache gh reads.</text>
+    <text x="3" y="159" fill="#64748b" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="25" font-weight="500" letter-spacing="0">Save the rate limit.</text>
+  </g>
+
+  <g transform="translate(76 486)">
+    <rect x="0" y="0" width="196" height="44" rx="10" fill="#0f172a"/>
+    <text x="22" y="29" fill="#e0f2fe" font-family="JetBrains Mono, SFMono-Regular, Menlo, monospace" font-size="19" font-weight="600" letter-spacing="0">gitcrawl.sh</text>
+    <rect x="216" y="0" width="210" height="44" rx="10" fill="#ffffff" stroke="#cbd5e1"/>
+    <text x="238" y="29" fill="#334155" font-family="JetBrains Mono, SFMono-Regular, Menlo, monospace" font-size="18" font-weight="600" letter-spacing="0">gh xcache stats</text>
+  </g>
+
+  <g transform="translate(640 118)" filter="url(#shadow)">
+    <rect x="0" y="0" width="474" height="338" rx="22" fill="url(#panel)"/>
+    <rect x="0" y="0" width="474" height="46" rx="22" fill="#182033"/>
+    <path d="M0 28h474v18H0z" fill="#182033"/>
+    <circle cx="28" cy="23" r="6" fill="#f87171"/>
+    <circle cx="49" cy="23" r="6" fill="#facc15"/>
+    <circle cx="70" cy="23" r="6" fill="#34d399"/>
+
+    <text x="30" y="86" fill="#93c5fd" font-family="JetBrains Mono, SFMono-Regular, Menlo, monospace" font-size="19" font-weight="600" letter-spacing="0">$ gitcrawl search prs cache</text>
+    <text x="30" y="126" fill="#e5e7eb" font-family="JetBrains Mono, SFMono-Regular, Menlo, monospace" font-size="18" letter-spacing="0">#77622  hydrated PR details</text>
+    <text x="30" y="160" fill="#e5e7eb" font-family="JetBrains Mono, SFMono-Regular, Menlo, monospace" font-size="18" letter-spacing="0">#77481  Actions log cache</text>
+    <text x="30" y="194" fill="#e5e7eb" font-family="JetBrains Mono, SFMono-Regular, Menlo, monospace" font-size="18" letter-spacing="0">#77109  local issue thread</text>
+
+    <rect x="30" y="228" width="414" height="70" rx="14" fill="#0b1326" stroke="#334155"/>
+    <text x="54" y="260" fill="#a7f3d0" font-family="JetBrains Mono, SFMono-Regular, Menlo, monospace" font-size="16" letter-spacing="0">local_hits        112</text>
+    <text x="54" y="284" fill="#bfdbfe" font-family="JetBrains Mono, SFMono-Regular, Menlo, monospace" font-size="16" letter-spacing="0">fallback_hits      70</text>
+    <path d="M272 264h112" stroke="url(#accent)" stroke-width="10" stroke-linecap="round"/>
+  </g>
+
+  <g transform="translate(858 450)">
+    <path d="M40 32C92 0 145 6 190 40M40 32c51 55 105 70 178 42M190 40c19 13 29 24 28 34" stroke="#2563eb" stroke-width="5" stroke-linecap="round" fill="none"/>
+    <circle cx="40" cy="32" r="15" fill="#2563eb"/>
+    <circle cx="190" cy="40" r="15" fill="#14b8a6"/>
+    <circle cx="218" cy="74" r="15" fill="#38bdf8"/>
+    <circle cx="112" cy="86" r="10" fill="#64748b"/>
+  </g>
+</svg>

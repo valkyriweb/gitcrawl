@@ -10,6 +10,7 @@ const outDir = path.join(root, "dist", "docs-site");
 const repoBase = "https://github.com/openclaw/gitcrawl";
 const repoEditBase = `${repoBase}/edit/main/docs`;
 const cname = readCname();
+const siteBase = cname ? `https://${cname}` : "";
 
 const sections = [
   ["Start", ["index.md", "installation.md", "quickstart.md", "concepts.md"]],
@@ -63,6 +64,8 @@ for (const page of pages) {
 }
 
 fs.writeFileSync(path.join(outDir, "favicon.svg"), faviconSvg(), "utf8");
+copyStaticAsset("social-card.svg");
+copyStaticAsset("social-card.png");
 fs.writeFileSync(path.join(outDir, ".nojekyll"), "", "utf8");
 if (cname) fs.writeFileSync(path.join(outDir, "CNAME"), cname, "utf8");
 validateLinks(outDir);
@@ -73,6 +76,11 @@ function readCname() {
     if (fs.existsSync(candidate)) return fs.readFileSync(candidate, "utf8").trim();
   }
   return "";
+}
+
+function copyStaticAsset(name) {
+  const source = path.join(docsDir, name);
+  if (fs.existsSync(source)) fs.copyFileSync(source, path.join(outDir, name));
 }
 
 function parseFrontmatter(raw) {
@@ -360,6 +368,23 @@ function layout({ page, html, toc, prev, next, sectionName }) {
   const articleClass = isHome ? "doc doc-home" : "doc";
   const tocBlock = isHome ? "" : toc;
   const titleSuffix = isHome ? "gitcrawl" : `${escapeHtml(page.title)} — gitcrawl`;
+  const canonicalUrl = pageCanonicalUrl(page);
+  const socialImage = siteBase ? `${siteBase}/social-card.png` : `${rootPrefix}social-card.png`;
+  const socialMeta = [
+    ["link", "rel", "canonical", "href", canonicalUrl],
+    ["meta", "property", "og:type", "content", "website"],
+    ["meta", "property", "og:site_name", "content", "gitcrawl"],
+    ["meta", "property", "og:title", "content", titleSuffix],
+    ["meta", "property", "og:description", "content", "Local-first GitHub issue and pull request crawler for maintainer triage."],
+    ["meta", "property", "og:url", "content", canonicalUrl],
+    ["meta", "property", "og:image", "content", socialImage],
+    ["meta", "property", "og:image:width", "content", "1200"],
+    ["meta", "property", "og:image:height", "content", "630"],
+    ["meta", "name", "twitter:card", "content", "summary_large_image"],
+    ["meta", "name", "twitter:title", "content", titleSuffix],
+    ["meta", "name", "twitter:description", "content", "Local-first GitHub issue and pull request crawler for maintainer triage."],
+    ["meta", "name", "twitter:image", "content", socialImage],
+  ].map(tagHtml).join("\n  ");
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -367,6 +392,7 @@ function layout({ page, html, toc, prev, next, sectionName }) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${titleSuffix}</title>
   <meta name="description" content="Local-first GitHub issue and pull request crawler for maintainer triage.">
+  ${socialMeta}
   <link rel="icon" href="${rootPrefix}favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -397,6 +423,17 @@ function layout({ page, html, toc, prev, next, sectionName }) {
   <script>${js()}</script>
 </body>
 </html>`;
+}
+
+function pageCanonicalUrl(page) {
+  if (!siteBase) return page.outRel;
+  if (page.outRel === "index.html") return `${siteBase}/`;
+  const rel = page.outRel.endsWith("/index.html") ? page.outRel.slice(0, -"index.html".length) : page.outRel;
+  return `${siteBase}/${rel}`;
+}
+
+function tagHtml([tag, k1, v1, k2, v2]) {
+  return tag === "link" ? `<link ${k1}="${v1}" ${k2}="${escapeAttr(v2)}">` : `<meta ${k1}="${v1}" ${k2}="${escapeAttr(v2)}">`;
 }
 
 function standardHero(page, sectionName, editUrl) {
