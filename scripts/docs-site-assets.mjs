@@ -70,6 +70,14 @@ body:not(.home) .doc>h1:first-child{display:none}
 .doc :is(h2,h3,h4) .anchor:hover{opacity:1;color:var(--accent);text-decoration:none}
 .doc p{margin:0 0 1.05em}
 .doc-home>p:first-of-type{font-size:1.12rem;color:var(--text-soft);line-height:1.6;margin:0 0 1.3em;max-width:60ch}
+.home-actions{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 1.7em!important}
+.home-actions a{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:1px solid var(--line);border-radius:8px;padding:8px 14px;background:var(--paper);color:var(--ink);font-weight:600;font-size:.94rem;line-height:1.2;text-decoration:none;box-shadow:0 1px 2px var(--shadow);transition:transform .14s,border-color .14s,background .14s,color .14s,box-shadow .14s}
+.home-actions a:hover{text-decoration:none;transform:translateY(-1px);border-color:var(--accent);box-shadow:0 4px 12px var(--shadow)}
+.home-actions a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.home-actions a:first-child{background:var(--accent);border-color:var(--accent);color:#fff;box-shadow:0 3px 10px var(--ring)}
+.home-actions a:first-child:hover{background:var(--accent-strong);border-color:var(--accent-strong);color:#fff}
+.home-actions a:first-child::before{content:"↗";font-size:.9em;margin-right:8px}
+.home-actions a[href*="github.com"]::before{content:"";width:15px;height:15px;margin-right:8px;background:currentColor;clip-path:path("M7.5 0C3.36 0 0 3.45 0 7.7c0 3.4 2.15 6.28 5.13 7.3.38.07.51-.17.51-.37v-1.31c-2.08.46-2.52-1.03-2.52-1.03-.34-.89-.83-1.12-.83-1.12-.68-.48.05-.47.05-.47.75.05 1.15.79 1.15.79.67 1.17 1.75.83 2.18.64.07-.5.26-.83.47-1.02-1.66-.2-3.41-.85-3.41-3.78 0-.83.29-1.52.77-2.05-.08-.2-.34-1.02.07-2.02 0 0 .63-.21 2.06.78.6-.17 1.24-.26 1.88-.26.64 0 1.28.09 1.88.26 1.43-.99 2.06-.78 2.06-.78.41 1 .15 1.82.07 2.02.48.53.77 1.22.77 2.05 0 2.94-1.75 3.58-3.42 3.78.27.24.51.72.51 1.45v2.1c0 .2.14.44.52.37A7.7 7.7 0 0 0 15 7.7C15 3.45 11.64 0 7.5 0Z")}
 .doc ul,.doc ol{padding-left:1.3rem;margin:0 0 1.15em}
 .doc li{margin:.25em 0}
 .doc li>p{margin:0 0 .4em}

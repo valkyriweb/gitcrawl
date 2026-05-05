@@ -172,7 +172,9 @@ function markdownToHtml(markdown, currentRel) {
 
   const flushParagraph = () => {
     if (!paragraph.length) return;
-    html.push(`<p>${inline(paragraph.join(" "), currentRel)}</p>`);
+    const text = paragraph.join(" ");
+    const className = currentRel === "index.md" && /^\[Quickstart\]\([^)]*\)\s+\[View on GitHub\]\(/.test(text) ? ' class="home-actions"' : "";
+    html.push(`<p${className}>${inline(text, currentRel)}</p>`);
     paragraph = [];
   };
   const closeList = () => {
