@@ -41,8 +41,16 @@ func (a *App) runGHRunList(ctx context.Context, args []string) error {
 	if err != nil {
 		return localGHUnsupported(err)
 	}
+	branch := strings.TrimSpace(*branchRaw)
+	if branch != "" && strings.TrimSpace(*commitRaw) == "" {
+		if number, findErr := a.findGHPullRequestNumberByBranch(ctx, repoValue, branch); findErr == nil {
+			if _, hydrateErr := a.ensureFreshGHPullRequestCache(ctx, repoValue, number); hydrateErr != nil {
+				return hydrateErr
+			}
+		}
+	}
 	runs, err := a.localGHWorkflowRuns(ctx, repoValue, store.WorkflowRunListOptions{
-		Branch:  strings.TrimSpace(*branchRaw),
+		Branch:  branch,
 		HeadSHA: strings.TrimSpace(*commitRaw),
 		Limit:   limit,
 	})

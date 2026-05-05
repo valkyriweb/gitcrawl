@@ -4,7 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/openclaw/gitcrawl/internal/config"
+	"github.com/openclaw/gitcrawl/internal/store"
 )
 
 func TestGHShimViewAndListUseLocalCache(t *testing.T) {
@@ -93,5 +98,84 @@ func TestGHShimViewAndListUseLocalCache(t *testing.T) {
 	}
 	if len(list) != 1 || int(list[0]["number"].(float64)) != 10 {
 		t.Fatalf("filtered list = %#v", list)
+	}
+}
+
+func TestGHShimAutoHydratesPRDetailsOnMiss(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	st, err := store.Open(ctx, cfg.DBPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	for _, table := range []string{"pull_request_checks", "pull_request_commits", "pull_request_files", "pull_request_details", "github_workflow_runs", "threads", "repositories"} {
+		if _, err := st.DB().ExecContext(ctx, "delete from "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/openclaw/openclaw":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 123, "open_issues_count": 1})
+		case "/repos/openclaw/openclaw/issues/12":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": 12, "number": 12, "state": "open", "title": "Manifest cache update",
+				"body": "", "html_url": "https://github.com/openclaw/openclaw/pull/12",
+				"labels": []map[string]any{}, "assignees": []map[string]any{},
+				"user":         map[string]any{"login": "bob", "type": "User"},
+				"pull_request": map[string]any{"url": "https://api.github.test/repos/openclaw/openclaw/pulls/12"},
+			})
+		case "/repos/openclaw/openclaw/pulls/12":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 12, "head": map[string]any{"sha": "auto123", "ref": "auto-branch", "repo": map[string]any{"full_name": "openclaw/openclaw"}},
+				"base": map[string]any{"sha": "base123"}, "mergeable_state": "clean", "changed_files": 1,
+			})
+		case "/repos/openclaw/openclaw/pulls/12/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"filename": "auto.go", "status": "modified"}})
+		case "/repos/openclaw/openclaw/pulls/12/commits":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"sha": "commit123", "commit": map[string]any{"message": "test"}}})
+		case "/repos/openclaw/openclaw/commits/auto123/check-runs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []map[string]any{{"name": "auto-test", "status": "completed", "conclusion": "success"}}})
+		case "/repos/openclaw/openclaw/actions/runs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]any{{"id": 12345, "head_branch": "auto-branch", "head_sha": "auto123", "status": "completed", "conclusion": "success", "name": "CI"}}})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.String())
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "test-token")
+	t.Setenv("GITCRAWL_GITHUB_BASE_URL", server.URL)
+	t.Setenv("GITCRAWL_GH_PATH", "/tmp/no-real-gh")
+
+	run := New()
+	var stdout bytes.Buffer
+	run.Stdout = &stdout
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "pr", "view", "12", "-R", "openclaw/openclaw", "--json", "number,files,commits,statusCheckRollup,headRefOid"}); err != nil {
+		t.Fatalf("auto hydrate view: %v", err)
+	}
+	var view map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
+		t.Fatalf("decode view: %v\n%s", err, stdout.String())
+	}
+	if view["headRefOid"] != "auto123" || len(view["files"].([]any)) != 1 {
+		t.Fatalf("view = %#v", view)
+	}
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "pr", "checks", "12", "-R", "openclaw/openclaw", "--json", "name,state"}); err != nil {
+		t.Fatalf("auto hydrate checks: %v", err)
+	}
+	var checks []map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &checks); err != nil {
+		t.Fatalf("decode checks: %v\n%s", err, stdout.String())
+	}
+	if len(checks) != 1 || checks[0]["name"] != "auto-test" || checks[0]["state"] != "SUCCESS" {
+		t.Fatalf("checks = %#v", checks)
 	}
 }

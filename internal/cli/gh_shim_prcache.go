@@ -27,7 +27,7 @@ func (a *App) ghThreadViewJSONRow(ctx context.Context, repoValue string, thread 
 			return nil, err
 		}
 		if cache == nil {
-			loaded, loadErr := a.localGHPullRequestCache(ctx, repoValue, thread.Number)
+			loaded, loadErr := a.loadGHPullRequestCache(ctx, repoValue, thread.Number, ghPRFieldsNeedFresh(fields))
 			if loadErr != nil {
 				return nil, loadErr
 			}
@@ -167,7 +167,7 @@ func (a *App) runGHPRChecks(ctx context.Context, args []string) error {
 	if err != nil {
 		return localGHUnsupported(err)
 	}
-	cache, err := a.localGHPullRequestCache(ctx, repoValue, number)
+	cache, err := a.ensureFreshGHPullRequestCache(ctx, repoValue, number)
 	if err != nil {
 		return err
 	}

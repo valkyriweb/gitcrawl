@@ -1789,9 +1789,9 @@ func (a *App) syncRepository(ctx context.Context, owner, repo string, options sy
 	if err != nil {
 		return syncer.Stats{}, err
 	}
-	token := config.ResolveGitHubToken(cfg)
+	token := a.resolveGitHubToken(ctx, cfg)
 	if token.Value == "" {
-		return syncer.Stats{}, fmt.Errorf("missing GitHub token: set %s", cfg.GitHub.TokenEnv)
+		return syncer.Stats{}, fmt.Errorf("missing GitHub token: set %s or authenticate gh", cfg.GitHub.TokenEnv)
 	}
 	if err := config.EnsureRuntimeDirs(cfg); err != nil {
 		return syncer.Stats{}, err

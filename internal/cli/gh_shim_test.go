@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/openclaw/gitcrawl/internal/config"
 	"github.com/openclaw/gitcrawl/internal/store"
@@ -417,6 +418,7 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 	if _, err := st.UpsertDocument(ctx, store.Document{ThreadID: prID, Title: "Manifest cache update", RawText: "manifest cache refresh", DedupeText: "manifest cache refresh", UpdatedAt: "2026-04-27T02:00:00Z"}); err != nil {
 		t.Fatalf("seed pr document: %v", err)
 	}
+	fetchedAt := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := st.UpsertPullRequestCache(ctx, store.PullRequestDetail{
 		ThreadID:         prID,
 		RepoID:           repoID,
@@ -430,8 +432,8 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 		Deletions:        2,
 		ChangedFiles:     1,
 		RawJSON:          `{"head":{"sha":"abc123"}}`,
-		FetchedAt:        "2026-04-27T02:00:00Z",
-		UpdatedAt:        "2026-04-27T02:00:00Z",
+		FetchedAt:        fetchedAt,
+		UpdatedAt:        fetchedAt,
 	}, []store.PullRequestFile{{
 		ThreadID:  prID,
 		Path:      "internal/cache.go",
@@ -440,7 +442,7 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 		Deletions: 2,
 		Changes:   12,
 		RawJSON:   "{}",
-		FetchedAt: "2026-04-27T02:00:00Z",
+		FetchedAt: fetchedAt,
 	}}, []store.PullRequestCommit{{
 		ThreadID:    prID,
 		SHA:         "commit123",
@@ -450,7 +452,7 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 		CommittedAt: "2026-04-27T01:00:00Z",
 		HTMLURL:     "https://github.com/openclaw/openclaw/commit/commit123",
 		RawJSON:     "{}",
-		FetchedAt:   "2026-04-27T02:00:00Z",
+		FetchedAt:   fetchedAt,
 	}}, []store.PullRequestCheck{{
 		ThreadID:     prID,
 		Name:         "test",
@@ -459,7 +461,7 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 		DetailsURL:   "https://github.com/openclaw/openclaw/actions/runs/99",
 		WorkflowName: "CI",
 		RawJSON:      "{}",
-		FetchedAt:    "2026-04-27T02:00:00Z",
+		FetchedAt:    fetchedAt,
 	}}, []store.WorkflowRun{{
 		RepoID:       repoID,
 		RunID:        "99",
@@ -474,7 +476,7 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 		CreatedAtGH:  "2026-04-27T01:00:00Z",
 		UpdatedAtGH:  "2026-04-27T02:00:00Z",
 		RawJSON:      "{}",
-		FetchedAt:    "2026-04-27T02:00:00Z",
+		FetchedAt:    fetchedAt,
 	}}); err != nil {
 		t.Fatalf("seed pr cache: %v", err)
 	}
