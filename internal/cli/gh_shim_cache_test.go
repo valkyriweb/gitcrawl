@@ -118,6 +118,12 @@ func TestGHShimCachesGHXStyleReadOnlyFallbackCommands(t *testing.T) {
 
 func TestGHShimCommandAwareCacheTTLs(t *testing.T) {
 	t.Setenv("GITCRAWL_GH_CACHE_TTL", "")
+	if got := ghCommandCacheTTL([]string{"api", "users/octocat"}); got != 7*24*time.Hour {
+		t.Fatalf("user api ttl = %s, want 7d", got)
+	}
+	if got := ghCommandCacheTTL([]string{"api", "graphql", "-f", "query={ viewer { login } }"}); got != 6*time.Hour {
+		t.Fatalf("graphql api ttl = %s, want 6h", got)
+	}
 	if got := ghCommandCacheTTL([]string{"run", "view", "123", "--log"}); got != 12*time.Hour {
 		t.Fatalf("run log ttl = %s, want 12h", got)
 	}
@@ -139,9 +145,74 @@ func TestGHShimCommandAwareCacheTTLs(t *testing.T) {
 	if got := normalizeGHAPIRoute([]string{"repos/openclaw/openclaw/actions/runs?per_page=1"}); got != "api repos/:owner/:repo/actions/runs" {
 		t.Fatalf("normalized actions route = %q", got)
 	}
+	if got := normalizeGHAPIRoute([]string{"--paginate", "repos/openclaw/openclaw/issues?state=all&creator=octocat", "--jq", ".[].number"}); got != "api repos/:owner/:repo/issues" {
+		t.Fatalf("normalized paginated issues route = %q", got)
+	}
 	entry := ghCommandCacheEntry{CreatedAt: time.Now().Add(-3 * time.Minute), ExitCode: 1, Stderr: "HTTP 403: API rate limit exceeded"}
 	if ttl := ghCommandCacheEntryTTL(entry, 12*time.Hour); ttl != 2*time.Minute {
 		t.Fatalf("rate-limit error ttl = %s, want 2m", ttl)
+	}
+}
+
+func TestGHShimGraphQLReadOnlyDetection(t *testing.T) {
+	if !cacheableGHRead([]string{"api", "graphql", "-f", "login=octocat", "-f", "query=query { viewer { login } }"}) {
+		t.Fatalf("graphql query should be cacheable")
+	}
+	if !cacheableGHRead([]string{"api", "graphql", "-f", "query={ viewer { login } }"}) {
+		t.Fatalf("anonymous graphql query should be cacheable")
+	}
+	if cacheableGHRead([]string{"api", "graphql", "-f", "query=mutation { addStar(input:{starrableId:\"x\"}) { clientMutationId } }"}) {
+		t.Fatalf("graphql mutation should not be cacheable")
+	}
+	if cacheableGHRead([]string{"api", "graphql", "-X", "PATCH", "-f", "query={ viewer { login } }"}) {
+		t.Fatalf("graphql non-read method should not be cacheable")
+	}
+	if cacheableGHRead([]string{"api", "graphql", "-f", "query=@query.graphql"}) {
+		t.Fatalf("graphql file-backed query should not be cacheable")
+	}
+	if cacheableGHRead([]string{"api", "repos/openclaw/openclaw/issues", "-f", "title=x"}) {
+		t.Fatalf("REST API fields should not be cacheable")
+	}
+}
+
+func TestGHShimExplicitCacheKeysAreCwdIndependent(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	a := New()
+	a.configPath = configPath
+	t.Setenv("GH_REPO", "")
+	t.Setenv("GH_HOST", "")
+
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	defer func() { _ = os.Chdir(original) }()
+	firstDir := t.TempDir()
+	secondDir := t.TempDir()
+
+	if err := os.Chdir(firstDir); err != nil {
+		t.Fatalf("chdir first: %v", err)
+	}
+	apiFirst := a.ghCommandCacheKey(ctx, []string{"api", "users/octocat"})
+	repoFirst := a.ghCommandCacheKey(ctx, []string{"repo", "view", "openclaw/gitcrawl", "--json", "nameWithOwner"})
+	runFirst := a.ghCommandCacheKey(ctx, []string{"run", "view", "123", "-R", "openclaw/gitcrawl", "--json", "status"})
+	implicitFirst := a.ghCommandCacheKey(ctx, []string{"repo", "view", "--json", "nameWithOwner"})
+
+	if err := os.Chdir(secondDir); err != nil {
+		t.Fatalf("chdir second: %v", err)
+	}
+	if apiSecond := a.ghCommandCacheKey(ctx, []string{"api", "users/octocat"}); apiSecond != apiFirst {
+		t.Fatalf("explicit api key changed across cwd: %s != %s", apiSecond, apiFirst)
+	}
+	if repoSecond := a.ghCommandCacheKey(ctx, []string{"repo", "view", "openclaw/gitcrawl", "--json", "nameWithOwner"}); repoSecond != repoFirst {
+		t.Fatalf("explicit repo key changed across cwd: %s != %s", repoSecond, repoFirst)
+	}
+	if runSecond := a.ghCommandCacheKey(ctx, []string{"run", "view", "123", "-R", "openclaw/gitcrawl", "--json", "status"}); runSecond != runFirst {
+		t.Fatalf("explicit -R key changed across cwd: %s != %s", runSecond, runFirst)
+	}
+	if implicitSecond := a.ghCommandCacheKey(ctx, []string{"repo", "view", "--json", "nameWithOwner"}); implicitSecond == implicitFirst {
+		t.Fatalf("implicit repo key did not include cwd")
 	}
 }
 

@@ -263,11 +263,10 @@ func waitGHCommandCache(entryPath, lockPath string, ttl time.Duration) (ghComman
 }
 
 func (a *App) ghCommandCacheKey(ctx context.Context, args []string) string {
-	cwd, _ := os.Getwd()
 	material := strings.Join([]string{
-		"v2",
+		"v3",
 		config.ResolvePath(a.configPath),
-		cwd,
+		ghCommandCacheScope(args),
 		os.Getenv("GH_HOST"),
 		os.Getenv("GH_REPO"),
 		a.ghCommandStableIdentity(ctx, args),
@@ -275,6 +274,59 @@ func (a *App) ghCommandCacheKey(ctx context.Context, args []string) string {
 	}, "\x00")
 	sum := sha256.Sum256([]byte(material))
 	return hex.EncodeToString(sum[:])
+}
+
+func ghCommandCacheScope(args []string) string {
+	if ghCommandHasExplicitIdentity(args) {
+		return "explicit"
+	}
+	cwd, _ := os.Getwd()
+	return "cwd:" + cwd
+}
+
+func ghCommandHasExplicitIdentity(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	if args[0] == "api" {
+		return ghAPIPathArg(args[1:]) != ""
+	}
+	if os.Getenv("GH_REPO") != "" || hasGHExplicitRepoFlag(args) {
+		return true
+	}
+	if len(args) >= 3 && args[0] == "repo" && args[1] == "view" {
+		return firstGHPositionalArg(args[2:]) != ""
+	}
+	return false
+}
+
+func hasGHExplicitRepoFlag(args []string) bool {
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		switch arg {
+		case "-R", "--repo":
+			return index+1 < len(args) && strings.TrimSpace(args[index+1]) != ""
+		default:
+			if strings.HasPrefix(arg, "--repo=") && strings.TrimSpace(strings.TrimPrefix(arg, "--repo=")) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func firstGHPositionalArg(args []string) string {
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if strings.HasPrefix(arg, "-") {
+			if !strings.Contains(arg, "=") && index+1 < len(args) {
+				index++
+			}
+			continue
+		}
+		return strings.TrimSpace(arg)
+	}
+	return ""
 }
 
 func (a *App) ghCommandStableIdentity(ctx context.Context, args []string) string {

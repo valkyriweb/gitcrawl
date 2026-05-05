@@ -65,6 +65,10 @@ func ghCommandName(args []string) string {
 
 func ghAPIReadOnly(args []string) bool {
 	method := "GET"
+	path := ghAPIPathArg(args)
+	if path == "graphql" {
+		return ghGraphQLReadOnly(args)
+	}
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		switch arg {
@@ -83,6 +87,60 @@ func ghAPIReadOnly(args []string) bool {
 		}
 	}
 	return method == "GET"
+}
+
+func ghGraphQLReadOnly(args []string) bool {
+	method := "POST"
+	query := ""
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		switch arg {
+		case "--input":
+			return false
+		case "--method", "-X":
+			if index+1 >= len(args) {
+				return false
+			}
+			method = strings.ToUpper(args[index+1])
+			index++
+		case "-f", "-F", "--field", "--raw-field":
+			if index+1 >= len(args) {
+				return false
+			}
+			name, value, ok := strings.Cut(args[index+1], "=")
+			if ok && strings.HasPrefix(strings.TrimSpace(value), "@") {
+				return false
+			}
+			if ok && name == "query" {
+				query = value
+			}
+			index++
+		default:
+			for _, prefix := range []string{"-f=", "-F=", "--field=", "--raw-field="} {
+				if strings.HasPrefix(arg, prefix) {
+					name, value, ok := strings.Cut(strings.TrimPrefix(arg, prefix), "=")
+					if ok && strings.HasPrefix(strings.TrimSpace(value), "@") {
+						return false
+					}
+					if ok && name == "query" {
+						query = value
+					}
+				}
+			}
+			if strings.HasPrefix(arg, "--method=") {
+				method = strings.ToUpper(strings.TrimPrefix(arg, "--method="))
+			}
+		}
+	}
+	if method != "GET" && method != "POST" {
+		return false
+	}
+	query = strings.TrimSpace(query)
+	if query == "" || strings.HasPrefix(query, "@") {
+		return false
+	}
+	lower := strings.ToLower(query)
+	return strings.HasPrefix(lower, "query") || strings.HasPrefix(lower, "{")
 }
 
 func (a *App) ghCommandCacheTTL(ctx context.Context, args []string) time.Duration {
@@ -152,6 +210,10 @@ func ghRunCacheTTL(args []string) time.Duration {
 func ghAPICacheTTL(args []string) time.Duration {
 	route := normalizeGHAPIRoute(args)
 	switch {
+	case route == "api graphql":
+		return 6 * time.Hour
+	case strings.HasPrefix(route, "api users/"):
+		return 7 * 24 * time.Hour
 	case strings.Contains(route, "/actions/runs/:id/logs"):
 		return 12 * time.Hour
 	case strings.Contains(route, "/actions/jobs/:id/logs"):
@@ -228,26 +290,7 @@ func ghPRHeadSHAFromRawJSON(raw string) string {
 }
 
 func normalizeGHAPIRoute(args []string) string {
-	path := ""
-	for index := 0; index < len(args); index++ {
-		arg := args[index]
-		switch arg {
-		case "-X", "--method":
-			index++
-			continue
-		case "-H", "--header", "--hostname", "--jq", "-q", "--paginate", "--preview", "--template", "-t", "--input":
-			if index+1 < len(args) && !strings.Contains(arg, "=") {
-				index++
-			}
-			continue
-		default:
-			if strings.HasPrefix(arg, "-") {
-				continue
-			}
-			path = strings.TrimSpace(arg)
-			index = len(args)
-		}
-	}
+	path := ghAPIPathArg(args)
 	path = strings.TrimPrefix(path, "https://api.github.com/")
 	path = strings.TrimPrefix(path, "http://api.github.com/")
 	path = strings.TrimPrefix(path, "/")
@@ -272,6 +315,33 @@ func normalizeGHAPIRoute(args []string) string {
 		}
 	}
 	return "api " + strings.Join(parts, "/")
+}
+
+func ghAPIPathArg(args []string) string {
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		switch arg {
+		case "-X", "--method":
+			index++
+			continue
+		case "--paginate":
+			continue
+		case "-H", "--header", "--hostname", "--jq", "-q", "--preview", "--template", "-t", "--input":
+			if index+1 < len(args) && !strings.Contains(arg, "=") {
+				index++
+			}
+			continue
+		case "-f", "-F", "--field", "--raw-field":
+			index++
+			continue
+		default:
+			if strings.HasPrefix(arg, "-") {
+				continue
+			}
+			return strings.TrimSpace(arg)
+		}
+	}
+	return ""
 }
 
 func isDecimalString(value string) bool {
