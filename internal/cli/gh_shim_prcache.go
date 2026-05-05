@@ -18,6 +18,14 @@ func (a *App) ghThreadViewJSONRow(ctx context.Context, repoValue string, thread 
 	row := make(map[string]any, len(fields))
 	var cache *store.PullRequestCache
 	for _, field := range fields {
+		if field == "comments" {
+			comments, err := a.localGHThreadComments(ctx, thread.ID)
+			if err != nil {
+				return nil, err
+			}
+			row[field] = ghCommentsJSONValue(comments)
+			continue
+		}
 		value, err := ghSearchJSONValue(thread, field)
 		if err == nil {
 			row[field] = value
@@ -61,6 +69,33 @@ func (a *App) localGHPullRequestCache(ctx context.Context, repoValue string, num
 		return store.PullRequestCache{}, localGHUnsupported(err)
 	}
 	return cache, nil
+}
+
+func (a *App) localGHThreadComments(ctx context.Context, threadID int64) ([]store.Comment, error) {
+	rt, err := a.openLocalRuntimeReadOnly(ctx)
+	if err != nil {
+		return nil, localGHUnsupported(err)
+	}
+	defer rt.Store.Close()
+	comments, err := rt.Store.ListComments(ctx, threadID)
+	if err != nil {
+		return nil, localGHUnsupported(err)
+	}
+	return comments, nil
+}
+
+func ghCommentsJSONValue(comments []store.Comment) []map[string]any {
+	out := make([]map[string]any, 0, len(comments))
+	for _, comment := range comments {
+		out = append(out, map[string]any{
+			"id":        comment.GitHubID,
+			"author":    map[string]any{"login": comment.AuthorLogin, "type": comment.AuthorType},
+			"body":      comment.Body,
+			"createdAt": comment.CreatedAtGitHub,
+			"updatedAt": comment.UpdatedAtGitHub,
+		})
+	}
+	return out
 }
 
 func ghPRDetailJSONValue(thread store.Thread, cache store.PullRequestCache, field string) (any, error) {

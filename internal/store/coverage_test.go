@@ -205,6 +205,9 @@ func TestPortablePruneCanonicalizesSchemaAndMetadata(t *testing.T) {
 	if err := st.UpsertThreadVector(ctx, ThreadVector{ThreadID: threadIDs[0], Basis: "title_original", Model: "test", Dimensions: 2, ContentHash: "hash", Vector: []float64{1, 0}, CreatedAt: "2026-04-30T00:00:00Z", UpdatedAt: "2026-04-30T00:00:00Z"}); err != nil {
 		t.Fatalf("upsert vector: %v", err)
 	}
+	if _, err := st.UpsertComment(ctx, Comment{ThreadID: threadIDs[0], GitHubID: "c1", CommentType: "issue_comment", AuthorLogin: "alice", Body: "portable comment body", RawJSON: `{"body":"portable comment body"}`, CreatedAtGitHub: "2026-04-30T00:00:00Z", UpdatedAtGitHub: "2026-04-30T00:00:00Z"}); err != nil {
+		t.Fatalf("upsert comment: %v", err)
+	}
 	if _, err := st.DB().ExecContext(ctx, `insert into sync_runs(repo_id, scope, status, started_at, finished_at, stats_json) values(?, 'open', 'success', '2026-04-30T00:00:00Z', '2026-04-30T00:01:00Z', '{}')`, repoID); err != nil {
 		t.Fatalf("seed sync run: %v", err)
 	}
@@ -217,6 +220,22 @@ func TestPortablePruneCanonicalizesSchemaAndMetadata(t *testing.T) {
 	}
 	if !st.tableExists(ctx, "portable_metadata") || st.hasColumn(ctx, "threads", "body") {
 		t.Fatalf("portable schema was not canonicalized")
+	}
+	if !st.tableExists(ctx, "comments") {
+		t.Fatalf("comments should remain in portable v2")
+	}
+	var schema, includes, excluded string
+	if err := st.DB().QueryRowContext(ctx, `select value from portable_metadata where key = 'schema'`).Scan(&schema); err != nil {
+		t.Fatalf("schema metadata: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select value from portable_metadata where key = 'includes'`).Scan(&includes); err != nil {
+		t.Fatalf("includes metadata: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select value from portable_metadata where key = 'excluded'`).Scan(&excluded); err != nil {
+		t.Fatalf("excluded metadata: %v", err)
+	}
+	if schema != "gitcrawl-portable-sync-v2" || !strings.Contains(includes, "comments") || strings.Contains(excluded, "comments") {
+		t.Fatalf("portable metadata schema=%q includes=%q excluded=%q", schema, includes, excluded)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatalf("close store: %v", err)

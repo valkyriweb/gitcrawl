@@ -127,4 +127,4 @@ Each row carries `started_at`, `finished_at`, `status`, and `stats_json` — use
 
 - **GitHub.** Sync uses standard REST endpoints; the API quota is the dominant cost on busy repos. Use `--include-comments` and `--with pr-details` selectively.
 - **OpenAI.** `text-embedding-3-small` is inexpensive but not free. `embed` is bounded by `--limit` if you want to stay under a budget on initial backfills.
-- **Disk.** Vectors and PR detail blobs grow with the repo. The portable-store flow includes `gitcrawl portable prune` to keep published payloads small — see [Portable stores](/portable-stores/).
+- **Disk.** Vectors, generated documents, and raw API payloads grow with the repo. The portable-store flow includes `gitcrawl portable prune` to keep published payloads small while retaining compact comments and PR details — see [Portable stores](/portable-stores/).

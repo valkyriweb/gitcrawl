@@ -88,7 +88,7 @@ Every sync, embed, and cluster operation records a **run** in `run_records` with
 
 A **portable store** is a Git-backed publish target for a `gitcrawl.db` plus its derived bodies, designed for sharing a local cache across agents or machines without a hosted service.
 
-`gitcrawl init --portable-store https://github.com/org/repo` clones a portable store into `~/.config/gitcrawl/portable/`, points the runtime at it, and `gitcrawl portable prune --body-chars 256` keeps the published payload small. Read-only commands run against portable stores refresh the checkout before reading. See [Portable stores](/portable-stores/).
+`gitcrawl init --portable-store https://github.com/org/repo` clones a portable store into `~/.config/gitcrawl/portable/`, points the runtime at it, and `gitcrawl portable prune --body-chars 256` keeps the published payload small while retaining comments, PR details, checks, and workflow runs. Read-only commands run against portable stores refresh the checkout before reading. See [Portable stores](/portable-stores/).
 
 ## Cache
 

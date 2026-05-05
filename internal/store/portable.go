@@ -20,7 +20,9 @@ type PortablePruneStats struct {
 	BytesBefore         int64    `json:"bytes_before"`
 	BytesAfter          int64    `json:"bytes_after"`
 	ThreadsPruned       int64    `json:"threads_pruned"`
+	CommentsPruned      int64    `json:"comments_pruned"`
 	RepositoriesPruned  int64    `json:"repositories_pruned"`
+	RawJSONPruned       int64    `json:"raw_json_pruned"`
 	FingerprintsPruned  int64    `json:"fingerprints_pruned"`
 	DocumentsDeleted    int64    `json:"documents_deleted"`
 	DocumentsFTSRebuilt bool     `json:"documents_fts_rebuilt"`
@@ -43,34 +45,25 @@ func (s *Store) PrunePortablePayloads(ctx context.Context, options PortablePrune
 	}
 
 	if s.hasColumn(ctx, "threads", "body") {
-		if s.hasColumn(ctx, "threads", "body_excerpt") && s.hasColumn(ctx, "threads", "body_length") {
-			if result, err := s.db.ExecContext(ctx, `
-				update threads
-				   set body_length = case when body is not null then length(body) else body_length end,
-				       body_excerpt = case
-				         when body is not null and length(body) > ? then substr(body, 1, ?)
-				         when body is not null then body
-				         else body_excerpt
-				       end
-				 where body is not null
-			`, options.BodyChars, options.BodyChars); err != nil {
-				return stats, fmt.Errorf("prune thread body excerpts: %w", err)
-			} else {
-				stats.ThreadsPruned += rowsAffected(result)
-			}
-			if _, err := s.db.ExecContext(ctx, `update threads set body = body_excerpt`); err != nil {
-				return stats, fmt.Errorf("replace thread bodies with excerpts: %w", err)
-			}
+		if err := s.ensurePortableExcerptColumns(ctx, "threads"); err != nil {
+			return stats, err
+		}
+		if result, err := s.db.ExecContext(ctx, `
+			update threads
+			   set body_length = case when body is not null then length(body) else body_length end,
+			       body_excerpt = case
+			         when body is not null and length(body) > ? then substr(body, 1, ?)
+			         when body is not null then body
+			         else body_excerpt
+			       end
+			 where body is not null
+		`, options.BodyChars, options.BodyChars); err != nil {
+			return stats, fmt.Errorf("prune thread body excerpts: %w", err)
 		} else {
-			if result, err := s.db.ExecContext(ctx, `
-				update threads
-				   set body = case when length(body) > ? then substr(body, 1, ?) else body end
-				 where body is not null
-			`, options.BodyChars, options.BodyChars); err != nil {
-				return stats, fmt.Errorf("trim thread bodies: %w", err)
-			} else {
-				stats.ThreadsPruned += rowsAffected(result)
-			}
+			stats.ThreadsPruned += rowsAffected(result)
+		}
+		if _, err := s.db.ExecContext(ctx, `update threads set body = body_excerpt`); err != nil {
+			return stats, fmt.Errorf("replace thread bodies with excerpts: %w", err)
 		}
 	}
 	if s.hasColumn(ctx, "threads", "raw_json") {
@@ -84,6 +77,26 @@ func (s *Store) PrunePortablePayloads(ctx context.Context, options PortablePrune
 			return stats, fmt.Errorf("clear repository raw json: %w", err)
 		}
 		stats.RepositoriesPruned = rowsAffected(result)
+	}
+	if s.tableExists(ctx, "comments") && s.hasColumn(ctx, "comments", "body") {
+		if err := s.ensurePortableExcerptColumns(ctx, "comments"); err != nil {
+			return stats, err
+		}
+		if result, err := s.db.ExecContext(ctx, `
+			update comments
+			   set body_length = length(body),
+			       body_excerpt = case when length(body) > ? then substr(body, 1, ?) else body end,
+			       body = case when length(body) > ? then substr(body, 1, ?) else body end
+		`, options.BodyChars, options.BodyChars, options.BodyChars, options.BodyChars); err != nil {
+			return stats, fmt.Errorf("prune comment bodies: %w", err)
+		} else {
+			stats.CommentsPruned = rowsAffected(result)
+		}
+	}
+	if pruned, err := s.clearPortableRawJSON(ctx); err != nil {
+		return stats, err
+	} else {
+		stats.RawJSONPruned = pruned
 	}
 	if s.tableExists(ctx, "thread_fingerprints") {
 		result, err := s.db.ExecContext(ctx, `
@@ -180,11 +193,13 @@ func (s *Store) canonicalizePortableSchema(ctx context.Context, bodyChars int, s
 		return fmt.Errorf("ensure portable metadata: %w", err)
 	}
 	metadata := map[string]string{
-		"schema":      "ghcrawl-portable-sync-v1",
-		"body_chars":  fmt.Sprintf("%d", bodyChars),
-		"excluded":    "raw_json,comments,documents,fts,vectors,code_snapshots,cluster_events,run_history,similarity_edges,blobs",
-		"exported_at": time.Now().UTC().Format(timeLayout),
-		"source_path": s.path,
+		"schema":       "gitcrawl-portable-sync-v2",
+		"body_chars":   fmt.Sprintf("%d", bodyChars),
+		"capabilities": "body_excerpts,comment_excerpts,pr_details,pr_files,pr_commits,pr_checks,workflow_runs,raw_json_stripped",
+		"includes":     "repositories,threads,comments,pull_request_details,pull_request_files,pull_request_commits,pull_request_checks,github_workflow_runs,thread_fingerprints",
+		"excluded":     "raw_json,documents,fts,vectors,code_snapshots,cluster_events,run_history,similarity_edges,blobs",
+		"exported_at":  time.Now().UTC().Format(timeLayout),
+		"source_path":  s.path,
 	}
 	for key, value := range metadata {
 		if _, err := s.db.ExecContext(ctx, `
@@ -198,6 +213,59 @@ func (s *Store) canonicalizePortableSchema(ctx context.Context, bodyChars int, s
 	return nil
 }
 
+func (s *Store) ensurePortableExcerptColumns(ctx context.Context, table string) error {
+	if !s.hasColumn(ctx, table, "body_excerpt") {
+		if _, err := s.db.ExecContext(ctx, `alter table `+sqliteIdentifier(table)+` add column body_excerpt text`); err != nil {
+			return fmt.Errorf("add portable %s.body_excerpt: %w", table, err)
+		}
+	}
+	if !s.hasColumn(ctx, table, "body_length") {
+		if _, err := s.db.ExecContext(ctx, `alter table `+sqliteIdentifier(table)+` add column body_length integer not null default 0`); err != nil {
+			return fmt.Errorf("add portable %s.body_length: %w", table, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) clearPortableRawJSON(ctx context.Context) (int64, error) {
+	var total int64
+	for _, column := range []struct {
+		table string
+		name  string
+	}{
+		{table: "comments", name: "raw_json"},
+		{table: "pull_request_details", name: "raw_json"},
+		{table: "pull_request_files", name: "raw_json"},
+		{table: "pull_request_commits", name: "raw_json"},
+		{table: "pull_request_checks", name: "raw_json"},
+		{table: "github_workflow_runs", name: "raw_json"},
+	} {
+		if !s.hasColumn(ctx, column.table, column.name) {
+			continue
+		}
+		result, err := s.db.ExecContext(ctx, `update `+sqliteIdentifier(column.table)+` set `+sqliteIdentifier(column.name)+` = '' where `+sqliteIdentifier(column.name)+` is not null and `+sqliteIdentifier(column.name)+` != ''`)
+		if err != nil {
+			return total, fmt.Errorf("clear portable raw json %s.%s: %w", column.table, column.name, err)
+		}
+		total += rowsAffected(result)
+	}
+	for _, column := range []struct {
+		table string
+		name  string
+	}{
+		{table: "comments", name: "raw_json_blob_id"},
+		{table: "thread_revisions", name: "raw_json_blob_id"},
+	} {
+		if !s.hasColumn(ctx, column.table, column.name) {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, `update `+sqliteIdentifier(column.table)+` set `+sqliteIdentifier(column.name)+` = null where `+sqliteIdentifier(column.name)+` is not null`); err != nil {
+			return total, fmt.Errorf("clear portable raw blob pointer %s.%s: %w", column.table, column.name, err)
+		}
+	}
+	return total, nil
+}
+
 func canonicalPortableDroppedTables() []string {
 	return []string{
 		"documents_fts",
@@ -205,7 +273,6 @@ func canonicalPortableDroppedTables() []string {
 		"documents_fts_data",
 		"documents_fts_docsize",
 		"documents_fts_idx",
-		"comments",
 		"documents",
 		"document_embeddings",
 		"document_summaries",

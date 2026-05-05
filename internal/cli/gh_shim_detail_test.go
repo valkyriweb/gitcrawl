@@ -19,14 +19,15 @@ func TestGHShimViewAndListUseLocalCache(t *testing.T) {
 	run := New()
 	var stdout bytes.Buffer
 	run.Stdout = &stdout
-	if err := run.Run(ctx, []string{"--config", configPath, "gh", "pr", "view", "12", "-R", "openclaw/openclaw", "--json", "number,title,isDraft,author"}); err != nil {
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "pr", "view", "12", "-R", "openclaw/openclaw", "--json", "number,title,isDraft,author,comments"}); err != nil {
 		t.Fatalf("gh pr view: %v", err)
 	}
 	var view map[string]any
 	if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
 		t.Fatalf("decode view: %v\n%s", err, stdout.String())
 	}
-	if int(view["number"].(float64)) != 12 || view["isDraft"] != true {
+	comments := view["comments"].([]any)
+	if int(view["number"].(float64)) != 12 || view["isDraft"] != true || len(comments) != 1 || comments[0].(map[string]any)["body"] != "cache path looks good" {
 		t.Fatalf("view = %#v", view)
 	}
 
@@ -87,6 +88,18 @@ func TestGHShimViewAndListUseLocalCache(t *testing.T) {
 	}
 	if len(list) != 1 || int(list[0]["number"].(float64)) != 10 {
 		t.Fatalf("list = %#v", list)
+	}
+
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "issue", "view", "10", "-R", "openclaw/openclaw", "--json", "number,comments"}); err != nil {
+		t.Fatalf("gh issue view comments: %v", err)
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &view); err != nil {
+		t.Fatalf("decode issue comments: %v\n%s", err, stdout.String())
+	}
+	comments = view["comments"].([]any)
+	if len(comments) != 1 || comments[0].(map[string]any)["body"] != "same hot loop here" {
+		t.Fatalf("issue comments = %#v", view)
 	}
 
 	stdout.Reset()

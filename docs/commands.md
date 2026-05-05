@@ -109,7 +109,7 @@ The shim binary can be installed standalone by symlinking the `gitcrawl` binary 
 
 | Command | Purpose | Docs |
 | --- | --- | --- |
-| `gitcrawl portable prune [--body-chars --no-vacuum --json]` | Truncate thread bodies and (optionally) `VACUUM` for a small publishable database | [Portable stores](/portable-stores/#publishing-gitcrawl-portable-prune) |
+| `gitcrawl portable prune [--body-chars --no-vacuum --json]` | Build a compact portable v2 backup and (optionally) `VACUUM` for publishing | [Portable stores](/portable-stores/#publishing-gitcrawl-portable-prune) |
 
 ## Not yet implemented
 

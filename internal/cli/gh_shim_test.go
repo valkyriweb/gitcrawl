@@ -119,6 +119,19 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 	if _, err := st.UpsertDocument(ctx, store.Document{ThreadID: issueID, Title: "Hot loop burns CPU", RawText: "runtime hot loop burns CPU", DedupeText: "runtime hot loop burns cpu", UpdatedAt: "2026-04-27T01:00:00Z"}); err != nil {
 		t.Fatalf("seed issue document: %v", err)
 	}
+	if _, err := st.UpsertComment(ctx, store.Comment{
+		ThreadID:        issueID,
+		GitHubID:        "1001",
+		CommentType:     "issue_comment",
+		AuthorLogin:     "carol",
+		AuthorType:      "User",
+		Body:            "same hot loop here",
+		RawJSON:         "{}",
+		CreatedAtGitHub: "2026-04-27T01:10:00Z",
+		UpdatedAtGitHub: "2026-04-27T01:10:00Z",
+	}); err != nil {
+		t.Fatalf("seed issue comment: %v", err)
+	}
 	prID, err := st.UpsertThread(ctx, store.Thread{
 		RepoID:          repoID,
 		GitHubID:        "12",
@@ -142,6 +155,19 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 	}
 	if _, err := st.UpsertDocument(ctx, store.Document{ThreadID: prID, Title: "Manifest cache update", RawText: "manifest cache refresh", DedupeText: "manifest cache refresh", UpdatedAt: "2026-04-27T02:00:00Z"}); err != nil {
 		t.Fatalf("seed pr document: %v", err)
+	}
+	if _, err := st.UpsertComment(ctx, store.Comment{
+		ThreadID:        prID,
+		GitHubID:        "1201",
+		CommentType:     "review_comment",
+		AuthorLogin:     "dana",
+		AuthorType:      "User",
+		Body:            "cache path looks good",
+		RawJSON:         "{}",
+		CreatedAtGitHub: "2026-04-27T02:10:00Z",
+		UpdatedAtGitHub: "2026-04-27T02:10:00Z",
+	}); err != nil {
+		t.Fatalf("seed pr comment: %v", err)
 	}
 	fetchedAt := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := st.UpsertPullRequestCache(ctx, store.PullRequestDetail{

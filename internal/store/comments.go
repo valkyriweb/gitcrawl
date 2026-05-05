@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 )
 
@@ -39,4 +40,39 @@ func (s *Store) UpsertComment(ctx context.Context, comment Comment) (int64, erro
 		return 0, fmt.Errorf("upsert comment: %w", err)
 	}
 	return id, nil
+}
+
+func (s *Store) ListComments(ctx context.Context, threadID int64) ([]Comment, error) {
+	if !s.tableExists(ctx, "comments") {
+		return nil, nil
+	}
+	rows, err := s.q().QueryContext(ctx, `
+		select id, thread_id, github_id, comment_type, author_login, author_type, body, is_bot, raw_json, created_at_gh, updated_at_gh
+		from comments
+		where thread_id = ?
+		order by created_at_gh, id
+	`, threadID)
+	if err != nil {
+		return nil, fmt.Errorf("list comments: %w", err)
+	}
+	defer rows.Close()
+	var comments []Comment
+	for rows.Next() {
+		var comment Comment
+		var authorLogin, authorType, createdAt, updatedAt sql.NullString
+		var isBot int
+		if err := rows.Scan(&comment.ID, &comment.ThreadID, &comment.GitHubID, &comment.CommentType, &authorLogin, &authorType, &comment.Body, &isBot, &comment.RawJSON, &createdAt, &updatedAt); err != nil {
+			return nil, fmt.Errorf("scan comment: %w", err)
+		}
+		comment.AuthorLogin = authorLogin.String
+		comment.AuthorType = authorType.String
+		comment.IsBot = isBot != 0
+		comment.CreatedAtGitHub = createdAt.String
+		comment.UpdatedAtGitHub = updatedAt.String
+		comments = append(comments, comment)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate comments: %w", err)
+	}
+	return comments, nil
 }

@@ -19,7 +19,7 @@ A Git-backed publish target for a `gitcrawl.db` plus its derived bodies — shar
 - You want a backup of the SQLite cache that someone else can clone and use immediately.
 - You want a deterministic snapshot of "what gitcrawl knew at time T" for reproducible triage.
 
-A portable store is just a Git repository whose contents include a SQLite database (and optionally derived bodies and vectors). Anyone with read access to the repository can `git clone` it and have a fully populated gitcrawl mirror in seconds.
+A portable store is just a Git repository whose contents include a SQLite database. Anyone with read access to the repository can `git clone` it and have a fully populated gitcrawl mirror in seconds.
 
 ## Setup: pointing gitcrawl at a portable store
 
@@ -68,11 +68,21 @@ gitcrawl portable prune --body-chars 512 --no-vacuum
 gitcrawl portable prune --json
 ```
 
-`prune` truncates thread bodies in the database to the requested character cap and (by default) runs SQLite `VACUUM` to reclaim space. The result is a smaller database suitable for committing back to Git.
+`prune` converts the database into the portable v2 backup format and (by default) runs SQLite `VACUUM` to reclaim space. The result is a smaller database suitable for committing back to Git.
+
+Portable v2 keeps the data agents most often need for offline GitHub reads:
+
+- Repositories, issues, pull requests, labels, authors, and timestamps
+- Compact issue/PR body excerpts plus original body lengths
+- Compact comments, reviews, and review-comment excerpts plus original body lengths
+- PR details, files, commits, status checks, and workflow runs
+- Thread fingerprints used by duplicate and cluster-oriented workflows
+
+It strips the data that is large, easy to regenerate, or mainly useful for exact API replay: raw GitHub JSON, generated documents and FTS indexes, embeddings and vectors, code snapshots and diff blobs, cluster run history, similarity edges, and blob storage. The database records this contract in `portable_metadata` with `schema=gitcrawl-portable-sync-v2`, `includes`, `excluded`, and `capabilities` keys.
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--body-chars <n>` | `256` | Maximum body characters to keep per thread |
+| `--body-chars <n>` | `256` | Maximum body characters to keep per thread/comment excerpt |
 | `--no-vacuum` | _(off)_ | Skip the post-prune `VACUUM` |
 | `--json` | _(off)_ | JSON output |
 
@@ -100,10 +110,12 @@ Other agents and machines pull the new commit on their next read-only command.
 
 `gitcrawl search` (and the gh-shim's search) work against portable-store data with one wrinkle: when the portable store has been pruned, generated document indexes may not be present. Search falls back to compact thread title/body data automatically — you keep useful results without the publisher needing to ship the full document indexes.
 
+The v2 backup also keeps comments and PR-detail tables, so common shim reads such as `gh issue view --json comments`, `gh pr view --json files,commits,statusCheckRollup`, `gh pr checks`, and `gh run list` can be answered from the shared checkout when those details were synced before publishing.
+
 ## Caveats
 
-- The portable store carries the SQLite database. It does not carry the runtime cache or the vector store unless you explicitly publish them.
-- Vectors regenerated on each consumer's machine after `embed` are not shared; if you want shared vectors, publish the `vectors/` directory alongside the database.
+- The portable store carries the SQLite database. It does not carry the runtime fallthrough cache.
+- Vectors regenerated on each consumer's machine after `embed` are not shared; portable pruning removes vector tables from the published database.
 - Portable stores are read-mostly. Multiple writers pushing concurrently will race the way any Git workflow does — gate writes through a single publisher or a CI workflow.
 
 ## See also

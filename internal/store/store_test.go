@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -456,7 +457,19 @@ func TestPrunePortablePayloads(t *testing.T) {
 		insert into repositories(id, owner, name, full_name, raw_json, updated_at)
 		values(1, 'openclaw', 'gitcrawl', 'openclaw/gitcrawl', '{"id":1}', '2026-04-26T00:00:00Z');
 		insert into threads(id, repo_id, github_id, number, kind, state, title, body, html_url, labels_json, assignees_json, raw_json, content_hash, updated_at)
-		values(1, 1, '1', 1, 'issue', 'open', 'download stalls', 'abcdefghijklmnopqrstuvwxyz', 'https://github.com/openclaw/gitcrawl/issues/1', '[]', '[]', '{"body":"abcdefghijklmnopqrstuvwxyz"}', 'hash', '2026-04-26T00:00:00Z');
+		values(1, 1, '1', 1, 'pull_request', 'open', 'download stalls', 'abcdefghijklmnopqrstuvwxyz', 'https://github.com/openclaw/gitcrawl/pull/1', '[]', '[]', '{"body":"abcdefghijklmnopqrstuvwxyz"}', 'hash', '2026-04-26T00:00:00Z');
+		insert into comments(id, thread_id, github_id, comment_type, author_login, author_type, body, is_bot, raw_json, created_at_gh, updated_at_gh)
+		values(1, 1, 'c1', 'issue_comment', 'alice', 'User', 'comment abcdefghijklmnopqrstuvwxyz', 0, '{"body":"comment abcdefghijklmnopqrstuvwxyz"}', '2026-04-26T00:00:00Z', '2026-04-26T00:00:00Z');
+		insert into pull_request_details(thread_id, repo_id, number, base_sha, head_sha, additions, deletions, changed_files, raw_json, fetched_at, updated_at)
+		values(1, 1, 1, 'base', 'head', 10, 2, 1, '{"mergeable":true}', '2026-04-26T00:00:00Z', '2026-04-26T00:00:00Z');
+		insert into pull_request_files(thread_id, path, status, additions, deletions, changes, patch, raw_json, fetched_at)
+		values(1, 'README.md', 'modified', 10, 2, 12, '@@ patch', '{"filename":"README.md"}', '2026-04-26T00:00:00Z');
+		insert into pull_request_commits(thread_id, sha, message, raw_json, fetched_at)
+		values(1, 'abc123', 'fix download stall', '{"sha":"abc123"}', '2026-04-26T00:00:00Z');
+		insert into pull_request_checks(thread_id, name, status, conclusion, details_url, raw_json, fetched_at)
+		values(1, 'CI', 'completed', 'success', 'https://example.test/check', '{"name":"CI"}', '2026-04-26T00:00:00Z');
+		insert into github_workflow_runs(repo_id, run_id, run_number, head_branch, head_sha, status, conclusion, workflow_name, html_url, raw_json, fetched_at)
+		values(1, '99', 99, 'main', 'head', 'completed', 'success', 'CI', 'https://example.test/run', '{"id":99}', '2026-04-26T00:00:00Z');
 		insert into documents(thread_id, title, body, raw_text, dedupe_text, updated_at)
 		values(1, 'download stalls', 'abcdefghijklmnopqrstuvwxyz', 'download stalls abcdefghijklmnopqrstuvwxyz', 'download stalls', '2026-04-26T00:00:00Z');
 		insert into thread_revisions(thread_id, source_updated_at, content_hash, title_hash, body_hash, labels_hash, created_at)
@@ -472,7 +485,7 @@ func TestPrunePortablePayloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
-	if stats.DocumentsDeleted != 1 || stats.FingerprintsPruned != 1 {
+	if stats.DocumentsDeleted != 1 || stats.FingerprintsPruned != 1 || stats.CommentsPruned != 1 || stats.RawJSONPruned == 0 {
 		t.Fatalf("unexpected stats: %#v", stats)
 	}
 
@@ -489,11 +502,58 @@ func TestPrunePortablePayloads(t *testing.T) {
 	if err := st.DB().QueryRowContext(ctx, `select body_excerpt from threads where id = 1`).Scan(&bodyExcerpt); err != nil {
 		t.Fatalf("thread body excerpt: %v", err)
 	}
+	var bodyLength int
+	if err := st.DB().QueryRowContext(ctx, `select body_length from threads where id = 1`).Scan(&bodyLength); err != nil {
+		t.Fatalf("thread body length: %v", err)
+	}
+	if bodyLength != 26 {
+		t.Fatalf("thread body_length = %d, want 26", bodyLength)
+	}
 	if err := st.DB().QueryRowContext(ctx, `select title_tokens_json, linked_refs_json, module_buckets_json, feature_json from thread_fingerprints where id = 1`).Scan(&titleTokens, &linkedRefs, &buckets, &features); err != nil {
 		t.Fatalf("fingerprint payload: %v", err)
 	}
 	if st.tableExists(ctx, "documents") {
 		t.Fatal("documents table was not dropped")
+	}
+	if !st.tableExists(ctx, "comments") {
+		t.Fatal("comments table was dropped")
+	}
+	var commentBody, commentExcerpt, commentRawJSON string
+	var commentBodyLength int
+	if err := st.DB().QueryRowContext(ctx, `select body, body_excerpt, body_length, raw_json from comments where id = 1`).Scan(&commentBody, &commentExcerpt, &commentBodyLength, &commentRawJSON); err != nil {
+		t.Fatalf("comment portable payload: %v", err)
+	}
+	if commentBody != "comment " || commentExcerpt != "comment " || commentBodyLength != 34 || commentRawJSON != "" {
+		t.Fatalf("comment not pruned: body=%q excerpt=%q length=%d raw=%q", commentBody, commentExcerpt, commentBodyLength, commentRawJSON)
+	}
+	var prDetailCount, prFileCount, prCommitCount, prCheckCount, runCount int
+	if err := st.DB().QueryRowContext(ctx, `select count(*) from pull_request_details where raw_json = ''`).Scan(&prDetailCount); err != nil {
+		t.Fatalf("pr detail count: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select count(*) from pull_request_files where raw_json = ''`).Scan(&prFileCount); err != nil {
+		t.Fatalf("pr file count: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select count(*) from pull_request_commits where raw_json = ''`).Scan(&prCommitCount); err != nil {
+		t.Fatalf("pr commit count: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select count(*) from pull_request_checks where raw_json = ''`).Scan(&prCheckCount); err != nil {
+		t.Fatalf("pr check count: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select count(*) from github_workflow_runs where raw_json = ''`).Scan(&runCount); err != nil {
+		t.Fatalf("workflow run count: %v", err)
+	}
+	if prDetailCount != 1 || prFileCount != 1 || prCommitCount != 1 || prCheckCount != 1 || runCount != 1 {
+		t.Fatalf("pr/run rows not retained: detail=%d files=%d commits=%d checks=%d runs=%d", prDetailCount, prFileCount, prCommitCount, prCheckCount, runCount)
+	}
+	var portableSchema, capabilities string
+	if err := st.DB().QueryRowContext(ctx, `select value from portable_metadata where key = 'schema'`).Scan(&portableSchema); err != nil {
+		t.Fatalf("portable schema metadata: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select value from portable_metadata where key = 'capabilities'`).Scan(&capabilities); err != nil {
+		t.Fatalf("portable capabilities metadata: %v", err)
+	}
+	if portableSchema != "gitcrawl-portable-sync-v2" || !strings.Contains(capabilities, "comment_excerpts") || !strings.Contains(capabilities, "workflow_runs") {
+		t.Fatalf("portable metadata schema=%q capabilities=%q", portableSchema, capabilities)
 	}
 	if bodyExcerpt != "abcdefgh" || titleTokens != "[]" || linkedRefs != "[]" || buckets != "[]" || features != "{}" {
 		t.Fatalf("payloads not pruned: bodyExcerpt=%q titleTokens=%q linkedRefs=%q buckets=%q features=%q", bodyExcerpt, titleTokens, linkedRefs, buckets, features)
