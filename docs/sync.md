@@ -1,0 +1,155 @@
+---
+title: Sync
+nav_order: 6
+permalink: /sync/
+---
+
+# Sync
+{: .no_toc }
+
+Bring GitHub issues and pull requests into local SQLite. Idempotent, incremental, and tunable per workflow.
+{: .fs-6 .fw-300 }
+
+1. TOC
+{:toc}
+
+## The default
+
+```bash
+gitcrawl sync owner/repo
+```
+
+This fetches **open** issues and pull requests for the repository. To keep local state from rotting, an incremental sync also sweeps recently closed items so that issues and PRs closed between runs are reflected locally.
+
+A sync writes:
+
+- `repositories` — repo metadata
+- `threads` — issues and PRs (titles, bodies, authors, labels, state, timestamps)
+- `documents` — canonical thread documents (when bodies change)
+- `run_records` — sync run statistics
+
+## State filters
+
+```bash
+gitcrawl sync owner/repo --state open    # default
+gitcrawl sync owner/repo --state closed  # only closed
+gitcrawl sync owner/repo --state all     # full backfill
+```
+
+`--state all` is the right choice for a one-shot historical backfill on a new repository. After that, the default `--state open` (with its closed sweep) is enough for ongoing freshness.
+
+## Time-windowed sync
+
+```bash
+gitcrawl sync owner/repo --since 2026-04-01T00:00:00Z
+```
+
+`--since` accepts an RFC 3339 timestamp and limits the GitHub query to threads updated after that point. Combine with `--state` to scope tightly:
+
+```bash
+gitcrawl sync owner/repo --state all --since 2026-04-01T00:00:00Z
+```
+
+## Exact rows
+
+```bash
+gitcrawl sync owner/repo --numbers 123,456 --include-comments
+```
+
+`--numbers` is the safest way to refresh specific issues or PRs — it bypasses list ordering and the updated-time window, fetching exactly the rows you ask for. Pair it with `--include-comments` and/or `--include-pr-details` to hydrate the conversation and PR-only data at the same time.
+
+This is also what the `gh` shim uses internally for [auto-hydration](./gh-shim#auto-hydration).
+
+## Hydration depth
+
+| Flag | What it adds |
+| --- | --- |
+| `--include-comments` | Issue comments, PR review comments, reviews |
+| `--include-pr-details` | PR files, commits, status checks, workflow runs |
+| `--with pr-details` | Same as `--include-pr-details` (gh-style flag) |
+
+PR details land in `pr_files`, `pr_commits`, `pr_checks`, and `pr_runs` tables and back the `gh pr view`, `gh pr checks`, and `gh run list/view` shim paths. See [gh shim](./gh-shim).
+
+`--include-code` is accepted for compatibility but is currently a no-op.
+
+## Limit and pagination
+
+```bash
+gitcrawl sync owner/repo --limit 200
+```
+
+`--limit` caps the number of rows fetched in this invocation. The underlying GitHub paginator surfaces total page counts in run records and honors GitHub's `Retry-After` and rate-limit response headers, so partial syncs interrupted by rate limiting resume cleanly.
+
+## JSON output
+
+```bash
+gitcrawl sync owner/repo --json
+```
+
+```json
+{
+  "repository": "owner/repo",
+  "state": "open",
+  "since": "",
+  "selected": 124,
+  "inserted": 12,
+  "updated": 9,
+  "deleted": 0,
+  "comments_inserted": 0,
+  "comments_updated": 0,
+  "reviews_inserted": 0,
+  "pr_files_inserted": 0,
+  "pr_commits_inserted": 0,
+  "run_id": 42,
+  "started_at": "2026-05-05T07:30:11Z",
+  "finished_at": "2026-05-05T07:30:43Z"
+}
+```
+
+## Common workflows
+
+### First-time setup for a repo
+
+```bash
+gitcrawl sync owner/repo --state all --include-comments
+gitcrawl embed owner/repo
+gitcrawl cluster owner/repo
+```
+
+Or in one step:
+
+```bash
+gitcrawl refresh owner/repo --include-comments
+```
+
+### Periodic incremental refresh
+
+```bash
+gitcrawl sync owner/repo
+```
+
+The closed sweep keeps the open list honest without paying for a full backfill.
+
+### Pull a specific issue + comments + PR detail
+
+```bash
+gitcrawl sync owner/repo --numbers 123 --include-comments --with pr-details
+```
+
+### Refresh a batch you got from search
+
+```bash
+NUMS=$(gitcrawl gh search issues "manifest cache" -R owner/repo --json number --limit 20 \
+        | jq -r '[.[].number] | join(",")')
+gitcrawl sync owner/repo --numbers "$NUMS" --with pr-details
+```
+
+## Required credentials
+
+`sync` requires a GitHub token. gitcrawl resolves it from `GITHUB_TOKEN`, the `[env]` table in `config.toml`, or from `gh auth token` if the real `gh` CLI is installed and authenticated. `gitcrawl doctor` reports the source.
+
+## See also
+
+- [Refresh and embed](./refresh-and-embed) — the wrapper that runs sync, embed, and cluster end to end
+- [gh shim](./gh-shim) — how synced PR details power `gh pr view` / `gh pr checks` / `gh run` from local cache
+- [Portable stores](./portable-stores) — sharing the synced cache across machines
