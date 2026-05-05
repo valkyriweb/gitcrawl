@@ -54,6 +54,9 @@ func ghCommandName(args []string) string {
 	if len(args) == 0 {
 		return ""
 	}
+	if args[0] == "api" {
+		return "api"
+	}
 	if len(args) == 1 {
 		return args[0]
 	}
@@ -104,10 +107,70 @@ func ghCommandCacheTTLBase(args []string, stablePRDiff bool) time.Duration {
 			return 5 * time.Minute
 		}
 		if args[0] == "api" {
-			return time.Minute
+			return ghAPICacheTTL(args[1:])
+		}
+		switch args[0] {
+		case "run":
+			return ghRunCacheTTL(args[1:])
+		case "workflow":
+			return 15 * time.Minute
+		case "search":
+			return 15 * time.Minute
+		case "release":
+			return 30 * time.Minute
+		case "repo", "ruleset":
+			return 15 * time.Minute
+		case "secret", "variable", "label", "org", "project", "gist", "cache":
+			return 10 * time.Minute
+		case "issue", "pr":
+			return 5 * time.Minute
 		}
 	}
-	return 30 * time.Second
+	return 5 * time.Minute
+}
+
+func ghRunCacheTTL(args []string) time.Duration {
+	if len(args) == 0 {
+		return 2 * time.Minute
+	}
+	switch args[0] {
+	case "view":
+		if hasAnyGHFlag(args[1:], "--log", "--log-failed") {
+			return 12 * time.Hour
+		}
+		if hasAnyGHFlag(args[1:], "--job") {
+			return 5 * time.Minute
+		}
+		return 2 * time.Minute
+	case "list":
+		return 2 * time.Minute
+	default:
+		return 2 * time.Minute
+	}
+}
+
+func ghAPICacheTTL(args []string) time.Duration {
+	route := normalizeGHAPIRoute(args)
+	switch {
+	case strings.Contains(route, "/actions/runs/:id/logs"):
+		return 12 * time.Hour
+	case strings.Contains(route, "/actions/jobs/:id/logs"):
+		return 12 * time.Hour
+	case strings.Contains(route, "/actions/runs/:id/jobs"):
+		return 5 * time.Minute
+	case strings.Contains(route, "/actions/runs/:id"):
+		return 2 * time.Minute
+	case strings.Contains(route, "/actions/workflows/"):
+		return 5 * time.Minute
+	case strings.Contains(route, "/actions/runs"):
+		return 2 * time.Minute
+	case strings.Contains(route, "/releases"):
+		return 30 * time.Minute
+	case strings.Contains(route, "/branches") || strings.Contains(route, "/commits"):
+		return 10 * time.Minute
+	default:
+		return 5 * time.Minute
+	}
 }
 
 func isGHPRDiff(args []string) bool {
@@ -162,6 +225,65 @@ func ghPRHeadSHAFromRawJSON(raw string) string {
 		return ""
 	}
 	return strings.TrimSpace(payload.Head.SHA)
+}
+
+func normalizeGHAPIRoute(args []string) string {
+	path := ""
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		switch arg {
+		case "-X", "--method":
+			index++
+			continue
+		case "-H", "--header", "--hostname", "--jq", "-q", "--paginate", "--preview", "--template", "-t", "--input":
+			if index+1 < len(args) && !strings.Contains(arg, "=") {
+				index++
+			}
+			continue
+		default:
+			if strings.HasPrefix(arg, "-") {
+				continue
+			}
+			path = strings.TrimSpace(arg)
+			index = len(args)
+		}
+	}
+	path = strings.TrimPrefix(path, "https://api.github.com/")
+	path = strings.TrimPrefix(path, "http://api.github.com/")
+	path = strings.TrimPrefix(path, "/")
+	if before, _, found := strings.Cut(path, "?"); found {
+		path = before
+	}
+	if path == "" {
+		return "api"
+	}
+	parts := strings.Split(path, "/")
+	for index, part := range parts {
+		if part == "" {
+			continue
+		}
+		switch {
+		case isDecimalString(part):
+			parts[index] = ":id"
+		case index >= 2 && parts[index-2] == "repos":
+			// Preserve owner/repo placeholders without leaking every repo into the route cardinality.
+			parts[index-1] = ":owner"
+			parts[index] = ":repo"
+		}
+	}
+	return "api " + strings.Join(parts, "/")
+}
+
+func isDecimalString(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func mutatingGHCommand(args []string) bool {

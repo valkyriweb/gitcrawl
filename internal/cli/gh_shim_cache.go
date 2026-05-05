@@ -58,7 +58,7 @@ func (a *App) execRealGHMaybeCached(ctx context.Context, args []string) error {
 	}
 
 	stdout, stderr, exitCode, err := a.captureRealGH(ctx, args)
-	_ = a.incrementGHXCacheCounter("backend_misses")
+	_ = a.incrementGHXCacheBackendMiss(args)
 	if err == nil || cacheGHReadErrors() {
 		_ = writeGHCommandCache(entryPath, ghCommandCacheEntry{
 			CreatedAt: time.Now().UTC(),
@@ -177,10 +177,32 @@ func readGHCommandCache(path string, ttl time.Duration) (ghCommandCacheEntry, bo
 	if err := json.Unmarshal(data, &entry); err != nil {
 		return ghCommandCacheEntry{}, false
 	}
-	if entry.CreatedAt.IsZero() || time.Since(entry.CreatedAt) > ttl {
+	if entry.CreatedAt.IsZero() || time.Since(entry.CreatedAt) > ghCommandCacheEntryTTL(entry, ttl) {
 		return ghCommandCacheEntry{}, false
 	}
 	return entry, true
+}
+
+func ghCommandCacheEntryTTL(entry ghCommandCacheEntry, ttl time.Duration) time.Duration {
+	if entry.ExitCode == 0 {
+		return ttl
+	}
+	errorTTL := 5 * time.Minute
+	if ghCommandCacheEntryLooksRateLimited(entry) {
+		errorTTL = 2 * time.Minute
+	}
+	if ttl > errorTTL {
+		return errorTTL
+	}
+	return ttl
+}
+
+func ghCommandCacheEntryLooksRateLimited(entry ghCommandCacheEntry) bool {
+	text := strings.ToLower(entry.Stdout + "\n" + entry.Stderr)
+	return strings.Contains(text, "api rate limit") ||
+		strings.Contains(text, "secondary rate limit") ||
+		strings.Contains(text, "rate limit exceeded") ||
+		strings.Contains(text, "x-ratelimit-remaining")
 }
 
 func writeGHCommandCache(path string, entry ghCommandCacheEntry) error {

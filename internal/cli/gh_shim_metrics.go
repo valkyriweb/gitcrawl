@@ -8,10 +8,12 @@ import (
 )
 
 type ghXCacheCounters struct {
-	LocalHits         int64 `json:"local_hits"`
-	FallbackHits      int64 `json:"fallback_hits"`
-	BackendMisses     int64 `json:"backend_misses"`
-	PassThroughWrites int64 `json:"pass_through_writes"`
+	LocalHits              int64            `json:"local_hits"`
+	FallbackHits           int64            `json:"fallback_hits"`
+	BackendMisses          int64            `json:"backend_misses"`
+	PassThroughWrites      int64            `json:"pass_through_writes"`
+	BackendMissesByCommand map[string]int64 `json:"backend_misses_by_command,omitempty"`
+	BackendMissesByRoute   map[string]int64 `json:"backend_misses_by_route,omitempty"`
 }
 
 func (a *App) ghXCacheCounters() (ghXCacheCounters, error) {
@@ -23,6 +25,14 @@ func (a *App) ghXCacheCounters() (ghXCacheCounters, error) {
 }
 
 func (a *App) incrementGHXCacheCounter(name string) error {
+	return a.incrementGHXCacheCounterWithArgs(name, nil)
+}
+
+func (a *App) incrementGHXCacheBackendMiss(args []string) error {
+	return a.incrementGHXCacheCounterWithArgs("backend_misses", args)
+}
+
+func (a *App) incrementGHXCacheCounterWithArgs(name string, args []string) error {
 	dir, err := a.ghCommandCacheDir()
 	if err != nil {
 		return err
@@ -45,6 +55,19 @@ func (a *App) incrementGHXCacheCounter(name string) error {
 		stats.FallbackHits++
 	case "backend_misses":
 		stats.BackendMisses++
+		if len(args) > 0 {
+			if stats.BackendMissesByCommand == nil {
+				stats.BackendMissesByCommand = map[string]int64{}
+			}
+			command := ghCommandName(args)
+			stats.BackendMissesByCommand[command]++
+			if route := ghCommandRoute(args); route != "" {
+				if stats.BackendMissesByRoute == nil {
+					stats.BackendMissesByRoute = map[string]int64{}
+				}
+				stats.BackendMissesByRoute[route]++
+			}
+		}
 	case "pass_through_writes":
 		stats.PassThroughWrites++
 	default:
@@ -55,6 +78,19 @@ func (a *App) incrementGHXCacheCounter(name string) error {
 		return err
 	}
 	return writeAtomicFile(path, data, 0o600)
+}
+
+func ghCommandRoute(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	if args[0] == "api" {
+		return normalizeGHAPIRoute(args[1:])
+	}
+	if len(args) >= 2 {
+		return ghCommandName(args)
+	}
+	return args[0]
 }
 
 func readGHXCacheCounters(path string) ghXCacheCounters {

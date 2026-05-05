@@ -96,11 +96,11 @@ These commands always run real `gh` but the response body is cached for the next
 - `gh repo view` / `gh repo list`
 - `gh search code/commits/issues/prs/repos`
 - `gh label list`
-- `gh api <GET path>` — only `GET` requests; never cached for `POST`/`PATCH`/`DELETE`/`PUT`
+- `gh api <GET path>` — only `GET` requests; never cached for `POST`/`PATCH`/`DELETE`/`PUT`. Common Actions REST reads such as run status, job lists, and logs get Actions-aware TTLs.
 
-Default cache TTL is short (30 seconds for most reads, 60 seconds for `gh api`, 5 minutes for `gh pr diff` without a stable SHA, 7 days for `gh pr diff` with a stable SHA). Override with `GITCRAWL_GH_CACHE_TTL=5m` or similar.
+Default cache TTLs are command-aware: `gh run list` and run-status reads use `2m`; workflow, job detail, and Actions job-list reads use `5m`; search reads use `15m`; release metadata uses `30m`; completed-style run/job log reads use `12h`; `gh pr diff` uses `5m` without a stable SHA and `7d` with one. Most other read-only fallthroughs use `5m` to `10m`. Override with `GITCRAWL_GH_CACHE_TTL=5m` or similar.
 
-Repeat read failures are cached by default too. That avoids a fleet of agents all rediscovering the same missing release, workflow, secret, or unsupported field. Set `GITCRAWL_GH_CACHE_ERRORS=0` to cache successful reads only.
+Repeat read failures are cached by default too. That avoids a fleet of agents all rediscovering the same missing release, workflow, secret, or unsupported field. Error entries are capped to shorter lifetimes, and rate-limit errors are capped at `2m` so a reset is not masked all day. Set `GITCRAWL_GH_CACHE_ERRORS=0` to cache successful reads only.
 
 ## Auto-hydration
 
@@ -137,7 +137,14 @@ All accept `--json` for scripting.
     "local_hits": 540,
     "fallback_hits": 88,
     "backend_misses": 12,
-    "pass_through_writes": 4
+    "pass_through_writes": 4,
+    "backend_misses_by_command": {
+      "run view": 7,
+      "api": 5
+    },
+    "backend_misses_by_route": {
+      "api repos/:owner/:repo/actions/runs/:id/logs": 3
+    }
   },
   "commands": {
     "pr diff": { "entries": 30, "bytes": 184320 },
@@ -146,7 +153,7 @@ All accept `--json` for scripting.
 }
 ```
 
-`local_hits` are answered from SQLite; `fallback_hits` are answered from the fallthrough cache; `backend_misses` actually hit GitHub. Watching the ratio is the easiest way to confirm the shim is paying for itself.
+`local_hits` are answered from SQLite; `fallback_hits` are answered from the fallthrough cache; `backend_misses` actually hit GitHub. The per-command and per-route miss maps show which shapes still escape the cache, which is usually the fastest way to find the next optimization.
 
 ## Cache key composition
 

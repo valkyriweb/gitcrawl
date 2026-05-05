@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/openclaw/gitcrawl/internal/config"
 	"github.com/openclaw/gitcrawl/internal/store"
@@ -112,6 +113,70 @@ func TestGHShimCachesGHXStyleReadOnlyFallbackCommands(t *testing.T) {
 		if !cacheableGHRead(args[1:]) {
 			t.Fatalf("%v should be cacheable", args)
 		}
+	}
+}
+
+func TestGHShimCommandAwareCacheTTLs(t *testing.T) {
+	t.Setenv("GITCRAWL_GH_CACHE_TTL", "")
+	if got := ghCommandCacheTTL([]string{"run", "view", "123", "--log"}); got != 12*time.Hour {
+		t.Fatalf("run log ttl = %s, want 12h", got)
+	}
+	if got := ghCommandCacheTTL([]string{"run", "view", "123", "--job", "456"}); got != 5*time.Minute {
+		t.Fatalf("run job ttl = %s, want 5m", got)
+	}
+	if got := ghCommandCacheTTL([]string{"run", "list", "-R", "openclaw/openclaw"}); got != 2*time.Minute {
+		t.Fatalf("run list ttl = %s, want 2m", got)
+	}
+	if got := ghCommandCacheTTL([]string{"search", "issues", "cache"}); got != 15*time.Minute {
+		t.Fatalf("search ttl = %s, want 15m", got)
+	}
+	if got := ghCommandCacheTTL([]string{"api", "-i", "repos/openclaw/openclaw/actions/runs/123/logs"}); got != 12*time.Hour {
+		t.Fatalf("actions log api ttl = %s, want 12h", got)
+	}
+	if got := ghCommandCacheTTL([]string{"api", "repos/openclaw/openclaw/actions/runs/123"}); got != 2*time.Minute {
+		t.Fatalf("actions run api ttl = %s, want 2m", got)
+	}
+	if got := normalizeGHAPIRoute([]string{"repos/openclaw/openclaw/actions/runs?per_page=1"}); got != "api repos/:owner/:repo/actions/runs" {
+		t.Fatalf("normalized actions route = %q", got)
+	}
+	entry := ghCommandCacheEntry{CreatedAt: time.Now().Add(-3 * time.Minute), ExitCode: 1, Stderr: "HTTP 403: API rate limit exceeded"}
+	if ttl := ghCommandCacheEntryTTL(entry, 12*time.Hour); ttl != 2*time.Minute {
+		t.Fatalf("rate-limit error ttl = %s, want 2m", ttl)
+	}
+}
+
+func TestGHShimTracksBackendMissesByCommandAndRoute(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\necho api:$*\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("GITCRAWL_GH_PATH", ghPath)
+	t.Setenv("GH_REPO", "miss-test/"+filepath.Base(dir))
+	t.Setenv("GITCRAWL_GH_CACHE_TTL", "1m")
+
+	run := New()
+	var stdout bytes.Buffer
+	run.Stdout = &stdout
+	args := []string{"--config", configPath, "gh", "api", "-i", "repos/openclaw/openclaw/actions/runs/123/logs"}
+	if err := run.Run(ctx, args); err != nil {
+		t.Fatalf("api read: %v", err)
+	}
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "xcache", "stats", "--json"}); err != nil {
+		t.Fatalf("xcache stats: %v", err)
+	}
+	var stats ghCommandCacheStats
+	if err := json.Unmarshal(stdout.Bytes(), &stats); err != nil {
+		t.Fatalf("decode stats: %v\n%s", err, stdout.String())
+	}
+	if stats.Counters.BackendMissesByCommand["api"] != 1 {
+		t.Fatalf("backend misses by command = %#v", stats.Counters.BackendMissesByCommand)
+	}
+	if stats.Counters.BackendMissesByRoute["api repos/:owner/:repo/actions/runs/:id/logs"] != 1 {
+		t.Fatalf("backend misses by route = %#v", stats.Counters.BackendMissesByRoute)
 	}
 }
 

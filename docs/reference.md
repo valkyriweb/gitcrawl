@@ -103,12 +103,19 @@ Override the config root with `--config <path>` or `GITCRAWL_CONFIG`.
 
 | Cache class | TTL |
 | --- | --- |
-| Most read-only fallthroughs | `30s` |
-| `gh api` (GET) | `60s` |
+| Most read-only fallthroughs | `5m`-`10m` |
+| `gh run list` / run status | `2m` |
+| `gh run view --log` / `--log-failed` | `12h` |
+| `gh run view --job` | `5m` |
+| `gh search ...` | `15m` |
+| `gh release ...` | `30m` |
+| `gh api` Actions run status | `2m` |
+| `gh api` Actions job lists / workflow reads | `5m` |
+| `gh api` Actions run/job logs | `12h` |
 | `gh pr diff` without stable head SHA | `5m` |
 | `gh pr diff` with stable head SHA | `7d` |
 | Override | `GITCRAWL_GH_CACHE_TTL` |
-| Cache read failures | on by default; disable with `GITCRAWL_GH_CACHE_ERRORS=0` |
+| Cache read failures | on by default; error TTL is capped (`2m` for rate-limit errors); disable with `GITCRAWL_GH_CACHE_ERRORS=0` |
 
 ## gh shim cache key composition
 

@@ -83,7 +83,36 @@ func (a *App) runGHXCacheStats() error {
 	}
 	_, _ = fmt.Fprintf(a.Stdout, "\nCounters:\n  local hits:          %d\n  fallback hits:       %d\n  backend misses:      %d\n  pass-through writes: %d\n",
 		stats.Counters.LocalHits, stats.Counters.FallbackHits, stats.Counters.BackendMisses, stats.Counters.PassThroughWrites)
+	printGHXCacheMisses(a.Stdout, "Backend Misses by Command", stats.Counters.BackendMissesByCommand)
+	printGHXCacheMisses(a.Stdout, "Backend Misses by Route", stats.Counters.BackendMissesByRoute)
 	return nil
+}
+
+func printGHXCacheMisses(w io.Writer, title string, misses map[string]int64) {
+	if len(misses) == 0 {
+		return
+	}
+	type row struct {
+		name  string
+		count int64
+	}
+	rows := make([]row, 0, len(misses))
+	for name, count := range misses {
+		rows = append(rows, row{name: name, count: count})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].count == rows[j].count {
+			return rows[i].name < rows[j].name
+		}
+		return rows[i].count > rows[j].count
+	})
+	_, _ = fmt.Fprintf(w, "\n%s:\n", title)
+	for index, row := range rows {
+		if index >= 10 {
+			break
+		}
+		_, _ = fmt.Fprintf(w, "  %-40s %d\n", row.name, row.count)
+	}
 }
 
 func (a *App) runGHXCacheKeys() error {
@@ -251,6 +280,6 @@ func ghCommandCacheKeyInfoFromDirEntry(dir string, entry os.DirEntry) (ghCommand
 		Command:   ghCommandName(cached.Args),
 		Args:      cached.Args,
 		Bytes:     info.Size(),
-		Expired:   cached.CreatedAt.IsZero() || age > ttl,
+		Expired:   cached.CreatedAt.IsZero() || age > ghCommandCacheEntryTTL(cached, ttl),
 	}, true
 }
