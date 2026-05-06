@@ -64,6 +64,16 @@ jobs:
       - name: Build
         run: go build -ldflags "-X github.com/openclaw/gitcrawl/internal/cli.version=${GITHUB_SHA:0:7}" -o bin/gitcrawl ./cmd/gitcrawl
 
+      - name: Smoke test TUI help
+        run: |
+          set -euo pipefail
+          test -n "$(./bin/gitcrawl --version)"
+          ./bin/gitcrawl metadata --json | grep -q '"schema_version"'
+          ./bin/gitcrawl status --json | grep -q '"databases"'
+          output="$(./bin/gitcrawl help tui)"
+          printf '%s\n' "$output"
+          printf '%s' "$output" | grep -q "gitcrawl tui"
+
       - name: Snapshot release build
         uses: goreleaser/goreleaser-action@v7.1.0
         with:

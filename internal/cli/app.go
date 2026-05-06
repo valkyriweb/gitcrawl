@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"github.com/openclaw/gitcrawl/internal/store"
 	"github.com/openclaw/gitcrawl/internal/syncer"
 	"github.com/openclaw/gitcrawl/internal/vector"
+	"github.com/vincentkoc/crawlkit/control"
 )
 
 const (
@@ -124,12 +126,16 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	switch rest[0] {
 	case "version":
 		return a.writeOutput("version", map[string]string{"version": version}, false)
+	case "metadata":
+		return a.runMetadata(rest[1:])
 	case "serve":
 		return usageErr(fmt.Errorf("serve is not supported in gitcrawl"))
 	case "init":
 		return a.runInit(ctx, rest[1:])
 	case "doctor":
 		return a.runDoctor(ctx, rest[1:])
+	case "status":
+		return a.runStatus(ctx, rest[1:])
 	case "sync":
 		return a.runSync(ctx, rest[1:])
 	case "threads":
@@ -1077,23 +1083,35 @@ func (a *App) runTUI(ctx context.Context, args []string) error {
 		rt, err = a.openLocalRuntimeReadOnly(ctx)
 	}
 	if err != nil {
+		if !interactive && errors.Is(err, os.ErrNotExist) {
+			cfg := config.Default()
+			if cfgErr := cfg.Normalize(); cfgErr != nil {
+				return cfgErr
+			}
+			sort, sortErr := resolveTUISort(*sortMode, cfg)
+			if sortErr != nil {
+				return sortErr
+			}
+			return a.writeOutput("tui", emptyClusterBrowserPayload(ctx, cfg, cfg.DBPath, sort, minSize, limit, *hideClosed), true)
+		}
 		return err
 	}
 	defer rt.Store.Close()
 
 	repo, inferred, err := a.resolveOptionalRepository(ctx, rt, fs.Args())
 	if err != nil {
+		if !interactive && len(fs.Args()) == 0 && strings.Contains(err.Error(), "no local repositories found") {
+			sort, sortErr := resolveTUISort(*sortMode, rt.Config)
+			if sortErr != nil {
+				return sortErr
+			}
+			return a.writeOutput("tui", emptyClusterBrowserPayload(ctx, rt.Config, rt.SourceDBPath, sort, minSize, limit, *hideClosed), true)
+		}
 		return err
 	}
-	sort := strings.TrimSpace(*sortMode)
-	if sort == "" {
-		sort = strings.TrimSpace(rt.Config.TUI.DefaultSort)
-	}
-	if sort == "" {
-		sort = "size"
-	}
-	if sort != "recent" && sort != "oldest" && sort != "size" {
-		return usageErr(fmt.Errorf("unsupported sort %q", sort))
+	sort, err := resolveTUISort(*sortMode, rt.Config)
+	if err != nil {
+		return err
 	}
 	showClosed := !*hideClosed || *includeClosed
 
@@ -1146,6 +1164,38 @@ func (a *App) runTUI(ctx context.Context, args []string) error {
 		return a.writeOutput("tui", payload, true)
 	}
 	return a.runInteractiveTUI(ctx, rt.Store, repo.ID, payload)
+}
+
+func resolveTUISort(raw string, cfg config.Config) (string, error) {
+	sort := strings.TrimSpace(raw)
+	if sort == "" {
+		sort = strings.TrimSpace(cfg.TUI.DefaultSort)
+	}
+	if sort == "" {
+		sort = "size"
+	}
+	if sort != "recent" && sort != "oldest" && sort != "size" {
+		return "", usageErr(fmt.Errorf("unsupported sort %q", sort))
+	}
+	return sort, nil
+}
+
+func emptyClusterBrowserPayload(ctx context.Context, cfg config.Config, sourceDBPath, sort string, minSize, limit int, hideClosed bool) clusterBrowserPayload {
+	if strings.TrimSpace(sourceDBPath) == "" {
+		sourceDBPath = cfg.DBPath
+	}
+	return clusterBrowserPayload{
+		Mode:           "cluster-browser",
+		DBSource:       databaseSourceKind(sourceDBPath),
+		DBLocation:     databaseSourceLocation(ctx, sourceDBPath),
+		Sort:           sort,
+		MinSize:        minSize,
+		Limit:          limit,
+		HideClosed:     hideClosed,
+		EmbedModel:     cfg.OpenAI.EmbedModel,
+		EmbeddingBasis: cfg.EmbeddingBasis,
+		Clusters:       []store.ClusterSummary{},
+	}
 }
 
 func databaseSourceKind(dbPath string) string {
@@ -1816,11 +1866,23 @@ func (a *App) syncRepository(ctx context.Context, owner, repo string, options sy
 		Reporter: func(message string) {
 			fmt.Fprintln(a.Stderr, message)
 		},
+		Logger: progressLogger(a.Stderr),
 	})
 	if err != nil {
 		return syncer.Stats{}, err
 	}
 	return stats, nil
+}
+
+func progressLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{
+		ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
+			if attr.Key == slog.TimeKey {
+				return slog.Attr{}
+			}
+			return attr
+		},
+	}))
 }
 
 func (a *App) runInit(ctx context.Context, args []string) error {
@@ -1887,6 +1949,8 @@ func (a *App) runPortable(ctx context.Context, args []string) error {
 		return usageErr(fmt.Errorf("portable requires a subcommand"))
 	}
 	switch args[0] {
+	case "help", "--help", "-h":
+		return a.printCommandUsage("portable")
 	case "prune":
 		return a.runPortablePrune(ctx, args[1:])
 	default:
@@ -2195,6 +2259,113 @@ func (a *App) runDoctor(ctx context.Context, args []string) error {
 		"embedding_basis":      cfg.EmbeddingBasis,
 		"api_supported":        false,
 	}, true)
+}
+
+func (a *App) runMetadata(args []string) error {
+	fs := flag.NewFlagSet("metadata", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	jsonOut := fs.Bool("json", false, "write JSON output")
+	if err := fs.Parse(normalizeCommandArgs(args, nil)); err != nil {
+		return usageErr(err)
+	}
+	a.applyCommandJSON(*jsonOut)
+	if fs.NArg() != 0 {
+		return usageErr(fmt.Errorf("metadata takes flags only"))
+	}
+	cfg := config.Default()
+	manifest := control.NewManifest("gitcrawl", "Git Crawl", "gitcrawl")
+	manifest.Description = "Local-first GitHub issue and pull request crawler."
+	manifest.Branding = control.Branding{SymbolName: "point.3.connected.trianglepath.dotted", AccentColor: "#2da44e"}
+	manifest.Paths = control.Paths{
+		DefaultConfig:   config.ResolvePath(""),
+		ConfigEnv:       config.DefaultConfigEnv,
+		DefaultDatabase: cfg.DBPath,
+		DefaultCache:    cfg.CacheDir,
+		DefaultLogs:     cfg.LogDir,
+	}
+	manifest.Capabilities = []string{"metadata", "status", "doctor", "sync", "search", "tui", "portable", "clusters", "embeddings"}
+	manifest.Privacy = control.Privacy{ContainsPrivateMessages: false, ExportsSecrets: false, LocalOnlyScopes: []string{"github", "sqlite", "portable"}}
+	manifest.Commands = map[string]control.Command{
+		"status":          {Title: "Status", Argv: []string{"gitcrawl", "status", "--json"}, JSON: true},
+		"doctor":          {Title: "Doctor", Argv: []string{"gitcrawl", "doctor", "--json"}, JSON: true},
+		"sync":            {Title: "Sync repository", Argv: []string{"gitcrawl", "sync", "--json"}, JSON: true, Mutates: true},
+		"search":          {Title: "Search", Argv: []string{"gitcrawl", "search", "--json"}, JSON: true},
+		"tui":             {Title: "Terminal cluster browser", Argv: []string{"gitcrawl", "tui"}},
+		"tui-json":        {Title: "Terminal cluster data", Argv: []string{"gitcrawl", "tui", "--json"}, JSON: true},
+		"portable":        {Title: "Portable store tools", Argv: []string{"gitcrawl", "portable", "prune", "--json"}, JSON: true, Mutates: true},
+		"clusters":        {Title: "Clusters", Argv: []string{"gitcrawl", "clusters", "--json"}, JSON: true},
+		"legacy-sync-api": {Title: "Legacy sync-status alias", Argv: []string{"gitcrawl", "sync-status"}, Legacy: true, Deprecated: true},
+	}
+	return a.writeOutput("metadata", manifest, false)
+}
+
+func (a *App) runStatus(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	jsonOut := fs.Bool("json", false, "write JSON output")
+	if err := fs.Parse(normalizeCommandArgs(args, nil)); err != nil {
+		return usageErr(err)
+	}
+	a.applyCommandJSON(*jsonOut)
+	if fs.NArg() != 0 {
+		return usageErr(fmt.Errorf("status takes flags only"))
+	}
+	cfg, err := config.Load(a.configPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		cfg = config.Default()
+		if err := cfg.Normalize(); err != nil {
+			return err
+		}
+	}
+	status := store.Status{DBPath: cfg.DBPath}
+	if _, err := os.Stat(cfg.DBPath); err == nil {
+		st, err := store.OpenReadOnly(ctx, cfg.DBPath)
+		if err != nil {
+			return err
+		}
+		defer st.Close()
+		status, err = st.Status(ctx)
+		if err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	status.DBPath = cfg.DBPath
+	return a.writeOutput("status", controlStatus(config.ResolvePath(a.configPath), cfg, status), false)
+}
+
+func controlStatus(configPath string, cfg config.Config, status store.Status) control.Status {
+	counts := []control.Count{
+		control.NewCount("repositories", "Repositories", int64(status.RepositoryCount)),
+		control.NewCount("threads", "Threads", int64(status.ThreadCount)),
+		control.NewCount("open_threads", "Open threads", int64(status.OpenThreadCount)),
+		control.NewCount("clusters", "Clusters", int64(status.ClusterCount)),
+	}
+	out := control.NewStatus("gitcrawl", fmt.Sprintf("%d threads across %d repositories", status.ThreadCount, status.RepositoryCount))
+	out.State = "current"
+	out.ConfigPath = configPath
+	out.DatabasePath = status.DBPath
+	out.Counts = counts
+	if !status.LastSyncAt.IsZero() {
+		out.LastSyncAt = status.LastSyncAt.UTC().Format(time.RFC3339)
+	}
+	db := control.SQLiteDatabase("primary", "GitHub archive", "archive", status.DBPath, true, counts)
+	out.DatabaseBytes = db.Bytes
+	out.WALBytes = fileSize(status.DBPath + "-wal")
+	out.Databases = []control.Database{db}
+	return out
+}
+
+func fileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 func (a *App) applyCommandJSON(enabled bool) {
@@ -2683,6 +2854,9 @@ func (a *App) printUsage() {
 
 func (a *App) printCommandUsage(command string) error {
 	switch command {
+	case "portable":
+		fmt.Fprint(a.Stdout, portableUsageText)
+		return nil
 	case "tui":
 		fmt.Fprint(a.Stdout, tuiUsageText)
 		return nil
@@ -2704,6 +2878,8 @@ Global flags:
   --version            print version
 
 Core commands:
+  metadata             print crawlkit control metadata
+  status               print fast read-only archive status
   init                 create config, optionally from a portable store
   doctor               check config, token, and database readiness
   sync                 sync GitHub issue and pull request metadata
@@ -2747,4 +2923,13 @@ Press p to switch between repositories already present in the local store.
 Press n to load neighbors for the selected issue or PR.
 Enter from the members pane also loads neighbors before opening detail.
 The TUI quietly refreshes from the local store every 15 seconds and leaves the current status alone when nothing changed.
+`
+
+const portableUsageText = `gitcrawl portable manages local portable-store snapshots.
+
+Usage:
+  gitcrawl portable prune [--body-chars N] [--no-vacuum] [--json]
+
+Subcommands:
+  prune               prune volatile payloads from the configured portable store
 `
