@@ -59,6 +59,172 @@ func TestInitDefaultOutputIsHumanReadable(t *testing.T) {
 	}
 }
 
+func TestMetadataStatusAndControlStatusJSON(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	init := New()
+	if err := init.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := os.WriteFile(dbPath+"-wal", []byte("wal"), 0o600); err != nil {
+		t.Fatalf("write wal: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "metadata", args: []string{"--config", configPath, "metadata", "--json"}, want: "commands"},
+		{name: "status", args: []string{"--config", configPath, "status", "--json"}, want: "databases"},
+		{name: "status missing config", args: []string{"--config", filepath.Join(dir, "missing.toml"), "status", "--json"}, want: "counts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := New()
+			var stdout bytes.Buffer
+			app.Stdout = &stdout
+			if err := app.Run(ctx, tc.args); err != nil {
+				t.Fatalf("run %s: %v", tc.name, err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+				t.Fatalf("decode %s output %q: %v", tc.name, stdout.String(), err)
+			}
+			if payload["app_id"] != "gitcrawl" && payload["id"] != "gitcrawl" {
+				t.Fatalf("expected gitcrawl payload, got %#v", payload)
+			}
+			if _, ok := payload[tc.want]; !ok {
+				t.Fatalf("expected %s in %#v", tc.want, payload)
+			}
+		})
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sizePath := filepath.Join(dir, "sized.db")
+	if err := os.WriteFile(sizePath, []byte("db"), 0o600); err != nil {
+		t.Fatalf("write sized db: %v", err)
+	}
+	if err := os.WriteFile(sizePath+"-wal", []byte("wal"), 0o600); err != nil {
+		t.Fatalf("write sized wal: %v", err)
+	}
+	lastSync := time.Unix(100, 0)
+	out := controlStatus(configPath, cfg, store.Status{
+		DBPath:          sizePath,
+		RepositoryCount: 2,
+		ThreadCount:     3,
+		OpenThreadCount: 1,
+		ClusterCount:    4,
+		LastSyncAt:      lastSync,
+	})
+	if out.DatabaseBytes == 0 {
+		t.Fatalf("database bytes should be populated: %#v", out)
+	}
+	if out.WALBytes != 3 {
+		t.Fatalf("wal bytes = %d, want 3", out.WALBytes)
+	}
+	if out.LastSyncAt != lastSync.UTC().Format(time.RFC3339) {
+		t.Fatalf("last sync = %q", out.LastSyncAt)
+	}
+	if len(out.Databases) != 1 || out.Databases[0].Path != sizePath || !out.Databases[0].IsPrimary {
+		t.Fatalf("database metadata = %#v", out.Databases)
+	}
+	if got := fileSize(filepath.Join(dir, "missing.db")); got != 0 {
+		t.Fatalf("missing file size = %d, want 0", got)
+	}
+
+	var helpOut bytes.Buffer
+	help := New()
+	help.Stdout = &helpOut
+	if err := help.printCommandUsage("portable"); err != nil {
+		t.Fatalf("portable help: %v", err)
+	}
+	if !strings.Contains(helpOut.String(), "portable") {
+		t.Fatalf("portable help output = %q", helpOut.String())
+	}
+	helpOut.Reset()
+	if err := help.printCommandUsage("tui"); err != nil {
+		t.Fatalf("tui help: %v", err)
+	}
+	if !strings.Contains(helpOut.String(), "cluster browser") {
+		t.Fatalf("tui help output = %q", helpOut.String())
+	}
+	if err := New().Run(ctx, []string{"--config", configPath, "status", "extra"}); err == nil {
+		t.Fatal("status extra arg should fail")
+	}
+}
+
+func TestControlRepositoryAndClusterHelperBranches(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.DBPath = filepath.Join(dir, "gitcrawl.db")
+	payload := emptyClusterBrowserPayload(ctx, cfg, "", "recent", 2, 50, true)
+	if payload.DBSource != "local" || payload.DBLocation != "gitcrawl.db" {
+		t.Fatalf("empty payload source = %s/%s", payload.DBSource, payload.DBLocation)
+	}
+	if payload.Sort != "recent" || payload.MinSize != 2 || payload.Limit != 50 || !payload.HideClosed {
+		t.Fatalf("empty payload options = %#v", payload)
+	}
+
+	rt := localRuntime{Config: cfg}
+	if got := remoteRefreshSource(rt); got != "" {
+		t.Fatalf("local refresh source = %q", got)
+	}
+	if got := remoteRuntimePath(rt); got != "" {
+		t.Fatalf("local runtime path = %q", got)
+	}
+	rt.RemoteSource = true
+	rt.SourceDBPath = filepath.Join(dir, "store", "data", "archive.db")
+	if got := remoteRefreshSource(rt); got != rt.SourceDBPath {
+		t.Fatalf("remote refresh source = %q", got)
+	}
+	if got := remoteRuntimePath(rt); got != cfg.DBPath {
+		t.Fatalf("remote runtime path = %q", got)
+	}
+
+	if got := githubRepoFromRemote("git@github.com:openclaw/gitcrawl-store.git"); got != "openclaw/gitcrawl-store" {
+		t.Fatalf("ssh remote repo = %q", got)
+	}
+	if got := githubRepoFromRemote("https://github.com/openclaw/gitcrawl-store.git"); got != "openclaw/gitcrawl-store" {
+		t.Fatalf("https remote repo = %q", got)
+	}
+	if got := githubRepoFromRemote("ssh://git@github.com/openclaw/gitcrawl-store.git"); got != "openclaw/gitcrawl-store" {
+		t.Fatalf("ssh url remote repo = %q", got)
+	}
+	if got := githubRepoFromRemote("https://example.com/openclaw/gitcrawl-store.git"); got != "" {
+		t.Fatalf("non-github remote repo = %q", got)
+	}
+	if got := githubRepoFromRemote("https://github.com/openclaw"); got != "" {
+		t.Fatalf("short github remote repo = %q", got)
+	}
+
+	with, err := parseSyncWith(" pr-details, ")
+	if err != nil || !with["pr-details"] {
+		t.Fatalf("parse sync with = %#v, %v", with, err)
+	}
+	if _, err := parseSyncWith("reviews"); err == nil {
+		t.Fatal("unsupported sync --with value should fail")
+	}
+	maxSize, fanout, crossKind, err := parseClusterShapeOptions("cluster", "", "", "")
+	if err != nil {
+		t.Fatalf("default cluster shape: %v", err)
+	}
+	if maxSize != defaultClusterMaxSize || fanout != defaultClusterFanout || crossKind != defaultCrossKindMinScore {
+		t.Fatalf("default cluster shape = %d/%d/%f", maxSize, fanout, crossKind)
+	}
+	if _, _, _, err := parseClusterShapeOptions("cluster", "2", "3", "1.5"); err == nil {
+		t.Fatal("out-of-range cross-kind threshold should fail")
+	}
+	if !stateIncludesClosed("all") || !stateIncludesClosed(" closed ") || stateIncludesClosed("open") {
+		t.Fatal("state closed helper mismatch")
+	}
+}
+
 func TestInitRejectsDBAndPortableStore(t *testing.T) {
 	dir := t.TempDir()
 	app := New()
