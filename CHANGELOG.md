@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a repo-local `gitcrawl` agent skill for local archive, freshness, gh-shim,
+  cluster, and verification workflows.
 - Document the crawlkit control surface now available on `main`, including
   `metadata --json`, `status --json`, and `doctor --json` for local launchers
   and CI.
