@@ -25,6 +25,7 @@ Mark a thread or a cluster as "handled locally — do not show me this again."
 
 ```bash
 gitcrawl close-thread owner/repo --number 123 --reason "duplicate handled"
+gitcrawl close-thread owner/repo --number https://github.com/owner/repo/issues/123 --reason "duplicate handled"
 gitcrawl reopen-thread owner/repo --number 123
 
 gitcrawl close-cluster owner/repo --id 42 --reason "all members handled"
@@ -47,6 +48,7 @@ Pull a single thread out of a cluster, or pull it back in.
 
 ```bash
 gitcrawl exclude-cluster-member owner/repo --id 42 --number 456 --reason "different repro"
+gitcrawl exclude-cluster-member owner/repo --id 42 --number owner/repo#456 --reason "different repro"
 gitcrawl include-cluster-member owner/repo --id 42 --number 456
 ```
 
@@ -71,6 +73,12 @@ gitcrawl set-cluster-canonical owner/repo --id 42 --number 123 --reason "main tr
 ```
 
 The chosen `--number` must already be a member of the cluster. The TUI's right-click menu has a "set canonical" entry that calls this command.
+
+All governance `--number` flags accept the same thread-reference forms as sync:
+bare numbers, `#123`, `issues/123`, `pull/123`, `owner/repo#123`, and full
+GitHub issue or pull request URLs. The command still applies only to the
+`owner/repo` argument you pass to gitcrawl; URL input is accepted so copied
+GitHub links can be pasted directly.
 
 ## Reopen and undo
 

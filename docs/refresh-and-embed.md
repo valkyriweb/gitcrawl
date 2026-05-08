@@ -71,10 +71,13 @@ Generates OpenAI embeddings for any thread whose document hash has changed since
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--number <n>` | _(any)_ | Embed a single issue/PR by number |
+| `--number <ref>` | _(any)_ | Embed a single issue/PR by number or copied GitHub URL |
 | `--limit <n>` | _(no limit)_ | Maximum rows to embed in this run |
 | `--force` | _(off)_ | Re-embed every selected row, ignoring content hash |
 | `--include-closed` | _(off)_ | Include closed threads |
+
+`--number` accepts bare numbers, `#123`, `issues/123`, `pull/123`,
+`owner/repo#123`, and full GitHub issue or pull request URLs.
 
 ### When to `--force`
 

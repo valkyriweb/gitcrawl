@@ -52,7 +52,12 @@ Answered from the local FTS index. Honors `--state`, `--json`, `--limit`. `--mat
 ```bash
 gh issue view 123 -R owner/repo --json number,title,state,url,body,labels,author
 gh pr view  123 -R owner/repo --json number,title,state,url,isDraft,author,headRef,baseRef
+gh issue view https://github.com/owner/repo/issues/123 --json number,title,url
+gh pr view https://github.com/owner/repo/pull/123 --json number,title,url
 ```
+
+Full GitHub issue/PR URLs provide both the repository and thread number when
+`-R`/`--repo` is omitted.
 
 Supported JSON fields include `number`, `title`, `state`, `url`, `body`, `author`, `createdAt`, `updatedAt`, `closedAt`, `labels`, plus PR-specific `isDraft`, `headRef`, `baseRef`. PR detail fields (`files`, `commits`, `checks`, `statusCheckRollup`) are answered from cached PR detail and trigger [auto-hydration](#auto-hydration) on miss.
 
@@ -71,9 +76,13 @@ Supports `--state`, `--search` (keyword search), `--author`, `--assignee`, repea
 
 ```bash
 gh pr checks 123 -R owner/repo --json name,state,conclusion,detailsUrl
+gh pr checks https://github.com/owner/repo/pull/123 --json name,state,conclusion
 ```
 
 Returns the cached check/status summary for the PR. If the cached PR detail is older than 90 seconds or its head SHA is stale, [auto-hydration](#auto-hydration) refreshes it before answering. Supported fields: `name`, `state`, `status`, `conclusion`, `detailsUrl`, `workflow`, `startedAt`, `completedAt`.
+
+Like `gh pr view`, a full pull request URL can supply both repository and
+number.
 
 ### `gh run list` / `gh run view`
 
@@ -89,7 +98,7 @@ Workflow runs come from cached PR detail. Filters: `--branch`, `--commit` (head 
 
 These commands always run real `gh` but the response body is cached for the next caller in the same workspace:
 
-- `gh pr diff` — keyed by the cached PR head SHA when available, so the cache is stable across many sequential agent reads
+- `gh pr diff <number-or-url>` — keyed by the cached PR head SHA when available, so the cache is stable across many sequential agent reads; full PR URLs can omit `-R`
 - `gh issue list/status/view`, `gh pr list/status/view/checks`, and unsupported read-only local shim shapes
 - `gh release list/view`, `gh workflow list/view`, `gh secret list`, and `gh variable get/list`
 - `gh project list/view/field-list/item-list`, `gh ruleset check/list/view`, `gh gist list/view`, and `gh org list`

@@ -165,6 +165,14 @@ func TestGHShimCachePolicyExtraBranches(t *testing.T) {
 	if !ok || repo != "openclaw/from-env" || number != 42 {
 		t.Fatalf("diff identity repo=%q number=%d ok=%v", repo, number, ok)
 	}
+	repo, number, ok = parseGHPRDiffIdentityArgs([]string{"pr", "diff", "https://github.com/openclaw/openclaw/pull/78601"})
+	if !ok || repo != "openclaw/openclaw" || number != 78601 {
+		t.Fatalf("diff URL identity repo=%q number=%d ok=%v", repo, number, ok)
+	}
+	repo, number, ok = parseGHPRDiffIdentityArgs([]string{"pr", "diff", "https://github.com/openclaw/openclaw/issues/78601"})
+	if !ok || repo != "openclaw/openclaw" || number != 78601 {
+		t.Fatalf("diff issue URL identity repo=%q number=%d ok=%v", repo, number, ok)
+	}
 	for _, args := range [][]string{{"issue", "close"}, {"pr", "merge"}, {"project", "item-add"}, {"release", "upload"}, {"repo", "delete"}, {"run", "rerun"}, {"secret", "set"}, {"variable", "delete"}, {"workflow", "disable"}, {"api", "repos/openclaw/gitcrawl/issues", "-f", "title=x"}} {
 		if !mutatingGHCommand(args) {
 			t.Fatalf("%v should be mutating", args)

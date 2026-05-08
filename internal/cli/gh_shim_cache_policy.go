@@ -334,6 +334,9 @@ func parseGHPRDiffIdentityArgs(args []string) (string, int, bool) {
 			if strings.HasPrefix(arg, "-") || number != 0 {
 				continue
 			}
+			if ref, ok := parseThreadReference(arg); ok && ref.FullName() != "" && repo == "" {
+				repo = ref.FullName()
+			}
 			parsed, err := parseThreadNumber(arg)
 			if err != nil {
 				return "", 0, false

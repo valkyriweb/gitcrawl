@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -308,9 +309,8 @@ func firstGHNumberArg(args []string) string {
 			}
 			continue
 		}
-		arg = strings.TrimPrefix(strings.TrimSpace(arg), "#")
-		if isDecimalString(arg) {
-			return arg
+		if ref, ok := parseThreadReference(arg); ok && ref.Number > 0 {
+			return strconv.Itoa(ref.Number)
 		}
 	}
 	return ""

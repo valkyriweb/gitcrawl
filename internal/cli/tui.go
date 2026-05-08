@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -1113,7 +1112,7 @@ func (m *clusterBrowserModel) startJumpInput() tea.Cmd {
 	m.showHelp = false
 	m.closeMenu("")
 	m.searchInput.Prompt = "# "
-	m.searchInput.Placeholder = "issue or PR number"
+	m.searchInput.Placeholder = "issue, PR, or GitHub URL"
 	m.searchInput.SetValue("")
 	m.status = "Jump to issue/PR"
 	return m.searchInput.Focus()
@@ -1123,9 +1122,9 @@ func (m clusterBrowserModel) handleJumpKey(msg tea.KeyMsg) (clusterBrowserModel,
 	switch msg.String() {
 	case "enter":
 		m.jumping = false
-		value := strings.TrimPrefix(strings.TrimSpace(m.searchInput.Value()), "#")
+		value := strings.TrimSpace(m.searchInput.Value())
 		m.searchInput.Blur()
-		number, err := strconv.Atoi(value)
+		number, err := parseOptionalThreadNumber(value)
 		if err != nil || number <= 0 {
 			m.status = "Enter a positive issue or PR number"
 			return m, nil

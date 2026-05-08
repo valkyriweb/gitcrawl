@@ -192,13 +192,18 @@ func (a *App) runGHPRChecks(ctx context.Context, args []string) error {
 		return usageErr(err)
 	}
 	if fs.NArg() != 1 {
-		return usageErr(fmt.Errorf("gh pr checks requires a number"))
+		return usageErr(fmt.Errorf("gh pr checks requires a number or GitHub URL"))
 	}
+	ref, _ := parseThreadReference(fs.Arg(0))
 	number, err := parseThreadNumber(fs.Arg(0))
 	if err != nil {
 		return usageErr(err)
 	}
-	repoValue, err := a.resolveGHRepo(ctx, firstNonEmpty(*repoShort, *repoLong))
+	repoArg := firstNonEmpty(*repoShort, *repoLong)
+	if repoArg == "" {
+		repoArg = ref.FullName()
+	}
+	repoValue, err := a.resolveGHRepo(ctx, repoArg)
 	if err != nil {
 		return localGHUnsupported(err)
 	}

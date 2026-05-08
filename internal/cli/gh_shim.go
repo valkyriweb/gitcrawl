@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/openclaw/gitcrawl/internal/store"
@@ -107,13 +106,18 @@ func (a *App) runGHThreadView(ctx context.Context, resource string, args []strin
 		return usageErr(err)
 	}
 	if fs.NArg() != 1 {
-		return usageErr(fmt.Errorf("gh %s view requires a number", resource))
+		return usageErr(fmt.Errorf("gh %s view requires a number or GitHub URL", resource))
 	}
+	ref, _ := parseThreadReference(fs.Arg(0))
 	number, err := parseThreadNumber(fs.Arg(0))
 	if err != nil {
 		return usageErr(err)
 	}
-	repoValue, err := a.resolveGHRepo(ctx, firstNonEmpty(*repoShort, *repoLong))
+	repoArg := firstNonEmpty(*repoShort, *repoLong)
+	if repoArg == "" {
+		repoArg = ref.FullName()
+	}
+	repoValue, err := a.resolveGHRepo(ctx, repoArg)
 	if err != nil {
 		return localGHUnsupported(err)
 	}
@@ -356,12 +360,7 @@ func ghResourceKind(resource string) string {
 }
 
 func parseThreadNumber(value string) (int, error) {
-	value = strings.TrimSpace(strings.TrimPrefix(value, "#"))
-	number, err := strconv.Atoi(value)
-	if err != nil || number <= 0 {
-		return 0, fmt.Errorf("expected positive issue or pull request number, got %q", value)
-	}
-	return number, nil
+	return parseOptionalThreadNumber(value)
 }
 
 func ownerRepoFromGitRemote(value string) (string, error) {

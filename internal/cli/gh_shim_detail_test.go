@@ -56,6 +56,17 @@ func TestGHShimViewAndListUseLocalCache(t *testing.T) {
 	}
 
 	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "pr", "checks", "https://github.com/openclaw/openclaw/pull/12", "--json", "name,state"}); err != nil {
+		t.Fatalf("gh pr checks URL: %v", err)
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &checks); err != nil {
+		t.Fatalf("decode URL checks: %v\n%s", err, stdout.String())
+	}
+	if len(checks) != 1 || checks[0]["name"] != "test" || checks[0]["state"] != "SUCCESS" {
+		t.Fatalf("URL checks = %#v", checks)
+	}
+
+	stdout.Reset()
 	if err := run.Run(ctx, []string{"--config", configPath, "gh", "run", "list", "-R", "openclaw/openclaw", "--branch", "manifest-cache", "--json", "databaseId,workflowName,status,conclusion,headSha"}); err != nil {
 		t.Fatalf("gh run list: %v", err)
 	}

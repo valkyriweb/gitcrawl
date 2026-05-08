@@ -880,3 +880,106 @@ func seedVectorThreads(t *testing.T, ctx context.Context, st *Store) (int64, []i
 	}
 	return repoID, ids
 }
+
+func TestClosedStoreErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, threadIDs := seedVectorThreads(t, ctx, st)
+	if _, err := st.SaveDurableClusters(ctx, repoID, []DurableClusterInput{{
+		StableKey:              "closed-store",
+		RepresentativeThreadID: threadIDs[0],
+		Members:                []DurableClusterMemberInput{{ThreadID: threadIDs[0]}, {ThreadID: threadIDs[1]}},
+	}}); err != nil {
+		t.Fatalf("seed durable cluster: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	checks := []struct {
+		name string
+		fn   func() error
+	}{
+		{"display summaries", func() error {
+			_, err := st.ListDisplayClusterSummaries(ctx, ClusterSummaryOptions{RepoID: repoID, IncludeClosed: true})
+			return err
+		}},
+		{"run summaries", func() error {
+			_, err := st.ListRunClusterSummaries(ctx, ClusterSummaryOptions{RepoID: repoID})
+			return err
+		}},
+		{"durable summaries", func() error {
+			_, err := st.ListClusterSummaries(ctx, ClusterSummaryOptions{RepoID: repoID})
+			return err
+		}},
+		{"cluster detail", func() error {
+			_, err := st.ClusterDetail(ctx, ClusterDetailOptions{RepoID: repoID, ClusterID: 1})
+			return err
+		}},
+		{"durable detail", func() error {
+			_, err := st.DurableClusterDetail(ctx, ClusterDetailOptions{RepoID: repoID, ClusterID: 1})
+			return err
+		}},
+		{"thread cluster", func() error {
+			_, err := st.ClusterIDForThreadNumber(ctx, repoID, 301, true)
+			return err
+		}},
+		{"close cluster", func() error {
+			return st.CloseClusterLocally(ctx, repoID, 1, "closed")
+		}},
+		{"reopen cluster", func() error {
+			return st.ReopenClusterLocally(ctx, repoID, 1)
+		}},
+		{"save durable", func() error {
+			_, err := st.SaveDurableClusters(ctx, repoID, []DurableClusterInput{{
+				StableKey:              "after-close",
+				RepresentativeThreadID: threadIDs[0],
+				Members:                []DurableClusterMemberInput{{ThreadID: threadIDs[0]}},
+			}})
+			return err
+		}},
+		{"exclude member", func() error {
+			_, err := st.ExcludeClusterMemberLocally(ctx, repoID, 1, 301, "closed")
+			return err
+		}},
+		{"include member", func() error {
+			_, err := st.IncludeClusterMemberLocally(ctx, repoID, 1, 301, "closed")
+			return err
+		}},
+		{"canonical member", func() error {
+			_, err := st.SetClusterCanonicalLocally(ctx, repoID, 1, 301, "closed")
+			return err
+		}},
+		{"summaries", func() error {
+			_, err := st.summariesByThreadIDs(ctx, threadIDs)
+			return err
+		}},
+		{"portable prune", func() error {
+			_, err := st.PrunePortablePayloads(ctx, PortablePruneOptions{BodyChars: 8})
+			return err
+		}},
+		{"status", func() error {
+			_, err := st.Status(ctx)
+			return err
+		}},
+		{"repositories", func() error {
+			_, err := st.ListRepositories(ctx)
+			return err
+		}},
+		{"runs", func() error {
+			_, err := st.ListRuns(ctx, repoID, "sync", 1)
+			return err
+		}},
+	}
+	errorsSeen := 0
+	for _, check := range checks {
+		if err := check.fn(); err != nil {
+			errorsSeen++
+		}
+	}
+	if errorsSeen == 0 {
+		t.Fatal("closed store checks did not exercise any errors")
+	}
+}

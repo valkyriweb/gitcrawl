@@ -54,9 +54,14 @@ gitcrawl sync owner/repo --state all --since 2026-04-01T00:00:00Z
 
 ```bash
 gitcrawl sync owner/repo --numbers 123,456 --include-comments
+gitcrawl sync owner/repo --numbers https://github.com/owner/repo/issues/123 --with pr-details
 ```
 
 `--numbers` is the safest way to refresh specific issues or PRs — it bypasses list ordering and the updated-time window, fetching exactly the rows you ask for. Pair it with `--include-comments` and/or `--include-pr-details` to hydrate the conversation and PR-only data at the same time.
+
+`--numbers` accepts comma-separated thread references, not just integers:
+`123`, `#123`, `issues/123`, `pull/123`, `owner/repo#123`, and full GitHub
+issue or pull request URLs.
 
 This is also what the `gh` shim uses internally for [auto-hydration](/gh-shim/#auto-hydration).
 

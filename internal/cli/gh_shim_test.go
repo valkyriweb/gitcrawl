@@ -64,6 +64,29 @@ func TestGHShimFallsBackForUnsupportedRead(t *testing.T) {
 	}
 }
 
+func TestGHShimViewAcceptsFullGitHubURL(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+
+	run := New()
+	var stdout bytes.Buffer
+	run.Stdout = &stdout
+	if err := run.Run(ctx, []string{
+		"--config", configPath,
+		"gh", "issue", "view", "https://github.com/openclaw/openclaw/issues/10",
+		"--json", "number,title,url",
+	}); err != nil {
+		t.Fatalf("gh issue view URL: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &row); err != nil {
+		t.Fatalf("decode issue view: %v\n%s", err, stdout.String())
+	}
+	if int(row["number"].(float64)) != 10 || row["url"] != "https://github.com/openclaw/openclaw/issues/10" {
+		t.Fatalf("row = %#v", row)
+	}
+}
+
 func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 	t.Helper()
 	dir := t.TempDir()

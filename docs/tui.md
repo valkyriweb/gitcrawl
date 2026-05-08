@@ -53,7 +53,7 @@ The view auto-refreshes from the local store every 15 seconds. There is no GitHu
 | `Tab` / `Shift+Tab` | Switch panes |
 | `Enter` | Open detail for selected cluster or member; on a member, loads neighbors first |
 | `a` | Open the action menu (cluster or member, depending on focus) |
-| `#` | Jump to a specific issue or PR number |
+| `#` | Jump to a specific issue or PR number or copied GitHub issue/PR URL |
 | `n` | Load neighbors for the selected issue or PR |
 | `p` | Switch between repositories already present in the local store |
 | `s` | Cycle sort mode (`size` ↔ `recent` ↔ `oldest`, both directions) |
@@ -61,6 +61,10 @@ The view auto-refreshes from the local store every 15 seconds. There is no GitHu
 | `q` | Quit |
 
 The action menu opened with `a` mirrors the right-click menu, so every mouse action has a keyboard equivalent.
+
+Jump input accepts the same thread references as the CLI: bare numbers, `#123`,
+`issues/123`, `pull/123`, `owner/repo#123`, and full GitHub issue or pull
+request URLs.
 
 ## Mouse
 

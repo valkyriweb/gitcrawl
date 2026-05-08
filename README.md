@@ -20,6 +20,7 @@ gitcrawl status --json
 gitcrawl sync owner/repo
 gitcrawl sync owner/repo --state open
 gitcrawl sync owner/repo --numbers 123,456 --include-comments
+gitcrawl sync owner/repo --numbers https://github.com/owner/repo/issues/123 --with pr-details
 gitcrawl refresh owner/repo
 gitcrawl cluster owner/repo --threshold 0.80
 gitcrawl clusters owner/repo
@@ -27,6 +28,7 @@ gitcrawl durable-clusters owner/repo
 gitcrawl cluster-detail owner/repo --id 123
 gitcrawl cluster-explain owner/repo --id 123
 gitcrawl close-thread owner/repo --number 123 --reason "duplicate handled"
+gitcrawl close-thread owner/repo --number https://github.com/owner/repo/issues/123 --reason "handled"
 gitcrawl reopen-thread owner/repo --number 123
 gitcrawl close-cluster owner/repo --id 123 --reason "handled"
 gitcrawl reopen-cluster owner/repo --id 123
@@ -34,6 +36,7 @@ gitcrawl exclude-cluster-member owner/repo --id 123 --number 456 --reason "not t
 gitcrawl include-cluster-member owner/repo --id 123 --number 456
 gitcrawl set-cluster-canonical owner/repo --id 123 --number 456
 gitcrawl neighbors owner/repo --number 123 --limit 10
+gitcrawl neighbors owner/repo --number https://github.com/owner/repo/pull/456 --limit 10
 gitcrawl search owner/repo --query "download stalls"
 gitcrawl search issues "download stalls" -R owner/repo --state open --json number,title,state,url,updatedAt,labels --limit 30
 gitcrawl search prs "manifest cache" -R owner/repo --state open --json number,title,state,url,updatedAt,isDraft,author --limit 20
@@ -41,6 +44,8 @@ gitcrawl search issues "hot loop" -R owner/repo --state open --sync-if-stale 5m 
 gitcrawl sync owner/repo --numbers 123 --with pr-details
 gitcrawl gh search issues "download stalls" -R owner/repo --state open --match comments --json number,title,url
 gitcrawl gh pr view 123 -R owner/repo --json number,title,state,url
+gitcrawl gh pr view https://github.com/owner/repo/pull/123 --json number,title,state,url
+gitcrawl gh pr checks https://github.com/owner/repo/pull/123 --json name,state,conclusion
 gitcrawl gh run view 123456789 -R owner/repo --json status,conclusion
 gitcrawl gh xcache stats
 gitcrawl tui
@@ -53,6 +58,7 @@ gitcrawl tui owner/repo
 `gitcrawl tui` infers the most recently updated local repository when `owner/repo` is omitted. `serve` is intentionally not part of `gitcrawl`.
 `gitcrawl sync` fetches open issues and pull requests by default. Pass `--state all` or `--state closed` for explicit backfill workflows; incremental open syncs with `--since` also sweep recently closed items so local open state does not rot.
 Pass `--numbers` to refresh exact issue or pull request rows without relying on list ordering or updated-time windows.
+Thread-reference inputs accept bare numbers, `#123`, `issues/123`, `pull/123`, `owner/repo#123`, and full GitHub issue/PR URLs. This applies to sync filters, `--number` flags, governance member commands, neighbor/embed lookups, gh-shim `view`/`checks`/`diff`, and TUI jump input. For gh-shim view/checks/diff, a full GitHub URL also supplies the repository, so `-R owner/repo` can be omitted.
 Pass `--with pr-details` or `--include-pr-details` to hydrate pull request files, commits, checks, and workflow runs for local review. The `gh` shim can also auto-hydrate one exact PR on a PR-detail miss, then retry locally.
 `gitcrawl search issues|prs` accepts the common `gh search` shape (`<query> -R owner/repo --state open --json fields --limit N`) and answers from the local SQLite cache. It is intended for discovery without spending GitHub REST search quota; use `gh` for final live verification and GitHub write actions. Pass `--sync-if-stale 5m` to perform one metadata sync before the cached search when the local repository mirror is older than that duration.
 `gitcrawl gh` is a gh-compatible shim for agent workflows. It answers broad `gh search issues|prs`, `gh issue/pr list`, supported `gh issue/pr view --json` fields, hydrated `gh pr checks`, and hydrated `gh run list/view` from local SQLite, then falls through to the real GitHub CLI for unsupported commands. Local `gh issue/pr list` supports common filters such as `--author`, `--assignee`, and repeated `--label`. Read-only fallthroughs such as `gh pr diff`, `gh repo view/list`, `gh release list/view`, `gh workflow list/view`, `gh secret list`, `gh variable get/list`, `gh label list`, read-only `gh search` kinds, GET-only REST `gh api` calls, and read-only `gh api graphql` queries use a command-aware persistent cache under `cache/gh-shim`; Actions run/job logs get longer TTLs, completed run/job reads are kept much longer than active CI status, user profile reads get a 7-day TTL, read-only GraphQL gets a 6-hour TTL, and `gh pr diff` entries are keyed by the cached PR head SHA when available. Explicit API paths and explicit repositories share cache entries across sibling checkouts even when agents set different `GH_REPO` values; implicit repo reads stay isolated by `GH_REPO` or current working directory. Cache keys canonicalize common flags such as `-R`/`--repo` and sorted `--json` fields so equivalent agent commands coalesce. Repeat read failures are cached by default so agents do not rediscover the same missing release or workflow, but rate-limit error entries expire quickly; if GitHub rate-limits a refresh and an expired successful entry exists, the shim serves the stale response with a warning instead of failing the read. When another process is refreshing an expired successful entry, peers may serve stale inside a short grace window instead of joining the backend stampede. Set `GITCRAWL_GH_STALE_GRACE=0` to disable stale-while-revalidate, or `GITCRAWL_GH_CACHE_ERRORS=0` to disable error caching. Mutating commands pass through, increment write counters, and invalidate matching cache tags instead of flushing unrelated entries. `gh xcache stats|keys|gc|flush|reset|snapshot` inspects, garbage-collects, clears, resets, or snapshots fallthrough-cache counters, including hit rate plus per-command, per-route, per-key, and `--since` recent-window miss counters. Set `GITCRAWL_GH_PATH` to choose the backend `gh`, and symlink or install the binary as `gh`/`gitcrawl-gh` to run the shim directly.

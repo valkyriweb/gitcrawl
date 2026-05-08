@@ -283,7 +283,7 @@ func TestTUIJumpKeyAndRefreshCommandBranches(t *testing.T) {
 		t.Fatalf("bad enter next=%+v cmd=%v", next, cmd)
 	}
 	input = textinput.New()
-	input.SetValue("123")
+	input.SetValue("https://github.com/openclaw/openclaw/issues/123")
 	model = clusterBrowserModel{
 		searchInput: input,
 		jumping:     true,
