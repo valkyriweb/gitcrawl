@@ -199,8 +199,12 @@ func TestGHXCacheCommandsReportAndCleanCacheState(t *testing.T) {
 	if err := app.clearGHCommandCache(); err != nil {
 		t.Fatalf("clear cache: %v", err)
 	}
-	if err := app.runGHXCache([]string{}); err == nil {
-		t.Fatal("missing xcache command should fail")
+	stdout.Reset()
+	if err := app.runGHXCache([]string{"--help"}); err != nil {
+		t.Fatalf("xcache help: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Usage:") || !strings.Contains(stdout.String(), "snapshot") {
+		t.Fatalf("help output = %q", stdout.String())
 	}
 	if err := app.runGHXCache([]string{"stats", "--since", "nope"}); err == nil {
 		t.Fatal("invalid since should fail")

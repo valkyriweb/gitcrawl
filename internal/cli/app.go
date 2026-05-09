@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alecthomas/kong"
 	clusterer "github.com/openclaw/gitcrawl/internal/cluster"
 	"github.com/openclaw/gitcrawl/internal/config"
 	gh "github.com/openclaw/gitcrawl/internal/github"
@@ -88,30 +89,24 @@ func New() *App {
 }
 
 func (a *App) Run(ctx context.Context, args []string) error {
-	global := flag.NewFlagSet("gitcrawl", flag.ContinueOnError)
-	global.SetOutput(io.Discard)
-	configPath := global.String("config", "", "config path")
-	format := global.String("format", string(FormatText), "output format: text|json|log")
-	jsonOut := global.Bool("json", false, "write JSON output")
-	versionFlag := global.Bool("version", false, "print version")
-	global.Bool("no-color", false, "disable color output")
-	if err := global.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			a.printUsage()
-			return nil
-		}
+	if len(args) == 0 || rootHelpRequested(args, "config", "format") {
+		a.printUsage()
+		return nil
+	}
+	var global gitcrawlRootArgs
+	if err := parseKongArgs(&global, args, "gitcrawl", a.Stdout, a.Stderr); err != nil {
 		return usageErr(err)
 	}
 
-	resolvedFormat, err := resolveOutputFormat(*format, *jsonOut)
+	resolvedFormat, err := resolveOutputFormat(global.Format, global.JSON)
 	if err != nil {
 		return usageErr(err)
 	}
-	a.configPath = strings.TrimSpace(*configPath)
+	a.configPath = strings.TrimSpace(global.Config)
 	a.format = resolvedFormat
 
-	rest := global.Args()
-	if *versionFlag {
+	rest := global.Args
+	if global.Version {
 		return a.writeOutput("version", map[string]string{"version": version}, false)
 	}
 	if len(rest) == 0 || rest[0] == "--help" || rest[0] == "-h" {
@@ -191,6 +186,70 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	default:
 		return usageErr(fmt.Errorf("unknown command %q", rest[0]))
 	}
+}
+
+type gitcrawlRootArgs struct {
+	Config  string   `help:"Config path."`
+	Format  string   `default:"text" help:"Output format: text, json, or log."`
+	JSON    bool     `name:"json" help:"Write JSON output."`
+	Version bool     `help:"Print version."`
+	NoColor bool     `name:"no-color" help:"Disable color output."`
+	Args    []string `arg:"" optional:"" passthrough:"partial" name:"command" help:"Command and arguments."`
+}
+
+func rootHelpRequested(args []string, valueFlags ...string) bool {
+	valueFlagSet := make(map[string]struct{}, len(valueFlags))
+	for _, flag := range valueFlags {
+		valueFlagSet[flag] = struct{}{}
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--help" || arg == "-h" || (arg == "help" && i == len(args)-1) {
+			return true
+		}
+		if !strings.HasPrefix(arg, "-") {
+			return false
+		}
+		if strings.HasPrefix(arg, "--") {
+			name := strings.TrimPrefix(arg, "--")
+			if before, _, ok := strings.Cut(name, "="); ok {
+				name = before
+			} else if _, ok := valueFlagSet[name]; ok {
+				i++
+			}
+		}
+	}
+	return false
+}
+
+func parseKongArgs(target any, args []string, name string, stdout, stderr io.Writer, options ...kong.Option) error {
+	_, err := parseKongContext(target, args, name, stdout, stderr, options...)
+	return err
+}
+
+func parseKongContext(target any, args []string, name string, stdout, stderr io.Writer, options ...kong.Option) (*kong.Context, error) {
+	opts := []kong.Option{
+		kong.Name(name),
+		kong.NoDefaultHelp(),
+		kong.Writers(stdout, stderr),
+		kong.Exit(func(int) {}),
+	}
+	opts = append(opts, options...)
+	parser, err := kong.New(target, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return parser.Parse(args)
+}
+
+func selectedKongCommand(ctx *kong.Context) string {
+	var selected string
+	for _, path := range ctx.Path {
+		if path.Command != nil {
+			selected = path.Command.Name
+		}
+	}
+	return selected
 }
 
 func (a *App) runConfigure(args []string) error {

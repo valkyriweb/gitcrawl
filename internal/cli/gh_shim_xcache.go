@@ -2,7 +2,6 @@ package cli
 
 import (
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -44,42 +43,87 @@ type ghCommandCacheKeyInfo struct {
 }
 
 func (a *App) runGHXCache(args []string) error {
-	if len(args) == 0 {
-		return usageErr(fmt.Errorf("usage: gh xcache <stats|keys|gc|flush|reset|snapshot>"))
+	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
+		printGHXCacheUsage(a.Stdout)
+		return nil
 	}
-	fs := flag.NewFlagSet("xcache "+args[0], flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	jsonOut := fs.Bool("json", false, "write JSON output")
-	sinceRaw := fs.String("since", "", "show stats for the recent duration (stats only)")
-	resetAfterSnapshot := fs.Bool("reset", false, "reset counters after writing a snapshot (snapshot only)")
-	if err := fs.Parse(args[1:]); err != nil {
+	var parsed ghXCacheCLI
+	kctx, err := parseKongContext(&parsed, args, "gh xcache", a.Stdout, a.Stderr)
+	if err != nil {
 		return usageErr(err)
 	}
-	a.applyCommandJSON(*jsonOut)
-	switch args[0] {
+	switch selectedKongCommand(kctx) {
 	case "stats":
+		a.applyCommandJSON(parsed.Stats.JSON)
 		var since time.Duration
-		if strings.TrimSpace(*sinceRaw) != "" {
-			parsed, err := time.ParseDuration(strings.TrimSpace(*sinceRaw))
-			if err != nil || parsed <= 0 {
-				return usageErr(fmt.Errorf("invalid --since duration %q", *sinceRaw))
+		if strings.TrimSpace(parsed.Stats.Since) != "" {
+			duration, err := time.ParseDuration(strings.TrimSpace(parsed.Stats.Since))
+			if err != nil || duration <= 0 {
+				return usageErr(fmt.Errorf("invalid --since duration %q", parsed.Stats.Since))
 			}
-			since = parsed
+			since = duration
 		}
 		return a.runGHXCacheStats(since)
 	case "keys":
+		a.applyCommandJSON(parsed.Keys.JSON)
 		return a.runGHXCacheKeys()
 	case "gc":
+		a.applyCommandJSON(parsed.GC.JSON)
 		return a.runGHXCacheGC()
 	case "flush":
+		a.applyCommandJSON(parsed.Flush.JSON)
 		return a.runGHXCacheFlush()
 	case "reset":
+		a.applyCommandJSON(parsed.Reset.JSON)
 		return a.runGHXCacheReset()
 	case "snapshot":
-		return a.runGHXCacheSnapshot(*resetAfterSnapshot)
+		a.applyCommandJSON(parsed.Snapshot.JSON)
+		return a.runGHXCacheSnapshot(parsed.Snapshot.Reset)
 	default:
-		return usageErr(fmt.Errorf("unknown xcache command %q", args[0]))
+		return usageErr(fmt.Errorf("unknown xcache command %q", selectedKongCommand(kctx)))
 	}
+}
+
+type ghXCacheCLI struct {
+	Stats    ghXCacheStatsArgs    `cmd:"" help:"Show cache size and hit/miss counters."`
+	Keys     ghXCacheJSONArgs     `cmd:"" help:"List cache keys."`
+	GC       ghXCacheJSONArgs     `cmd:"" name:"gc" help:"Remove expired cache entries."`
+	Flush    ghXCacheJSONArgs     `cmd:"" help:"Remove all cache entries."`
+	Reset    ghXCacheJSONArgs     `cmd:"" help:"Reset xcache counters."`
+	Snapshot ghXCacheSnapshotArgs `cmd:"" help:"Write a counter snapshot."`
+}
+
+type ghXCacheStatsArgs struct {
+	JSON  bool   `name:"json" help:"Write JSON output."`
+	Since string `help:"Stats window duration."`
+}
+
+type ghXCacheJSONArgs struct {
+	JSON bool `name:"json" help:"Write JSON output."`
+}
+
+type ghXCacheSnapshotArgs struct {
+	JSON  bool `name:"json" help:"Write JSON output."`
+	Reset bool `help:"Reset counters after snapshot."`
+}
+
+func printGHXCacheUsage(w io.Writer) {
+	_, _ = fmt.Fprint(w, `Usage:
+  gh xcache <stats|keys|gc|flush|reset|snapshot> [flags]
+
+Commands:
+  stats      Show cache size and hit/miss counters.
+  keys       List cache keys.
+  gc         Remove expired cache entries.
+  flush      Remove all cache entries.
+  reset      Reset xcache counters.
+  snapshot   Write a counter snapshot.
+
+Flags:
+  --json       Write JSON output.
+  --since D    Stats window duration, for stats only.
+  --reset      Reset counters after snapshot, for snapshot only.
+`)
 }
 
 func (a *App) runGHXCacheStats(since time.Duration) error {

@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 - Unreleased
+
+- Move top-level CLI parsing and `gh xcache` argument parsing onto Kong while keeping the broader `gh` shim pass-through compatible with GitHub CLI argument shapes.
+- Keep `gh xcache --help` discoverable and make `stats --since`, JSON output, and snapshot reset parsing share one typed parser path.
 
 ## 0.3.1 - 2026-05-08
 
