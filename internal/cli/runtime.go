@@ -30,7 +30,7 @@ const portableStoreRefreshFailureBackoff = time.Minute
 var errPortableStoreDirty = errors.New("portable store checkout has local changes")
 
 func (a *App) openLocalRuntime(ctx context.Context) (localRuntime, error) {
-	cfg, err := config.Load(a.configPath)
+	cfg, err := config.LoadRuntime(a.configPath)
 	if err != nil {
 		return localRuntime{}, err
 	}
@@ -52,7 +52,7 @@ func (a *App) openLocalRuntime(ctx context.Context) (localRuntime, error) {
 }
 
 func (a *App) openLocalRuntimeReadOnly(ctx context.Context) (localRuntime, error) {
-	cfg, err := config.Load(a.configPath)
+	cfg, err := config.LoadRuntime(a.configPath)
 	if err != nil {
 		return localRuntime{}, err
 	}
