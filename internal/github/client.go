@@ -20,6 +20,7 @@ type Client struct {
 	token      string
 	userAgent  string
 	pageDelay  time.Duration
+	rateLimit  RateLimitObserver
 }
 
 type Options struct {
@@ -28,6 +29,17 @@ type Options struct {
 	UserAgent  string
 	HTTPClient *http.Client
 	PageDelay  time.Duration
+	RateLimit  RateLimitObserver
+}
+
+type RateLimitObserver func(RateLimitSnapshot)
+
+type RateLimitSnapshot struct {
+	Host      string
+	Limit     int
+	Remaining int
+	ResetAt   time.Time
+	Resource  string
 }
 
 type ListIssuesOptions struct {
@@ -77,6 +89,7 @@ func New(options Options) *Client {
 		token:      options.Token,
 		userAgent:  userAgent,
 		pageDelay:  options.PageDelay,
+		rateLimit:  options.RateLimit,
 	}
 }
 
@@ -282,6 +295,7 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body io.Reader
 	if err != nil {
 		return nil, fmt.Errorf("github request: %w", err)
 	}
+	c.observeRateLimit(resp.Header)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return resp, nil
 	}
@@ -294,6 +308,41 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body io.Reader
 		Body:    strings.TrimSpace(string(data)),
 		Headers: resp.Header,
 	}
+}
+
+func (c *Client) observeRateLimit(header http.Header) {
+	if c.rateLimit == nil {
+		return
+	}
+	remaining, err := strconv.Atoi(strings.TrimSpace(header.Get("X-RateLimit-Remaining")))
+	if err != nil {
+		return
+	}
+	limit, _ := strconv.Atoi(strings.TrimSpace(header.Get("X-RateLimit-Limit")))
+	var resetAt time.Time
+	if raw := strings.TrimSpace(header.Get("X-RateLimit-Reset")); raw != "" {
+		if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			resetAt = time.Unix(secs, 0).UTC()
+		}
+	}
+	c.rateLimit(RateLimitSnapshot{
+		Host:      rateLimitHostForBaseURL(c.baseURL),
+		Limit:     limit,
+		Remaining: remaining,
+		ResetAt:   resetAt,
+		Resource:  strings.TrimSpace(header.Get("X-RateLimit-Resource")),
+	})
+}
+
+func rateLimitHostForBaseURL(baseURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	if strings.EqualFold(parsed.Hostname(), "api.github.com") {
+		return "github.com"
+	}
+	return parsed.Host
 }
 
 func rateLimitWait(err error) (time.Duration, bool) {

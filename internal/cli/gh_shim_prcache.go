@@ -87,6 +87,9 @@ func (a *App) localGHThreadComments(ctx context.Context, threadID int64) ([]stor
 func ghCommentsJSONValue(comments []store.Comment) []map[string]any {
 	out := make([]map[string]any, 0, len(comments))
 	for _, comment := range comments {
+		if comment.CommentType == "pull_review" {
+			continue
+		}
 		out = append(out, map[string]any{
 			"id":        comment.GitHubID,
 			"author":    map[string]any{"login": comment.AuthorLogin, "type": comment.AuthorType},
@@ -146,6 +149,8 @@ func ghPRDetailJSONValue(thread store.Thread, cache store.PullRequestCache, fiel
 		return map[string]any{"nameWithOwner": cache.Detail.HeadRepoFullName}, nil
 	case "mergeStateStatus":
 		return strings.ToUpper(cache.Detail.MergeableState), nil
+	case "mergeable":
+		return ghMergeableValue(cache.Detail.MergeableState), nil
 	case "additions":
 		return cache.Detail.Additions, nil
 	case "deletions":
@@ -156,6 +161,17 @@ func ghPRDetailJSONValue(thread store.Thread, cache store.PullRequestCache, fiel
 		return thread.IsDraft, nil
 	default:
 		return nil, fmt.Errorf("unsupported --json field %q", field)
+	}
+}
+
+func ghMergeableValue(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "blocked", "behind", "clean", "unstable", "has_hooks":
+		return "MERGEABLE"
+	case "dirty":
+		return "CONFLICTING"
+	default:
+		return "UNKNOWN"
 	}
 }
 

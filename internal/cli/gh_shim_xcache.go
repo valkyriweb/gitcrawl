@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ type ghCommandCacheStats struct {
 	HitRatePercent     float64                        `json:"hit_rate_percent"`
 	Counters           ghXCacheCounters               `json:"counters"`
 	CumulativeCounters *ghXCacheCounters              `json:"cumulative_counters,omitempty"`
+	RateLimit          *ghSharedRateLimitState        `json:"rate_limit,omitempty"`
 	Commands           map[string]ghCommandCacheCount `json:"commands"`
 }
 
@@ -148,9 +150,13 @@ func (a *App) runGHXCacheStats(since time.Duration) error {
 	if stats.Since != "" {
 		_, _ = fmt.Fprintf(a.Stdout, "\nSince: %s\n", stats.Since)
 	}
-	_, _ = fmt.Fprintf(a.Stdout, "\nCounters:\n  local hits:          %d\n  fallback hits:       %d\n  stale hits:          %d\n  backend misses:      %d\n  pass-through writes: %d\n  hit rate:            %.1f%% (%d/%d reads)\n",
-		stats.Counters.LocalHits, stats.Counters.FallbackHits, stats.Counters.StaleHits, stats.Counters.BackendMisses, stats.Counters.PassThroughWrites,
+	_, _ = fmt.Fprintf(a.Stdout, "\nCounters:\n  local hits:              %d\n  fallback hits:           %d\n  stale hits:              %d\n  low-budget stale hits:   %d\n  backend misses:          %d\n  pass-through writes:     %d\n  hit rate:                %.1f%% (%d/%d reads)\n",
+		stats.Counters.LocalHits, stats.Counters.FallbackHits, stats.Counters.StaleHits, stats.Counters.LowBudgetStaleHits, stats.Counters.BackendMisses, stats.Counters.PassThroughWrites,
 		stats.HitRatePercent, stats.CacheHits, stats.TotalReads)
+	if stats.RateLimit != nil {
+		_, _ = fmt.Fprintf(a.Stdout, "\nShared Rate Limit:\n  low:       %t\n  remaining: %d\n  threshold: %d\n  reset:     %s\n",
+			stats.RateLimit.Low, stats.RateLimit.Remaining, stats.RateLimit.Threshold, stats.RateLimit.ResetAt.Format(time.RFC3339))
+	}
 	printGHXCacheMisses(a.Stdout, "Backend Misses by Command", stats.Counters.BackendMissesByCommand)
 	printGHXCacheMisses(a.Stdout, "Backend Misses by Route", stats.Counters.BackendMissesByRoute)
 	printGHXCacheMisses(a.Stdout, "Backend Misses by Key", stats.Counters.BackendMissesByKey)
@@ -294,6 +300,9 @@ func (a *App) ghCommandCacheStats(since time.Duration) (ghCommandCacheStats, err
 	counters, _ := a.ghXCacheCounters()
 	cumulative := counters
 	stats := ghCommandCacheStats{CacheDir: dir, Locks: locks, Counters: counters, Commands: map[string]ghCommandCacheCount{}}
+	if state, ok := a.sharedRateLimitState(context.Background()); ok {
+		stats.RateLimit = &state
+	}
 	if since > 0 {
 		stats.Since = since.String()
 		stats.CumulativeCounters = &cumulative

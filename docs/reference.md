@@ -119,6 +119,8 @@ Override the config root with `--config <path>` or `GITCRAWL_CONFIG`.
 | `gh pr diff` with stable head SHA | `7d` |
 | Override | `GITCRAWL_GH_CACHE_TTL` |
 | Stale-while-revalidate grace | command-aware; override with `GITCRAWL_GH_STALE_GRACE` |
+| Low-budget stale grace | command-aware; override with `GITCRAWL_GH_LOW_BUDGET_STALE_GRACE` |
+| Low-budget threshold | `250` remaining shared core requests; override with `GITCRAWL_GH_RATE_LIMIT_LOW_REMAINING` |
 | Cache read failures | on by default; error TTL is capped (`2m` for rate-limit errors); disable with `GITCRAWL_GH_CACHE_ERRORS=0` |
 
 ## gh shim cache key composition

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/openclaw/gitcrawl/internal/config"
+	gh "github.com/openclaw/gitcrawl/internal/github"
 	"github.com/openclaw/gitcrawl/internal/store"
 )
 
@@ -118,6 +119,258 @@ echo "call-$count:$*"
 	}
 	if int(flushed["removed"].(float64)) != 1 {
 		t.Fatalf("flushed = %#v", flushed)
+	}
+}
+
+func TestGHShimPreservesGHJQWithoutExternalJQ(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "count")
+	ghPath := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+count=0
+if [ -f "$GH_SHIM_COUNT" ]; then
+  IFS= read -r count < "$GH_SHIM_COUNT"
+fi
+count=$((count + 1))
+printf "%s" "$count" > "$GH_SHIM_COUNT"
+jq_expr=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --jq|-q)
+      shift
+      jq_expr="$1"
+      ;;
+    --jq=*)
+      jq_expr="${1#--jq=}"
+      ;;
+    -q=*)
+      jq_expr="${1#-q=}"
+      ;;
+  esac
+  shift
+done
+case "$jq_expr" in
+  .nameWithOwner)
+    printf 'openclaw/gitcrawl\n'
+    ;;
+  .id)
+    printf '123\n'
+    ;;
+  *)
+    printf '{"nameWithOwner":"openclaw/gitcrawl","id":123}\n'
+    ;;
+esac
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("GITCRAWL_GH_PATH", ghPath)
+	t.Setenv("GH_SHIM_COUNT", countPath)
+	t.Setenv("GITCRAWL_GH_CACHE_TTL", "1m")
+	t.Setenv("PATH", "")
+
+	run := New()
+	var stdout bytes.Buffer
+	run.Stdout = &stdout
+	base := []string{"--config", configPath, "gh", "repo", "view", "openclaw/gitcrawl", "--json", "id,nameWithOwner"}
+	if err := run.Run(ctx, append(append([]string{}, base...), "--jq", ".nameWithOwner")); err != nil {
+		t.Fatalf("first jq read: %v", err)
+	}
+	if strings.TrimSpace(stdout.String()) != "openclaw/gitcrawl" {
+		t.Fatalf("first jq output = %q", stdout.String())
+	}
+	stdout.Reset()
+	if err := run.Run(ctx, append(append([]string{}, base...), "--jq", ".nameWithOwner")); err != nil {
+		t.Fatalf("second jq read: %v", err)
+	}
+	if strings.TrimSpace(stdout.String()) != "openclaw/gitcrawl" {
+		t.Fatalf("second jq output = %q", stdout.String())
+	}
+	countData, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatalf("read count: %v", err)
+	}
+	if strings.TrimSpace(string(countData)) != "1" {
+		t.Fatalf("fake gh call count = %q, want 1", countData)
+	}
+}
+
+func TestGHRateLimitStateUsesObservedAPIHost(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	t.Setenv("GITCRAWL_GITHUB_BASE_URL", "https://ghe.example/api/v3")
+	t.Setenv("GITHUB_TOKEN", "custom-host-token")
+
+	app := New()
+	app.configPath = configPath
+	if err := app.writeSharedRateLimit(ctx, "custom-host-token", gh.RateLimitSnapshot{
+		Host:      "ghe.example",
+		Limit:     5000,
+		Remaining: 0,
+		ResetAt:   time.Now().Add(time.Hour),
+		Resource:  "core",
+	}, "test"); err != nil {
+		t.Fatalf("write rate limit state: %v", err)
+	}
+	if _, ok := app.sharedRateLimitStateForTokenHost("custom-host-token", "ghe.example"); !ok {
+		t.Fatal("missing custom-host rate limit state")
+	}
+	if _, ok := app.sharedRateLimitStateForTokenHost("custom-host-token", "github.com"); ok {
+		t.Fatal("custom-host rate limit state should not be stored under github.com")
+	}
+	if _, ok := app.sharedRateLimitStateForToken("custom-host-token"); ok {
+		t.Fatal("default shim host should not read custom-host rate limit state")
+	}
+	if _, low := app.sharedRateLimitLowForArgs(ctx, []string{"api", "--hostname", "ghe.example", "rate_limit"}); !low {
+		t.Fatal("command hostname should read custom-host rate limit state")
+	}
+}
+
+func TestGHShimLowBudgetStaleUsesCommandHostname(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "count")
+	ghPath := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+count=0
+if [ -f "$GH_SHIM_COUNT" ]; then
+  count=$(cat "$GH_SHIM_COUNT")
+fi
+count=$((count + 1))
+printf "%s" "$count" > "$GH_SHIM_COUNT"
+printf '{"name":"fresh"}\n'
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("GITCRAWL_GH_PATH", ghPath)
+	t.Setenv("GH_SHIM_COUNT", countPath)
+	t.Setenv("GITHUB_TOKEN", "hostname-token")
+
+	app := New()
+	app.configPath = configPath
+	args := []string{"api", "--hostname", "ghe.example", "repos/openclaw/gitcrawl"}
+	cacheDir, err := app.ghCommandCacheDir()
+	if err != nil {
+		t.Fatalf("cache dir: %v", err)
+	}
+	entryPath := filepath.Join(cacheDir, app.ghCommandCacheKey(ctx, args)+".json")
+	if err := writeGHCommandCache(entryPath, ghCommandCacheEntry{
+		CreatedAt: time.Now().UTC().Add(-2 * time.Hour),
+		Args:      args,
+		ExitCode:  0,
+		Stdout:    `{"name":"stale"}` + "\n",
+	}); err != nil {
+		t.Fatalf("write stale cache: %v", err)
+	}
+	if err := app.writeSharedRateLimit(ctx, "hostname-token", gh.RateLimitSnapshot{
+		Host:      "github.com",
+		Limit:     5000,
+		Remaining: 0,
+		ResetAt:   time.Now().Add(time.Hour),
+		Resource:  "core",
+	}, "test"); err != nil {
+		t.Fatalf("write default rate limit state: %v", err)
+	}
+
+	run := New()
+	var stdout, stderr bytes.Buffer
+	run.Stdout = &stdout
+	run.Stderr = &stderr
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "api", "--hostname", "ghe.example", "repos/openclaw/gitcrawl"}); err != nil {
+		t.Fatalf("hostname read: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"fresh"`) || strings.Contains(stdout.String(), `"stale"`) {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	countData, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatalf("read count: %v", err)
+	}
+	if strings.TrimSpace(string(countData)) != "1" {
+		t.Fatalf("fake gh call count = %q, want 1", countData)
+	}
+}
+
+func TestGHShimServesLowBudgetStaleBeforeBackend(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "count")
+	ghPath := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+count=0
+if [ -f "$GH_SHIM_COUNT" ]; then
+  count=$(cat "$GH_SHIM_COUNT")
+fi
+count=$((count + 1))
+printf "%s" "$count" > "$GH_SHIM_COUNT"
+echo "backend should not run" >&2
+exit 9
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("GITCRAWL_GH_PATH", ghPath)
+	t.Setenv("GH_SHIM_COUNT", countPath)
+	t.Setenv("GITHUB_TOKEN", "low-budget-token")
+
+	app := New()
+	app.configPath = configPath
+	cacheArgs := []string{"repo", "view", "openclaw/gitcrawl", "--json", "nameWithOwner"}
+	cacheDir, err := app.ghCommandCacheDir()
+	if err != nil {
+		t.Fatalf("cache dir: %v", err)
+	}
+	entryPath := filepath.Join(cacheDir, app.ghCommandCacheKey(ctx, cacheArgs)+".json")
+	if err := writeGHCommandCache(entryPath, ghCommandCacheEntry{
+		CreatedAt: time.Now().UTC().Add(-2 * time.Hour),
+		Args:      cacheArgs,
+		ExitCode:  0,
+		Stdout:    `{"nameWithOwner":"openclaw/gitcrawl"}` + "\n",
+	}); err != nil {
+		t.Fatalf("write stale cache: %v", err)
+	}
+	if err := app.writeSharedRateLimit(ctx, "low-budget-token", gh.RateLimitSnapshot{
+		Limit:     5000,
+		Remaining: 0,
+		ResetAt:   time.Now().Add(time.Hour),
+		Resource:  "core",
+	}, "test"); err != nil {
+		t.Fatalf("write rate limit state: %v", err)
+	}
+
+	run := New()
+	var stdout, stderr bytes.Buffer
+	run.Stdout = &stdout
+	run.Stderr = &stderr
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "repo", "view", "openclaw/gitcrawl", "--json", "nameWithOwner"}); err != nil {
+		t.Fatalf("low-budget stale read: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "openclaw/gitcrawl") || !strings.Contains(stderr.String(), "shared GitHub rate limit low") {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if data, err := os.ReadFile(countPath); err == nil && strings.TrimSpace(string(data)) != "" {
+		t.Fatalf("backend ran unexpectedly: %q", data)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "xcache", "stats", "--json"}); err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	var stats map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &stats); err != nil {
+		t.Fatalf("decode stats: %v\n%s", err, stdout.String())
+	}
+	counters := stats["counters"].(map[string]any)
+	if int(counters["low_budget_stale_hits"].(float64)) != 1 {
+		t.Fatalf("counters = %#v", counters)
+	}
+	if stats["rate_limit"] == nil {
+		t.Fatalf("missing rate_limit: %#v", stats)
 	}
 }
 

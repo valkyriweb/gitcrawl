@@ -296,6 +296,30 @@ func TestRateLimitRetriesOn403WithRemainingZero(t *testing.T) {
 	}
 }
 
+func TestRateLimitObserverIncludesAPIHost(t *testing.T) {
+	var snapshot RateLimitSnapshot
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	}))
+	defer server.Close()
+
+	client := New(Options{
+		BaseURL:   server.URL,
+		PageDelay: -1,
+		RateLimit: func(value RateLimitSnapshot) {
+			snapshot = value
+		},
+	})
+	if _, err := client.GetRepo(context.Background(), "openclaw", "gitcrawl", nil); err != nil {
+		t.Fatalf("get repo: %v", err)
+	}
+	if snapshot.Host != strings.TrimPrefix(server.URL, "http://") || snapshot.Remaining != 4999 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}
+
 func TestRateLimitRetriesOn429WithRetryAfter(t *testing.T) {
 	var calls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

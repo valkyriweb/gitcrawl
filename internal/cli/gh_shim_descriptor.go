@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -359,6 +360,37 @@ func ghCompletedRunCacheTTL(entry ghCommandCacheEntry) time.Duration {
 		if strings.Contains(route, "/actions/runs") && ghJSONCollectionCompleted(entry.Stdout) {
 			return 30 * time.Minute
 		}
+	}
+	return 0
+}
+
+func ghClosedThreadCacheTTL(entry ghCommandCacheEntry) time.Duration {
+	if len(entry.Args) < 2 {
+		return 0
+	}
+	command := ghCommandName(entry.Args)
+	if command != "issue view" && command != "pr view" && entry.Args[0] != "api" {
+		return 0
+	}
+	if entry.Args[0] == "api" {
+		route := normalizeGHAPIRoute(entry.Args[1:])
+		if !strings.Contains(route, "/issues/:id") && !strings.Contains(route, "/pulls/:id") {
+			return 0
+		}
+		if strings.Contains(route, "/comments") || strings.Contains(route, "/reviews") {
+			return 0
+		}
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(entry.Stdout), &payload); err != nil {
+		return 0
+	}
+	state := strings.TrimSpace(fmt.Sprint(payload["state"]))
+	if state == "" {
+		return 0
+	}
+	if !strings.EqualFold(state, "open") {
+		return 24 * time.Hour
 	}
 	return 0
 }

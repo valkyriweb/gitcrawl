@@ -1916,7 +1916,7 @@ func (a *App) syncRepository(ctx context.Context, owner, repo string, options sy
 	}
 	defer rt.Store.Close()
 
-	client := gh.New(gh.Options{Token: token.Value, BaseURL: githubBaseURL()})
+	client := gh.New(gh.Options{Token: token.Value, BaseURL: githubBaseURL(), RateLimit: a.observeGitHubRateLimit(ctx, token.Value)})
 	service := syncer.New(client, rt.Store)
 	stats, err := service.Sync(ctx, syncer.Options{
 		Owner:            owner,

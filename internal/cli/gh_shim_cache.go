@@ -38,6 +38,14 @@ func (a *App) execRealGHMaybeCached(ctx context.Context, args []string) error {
 		_ = a.incrementGHXCacheCounter("fallback_hits")
 		return a.writeGHCommandCacheEntry(entry)
 	}
+	if hasStaleEntry {
+		if state, low := a.sharedRateLimitLowForArgs(ctx, args); low && ghCommandCacheEntryCanServeLowBudgetStale(staleEntry, ttl) {
+			_ = a.incrementGHXCacheCounter("stale_hits")
+			_ = a.incrementGHXCacheCounter("low_budget_stale_hits")
+			_, _ = io.WriteString(a.Stderr, state.staleNotice(time.Since(staleEntry.CreatedAt)))
+			return a.writeGHCommandCacheEntry(staleEntry)
+		}
+	}
 	lockPath := entryPath + ".lock"
 	lock, locked := tryGHCommandCacheLock(lockPath)
 	if !locked {
@@ -66,6 +74,9 @@ func (a *App) execRealGHMaybeCached(ctx context.Context, args []string) error {
 		return a.writeGHCommandCacheEntry(staleEntry)
 	}
 	if err == nil || cacheGHReadErrors() {
+		if err == nil {
+			_ = a.recordGHRateLimitFromOutput(ctx, args, stdout)
+		}
 		_ = writeGHCommandCache(entryPath, ghCommandCacheEntry{
 			CreatedAt: time.Now().UTC(),
 			Args:      append([]string(nil), args...),
@@ -249,6 +260,9 @@ func ghCommandCacheEntryTTL(entry ghCommandCacheEntry, ttl time.Duration) time.D
 		if completedTTL := ghCompletedRunCacheTTL(entry); completedTTL > ttl {
 			return completedTTL
 		}
+		if closedTTL := ghClosedThreadCacheTTL(entry); closedTTL > ttl {
+			return closedTTL
+		}
 		return ttl
 	}
 	errorTTL := 5 * time.Minute
@@ -270,6 +284,45 @@ func ghCommandCacheEntryCanServeStale(entry ghCommandCacheEntry, ttl time.Durati
 		return true
 	}
 	return age <= ghCommandCacheEntryTTL(entry, ttl)+ghCommandCacheStaleGrace(entry.Args)
+}
+
+func ghCommandCacheEntryCanServeLowBudgetStale(entry ghCommandCacheEntry, ttl time.Duration) bool {
+	if entry.ExitCode != 0 || entry.CreatedAt.IsZero() {
+		return false
+	}
+	age := time.Since(entry.CreatedAt)
+	if age <= ghCommandCacheEntryTTL(entry, ttl) {
+		return true
+	}
+	return age <= ghCommandCacheEntryTTL(entry, ttl)+ghCommandCacheLowBudgetStaleGrace(entry.Args)
+}
+
+func ghCommandCacheLowBudgetStaleGrace(args []string) time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("GITCRAWL_GH_LOW_BUDGET_STALE_GRACE")); raw != "" {
+		if duration, err := time.ParseDuration(raw); err == nil && duration >= 0 {
+			return duration
+		}
+	}
+	if len(args) == 0 {
+		return time.Hour
+	}
+	switch args[0] {
+	case "run":
+		return 10 * time.Minute
+	case "api":
+		route := normalizeGHAPIRoute(args[1:])
+		switch {
+		case strings.Contains(route, "/actions/runs"):
+			return 10 * time.Minute
+		case strings.Contains(route, "/contents"), strings.HasPrefix(route, "api users/"):
+			return 24 * time.Hour
+		case strings.Contains(route, "/issues"), strings.Contains(route, "/pulls"):
+			return 6 * time.Hour
+		}
+	case "issue", "pr", "repo", "release", "workflow":
+		return 6 * time.Hour
+	}
+	return time.Hour
 }
 
 func ghCommandCacheStaleGrace(args []string) time.Duration {

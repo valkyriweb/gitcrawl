@@ -149,7 +149,7 @@ func TestGHShimCachePolicyExtraBranches(t *testing.T) {
 		{[]string{"api", "repos/openclaw/gitcrawl/releases/latest"}, time.Hour},
 		{[]string{"api", "repos/openclaw/gitcrawl/branches/main"}, 10 * time.Minute},
 		{[]string{"workflow", "list"}, 15 * time.Minute},
-		{[]string{"issue", "view"}, 5 * time.Minute},
+		{[]string{"issue", "view"}, 15 * time.Minute},
 		{[]string{"unknown"}, 5 * time.Minute},
 	}
 	for _, tc := range ttlCases {

@@ -148,6 +148,22 @@ func TestGHShimViewAndListUseLocalCache(t *testing.T) {
 	}
 }
 
+func TestGHMergeableValueMapsNonConflictingStates(t *testing.T) {
+	tests := map[string]string{
+		"blocked":   "MERGEABLE",
+		"behind":    "MERGEABLE",
+		"clean":     "MERGEABLE",
+		"dirty":     "CONFLICTING",
+		"unknown":   "UNKNOWN",
+		"unchecked": "UNKNOWN",
+	}
+	for state, want := range tests {
+		if got := ghMergeableValue(state); got != want {
+			t.Fatalf("ghMergeableValue(%q) = %q, want %q", state, got, want)
+		}
+	}
+}
+
 func TestGHShimAutoHydratesPRDetailsOnMiss(t *testing.T) {
 	ctx := context.Background()
 	configPath := seedGHShimRepo(t, ctx)

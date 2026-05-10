@@ -55,14 +55,17 @@ func TestGHShimFallsBackForUnsupportedRead(t *testing.T) {
 	}
 	t.Setenv("GITCRAWL_GH_PATH", ghPath)
 
-	run := New()
-	var stdout bytes.Buffer
-	run.Stdout = &stdout
-	if err := run.Run(ctx, []string{"--config", configPath, "gh", "pr", "view", "12", "-R", "openclaw/openclaw", "--json", "unsupportedField"}); err != nil {
-		t.Fatalf("fallback: %v", err)
-	}
-	if got := strings.TrimSpace(stdout.String()); got != "fallback:pr view 12 -R openclaw/openclaw --json unsupportedField" {
-		t.Fatalf("fallback output = %q", got)
+	for _, fields := range []string{"unsupportedField", "reviews", "reviewDecision"} {
+		run := New()
+		var stdout bytes.Buffer
+		run.Stdout = &stdout
+		if err := run.Run(ctx, []string{"--config", configPath, "gh", "pr", "view", "12", "-R", "openclaw/openclaw", "--json", fields}); err != nil {
+			t.Fatalf("fallback %s: %v", fields, err)
+		}
+		want := "fallback:pr view 12 -R openclaw/openclaw --json " + fields
+		if got := strings.TrimSpace(stdout.String()); got != want {
+			t.Fatalf("fallback output for %s = %q, want %q", fields, got, want)
+		}
 	}
 }
 

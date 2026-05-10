@@ -43,7 +43,7 @@ func (a *App) loadGHPullRequestCache(ctx context.Context, repoValue string, numb
 func ghPRFieldsNeedFresh(fields []string) bool {
 	for _, field := range fields {
 		switch field {
-		case "statusCheckRollup", "mergeStateStatus":
+		case "statusCheckRollup", "mergeStateStatus", "mergeable":
 			return true
 		}
 	}

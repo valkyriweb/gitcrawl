@@ -176,13 +176,13 @@ func ghCommandCacheTTLBase(args []string, stablePRDiff bool) time.Duration {
 		case "search":
 			return 15 * time.Minute
 		case "release":
-			return 30 * time.Minute
+			return time.Hour
 		case "repo", "ruleset":
-			return 15 * time.Minute
+			return time.Hour
 		case "secret", "variable", "label", "org", "project", "gist", "cache":
 			return 10 * time.Minute
 		case "issue", "pr":
-			return 5 * time.Minute
+			return 15 * time.Minute
 		}
 	}
 	return 5 * time.Minute
@@ -244,6 +244,14 @@ func ghAPICacheTTL(args []string) time.Duration {
 		return 30 * time.Second
 	case strings.Contains(route, "/releases"):
 		return 1 * time.Hour
+	case strings.Contains(route, "/issues/:id/comments") || strings.Contains(route, "/pulls/:id/comments") || strings.Contains(route, "/pulls/:id/reviews"):
+		return time.Hour
+	case strings.Contains(route, "/issues/:id") || strings.Contains(route, "/pulls/:id"):
+		return 30 * time.Minute
+	case route == "api repos/:owner/:repo":
+		return time.Hour
+	case strings.Contains(route, "/pulls") || strings.Contains(route, "/issues"):
+		return 15 * time.Minute
 	case strings.Contains(route, "/branches") || strings.Contains(route, "/commits"):
 		return 10 * time.Minute
 	default:
