@@ -17,17 +17,27 @@ import (
 )
 
 func (a *App) runGHShim(ctx context.Context, args []string) error {
+	args, controls := parseGHShimControls(args)
 	if len(args) == 0 {
-		return a.execRealGH(ctx, args)
+		return a.execRealGHWithMutationTracking(ctx, args)
 	}
 	switch args[0] {
 	case "xcache":
 		return a.runGHXCache(args[1:])
+	}
+	if controls.Live {
+		_ = a.incrementGHXCacheCounter("live_bypasses")
+		return a.execRealGHWithMutationTracking(ctx, args)
+	}
+	switch args[0] {
 	case "search":
 		if len(args) >= 2 && isGHSearchKind(args[1]) {
 			if err := a.runGHSearch(ctx, args[1:]); err != nil {
 				if isLocalGHUnsupported(err) {
-					return a.execRealGHMaybeCached(ctx, args)
+					if controls.Cached {
+						return err
+					}
+					return a.execRealGHMaybeCached(ctx, args, controls)
 				}
 				return err
 			}
@@ -40,7 +50,10 @@ func (a *App) runGHShim(ctx context.Context, args []string) error {
 			case "view":
 				if err := a.runGHThreadView(ctx, args[0], args[2:]); err != nil {
 					if isLocalGHUnsupported(err) {
-						return a.execRealGHMaybeCached(ctx, args)
+						if controls.Cached {
+							return err
+						}
+						return a.execRealGHMaybeCached(ctx, args, controls)
 					}
 					return err
 				}
@@ -50,7 +63,10 @@ func (a *App) runGHShim(ctx context.Context, args []string) error {
 				if args[0] == "pr" {
 					if err := a.runGHPRChecks(ctx, args[2:]); err != nil {
 						if isLocalGHUnsupported(err) {
-							return a.execRealGHMaybeCached(ctx, args)
+							if controls.Cached {
+								return err
+							}
+							return a.execRealGHMaybeCached(ctx, args, controls)
 						}
 						return err
 					}
@@ -60,7 +76,10 @@ func (a *App) runGHShim(ctx context.Context, args []string) error {
 			case "list":
 				if err := a.runGHThreadList(ctx, args[0], args[2:]); err != nil {
 					if isLocalGHUnsupported(err) {
-						return a.execRealGHMaybeCached(ctx, args)
+						if controls.Cached {
+							return err
+						}
+						return a.execRealGHMaybeCached(ctx, args, controls)
 					}
 					return err
 				}
@@ -72,18 +91,34 @@ func (a *App) runGHShim(ctx context.Context, args []string) error {
 		if len(args) >= 2 {
 			switch args[1] {
 			case "list":
-				if err := a.runGHRunList(ctx, args[2:]); err != nil {
+				if a.shouldBypassGHCacheForLiveness(ctx, args, controls) {
+					return a.execRealGHWithMutationTracking(ctx, args)
+				}
+				if err := a.runGHRunList(ctx, args[2:], controls); err != nil {
 					if isLocalGHUnsupported(err) {
-						return a.execRealGHMaybeCached(ctx, args)
+						if controls.Cached {
+							return err
+						}
+						if isGHRunListLiveRequired(err) {
+							_ = a.incrementGHXCacheCounter("live_bypasses")
+							return a.execRealGHWithMutationTracking(ctx, args)
+						}
+						return a.execRealGHMaybeCached(ctx, args, controls)
 					}
 					return err
 				}
 				_ = a.incrementGHXCacheCounter("local_hits")
 				return nil
 			case "view":
+				if a.shouldBypassGHCacheForLiveness(ctx, args, controls) {
+					return a.execRealGHWithMutationTracking(ctx, args)
+				}
 				if err := a.runGHRunView(ctx, args[2:]); err != nil {
 					if isLocalGHUnsupported(err) {
-						return a.execRealGHMaybeCached(ctx, args)
+						if controls.Cached {
+							return err
+						}
+						return a.execRealGHMaybeCached(ctx, args, controls)
 					}
 					return err
 				}
@@ -92,7 +127,7 @@ func (a *App) runGHShim(ctx context.Context, args []string) error {
 			}
 		}
 	}
-	return a.execRealGHMaybeCached(ctx, args)
+	return a.execRealGHMaybeCached(ctx, args, controls)
 }
 
 func (a *App) runGHThreadView(ctx context.Context, resource string, args []string) error {

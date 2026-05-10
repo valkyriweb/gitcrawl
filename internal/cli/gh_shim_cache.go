@@ -18,14 +18,19 @@ import (
 	"github.com/openclaw/gitcrawl/internal/config"
 )
 
-func (a *App) execRealGHMaybeCached(ctx context.Context, args []string) error {
+func (a *App) execRealGHWithMutationTracking(ctx context.Context, args []string) error {
+	err := a.execRealGH(ctx, args)
+	if err == nil && mutatingGHCommand(args) {
+		_ = a.incrementGHXCacheCounter("pass_through_writes")
+		_ = a.clearGHCommandCacheForMutation(ctx, args)
+		_ = a.recordGHLivenessTombstone(ctx, args)
+	}
+	return err
+}
+
+func (a *App) execRealGHMaybeCached(ctx context.Context, args []string, controls ghShimControls) error {
 	if !cacheableGHRead(args) {
-		err := a.execRealGH(ctx, args)
-		if err == nil && mutatingGHCommand(args) {
-			_ = a.incrementGHXCacheCounter("pass_through_writes")
-			_ = a.clearGHCommandCacheForMutation(ctx, args)
-		}
-		return err
+		return a.execRealGHWithMutationTracking(ctx, args)
 	}
 	cacheDir, err := a.ghCommandCacheDir()
 	if err != nil {
@@ -34,35 +39,44 @@ func (a *App) execRealGHMaybeCached(ctx context.Context, args []string) error {
 	ttl := a.ghCommandCacheTTL(ctx, args)
 	entryPath := filepath.Join(cacheDir, a.ghCommandCacheKey(ctx, args)+".json")
 	staleEntry, hasStaleEntry := readGHCommandCacheEntry(entryPath)
-	if entry, ok := readGHCommandCache(entryPath, ttl); ok {
-		_ = a.incrementGHXCacheCounter("fallback_hits")
-		return a.writeGHCommandCacheEntry(entry)
+	bypassCache := false
+	if a.shouldBypassGHCacheForLiveness(ctx, args, controls) {
+		bypassCache = true
 	}
-	if hasStaleEntry {
-		if state, low := a.sharedRateLimitLowForArgs(ctx, args); low && ghCommandCacheEntryCanServeLowBudgetStale(staleEntry, ttl) {
-			_ = a.incrementGHXCacheCounter("stale_hits")
-			_ = a.incrementGHXCacheCounter("low_budget_stale_hits")
-			_, _ = io.WriteString(a.Stderr, state.staleNotice(time.Since(staleEntry.CreatedAt)))
-			return a.writeGHCommandCacheEntry(staleEntry)
-		}
-	}
-	lockPath := entryPath + ".lock"
-	lock, locked := tryGHCommandCacheLock(lockPath)
-	if !locked {
-		if entry, hit, ok := waitGHCommandCache(entryPath, lockPath, ttl, staleEntry, hasStaleEntry); ok {
-			_ = a.incrementGHXCacheCounter(hit)
-			return a.writeGHCommandCacheEntry(entry)
-		}
-		lock, locked = tryGHCommandCacheLock(lockPath)
-	}
-	if locked {
-		defer func() {
-			_ = lock.Close()
-			_ = os.Remove(lockPath)
-		}()
+	if !bypassCache {
 		if entry, ok := readGHCommandCache(entryPath, ttl); ok {
 			_ = a.incrementGHXCacheCounter("fallback_hits")
+			a.writeGHCommandCacheLivenessNotice(entry)
 			return a.writeGHCommandCacheEntry(entry)
+		}
+		if hasStaleEntry {
+			if state, low := a.sharedRateLimitLowForArgs(ctx, args); low && ghCommandCacheEntryCanServeLowBudgetStale(staleEntry, ttl) {
+				_ = a.incrementGHXCacheCounter("stale_hits")
+				_ = a.incrementGHXCacheCounter("low_budget_stale_hits")
+				_, _ = io.WriteString(a.Stderr, state.staleNotice(time.Since(staleEntry.CreatedAt)))
+				return a.writeGHCommandCacheEntry(staleEntry)
+			}
+		}
+		lockPath := entryPath + ".lock"
+		lock, locked := tryGHCommandCacheLock(lockPath)
+		if !locked {
+			if entry, hit, ok := waitGHCommandCache(entryPath, lockPath, ttl, staleEntry, hasStaleEntry); ok {
+				_ = a.incrementGHXCacheCounter(hit)
+				a.writeGHCommandCacheLivenessNotice(entry)
+				return a.writeGHCommandCacheEntry(entry)
+			}
+			lock, locked = tryGHCommandCacheLock(lockPath)
+		}
+		if locked {
+			defer func() {
+				_ = lock.Close()
+				_ = os.Remove(lockPath)
+			}()
+			if entry, ok := readGHCommandCache(entryPath, ttl); ok {
+				_ = a.incrementGHXCacheCounter("fallback_hits")
+				a.writeGHCommandCacheLivenessNotice(entry)
+				return a.writeGHCommandCacheEntry(entry)
+			}
 		}
 	}
 
@@ -199,6 +213,12 @@ func (a *App) clearGHCommandCacheCount() (int, error) {
 	removed := 0
 	for _, entry := range entries {
 		name := entry.Name()
+		if entry.IsDir() && name == "_liveness" {
+			if err := os.RemoveAll(filepath.Join(dir, name)); err == nil {
+				removed++
+			}
+			continue
+		}
 		if strings.HasSuffix(name, ".lock") || isGHCommandCacheEntryFile(name) {
 			if err := os.Remove(filepath.Join(dir, entry.Name())); err == nil {
 				removed++
@@ -230,6 +250,14 @@ func (a *App) writeGHCommandCacheEntry(entry ghCommandCacheEntry) error {
 		return fmt.Errorf("cached gh command failed with exit code %d", entry.ExitCode)
 	}
 	return nil
+}
+
+func (a *App) writeGHCommandCacheLivenessNotice(entry ghCommandCacheEntry) {
+	if !ghCommandNeedsLivenessNotice(entry.Args) || entry.CreatedAt.IsZero() {
+		return
+	}
+	_, _ = fmt.Fprintf(a.Stderr, "gitcrawl: serving cached gh %s from %s ago; use --live for CI/release liveness\n",
+		ghCommandName(entry.Args), time.Since(entry.CreatedAt).Round(time.Second))
 }
 
 func readGHCommandCache(path string, ttl time.Duration) (ghCommandCacheEntry, bool) {

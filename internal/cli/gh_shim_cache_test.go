@@ -122,6 +122,205 @@ echo "call-$count:$*"
 	}
 }
 
+func TestGHShimLiveControlsAndLivenessTombstones(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "count")
+	ghPath := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+count=0
+if [ -f "$GH_SHIM_COUNT" ]; then
+  count=$(cat "$GH_SHIM_COUNT")
+fi
+count=$((count + 1))
+printf "%s" "$count" > "$GH_SHIM_COUNT"
+echo "live-$count:$*"
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("GITCRAWL_GH_PATH", ghPath)
+	t.Setenv("GH_SHIM_COUNT", countPath)
+
+	app := New()
+	app.configPath = configPath
+	readArgs := []string{"release", "view", "v1.0.0", "-R", "openclaw/openclaw"}
+	cacheDir, err := app.ghCommandCacheDir()
+	if err != nil {
+		t.Fatalf("cache dir: %v", err)
+	}
+	entryPath := filepath.Join(cacheDir, app.ghCommandCacheKey(ctx, readArgs)+".json")
+	if err := writeGHCommandCache(entryPath, ghCommandCacheEntry{
+		CreatedAt: time.Now().UTC(),
+		Args:      readArgs,
+		Tags:      app.ghCommandCacheTags(ctx, readArgs),
+		ExitCode:  0,
+		Stdout:    "cached-release\n",
+	}); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+	if err := app.recordGHLivenessTombstone(ctx, []string{"release", "create", "v1.0.0", "-R", "openclaw/openclaw"}); err != nil {
+		t.Fatalf("record tombstone: %v", err)
+	}
+
+	run := New()
+	var stdout, stderr bytes.Buffer
+	run.Stdout = &stdout
+	run.Stderr = &stderr
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "release", "view", "v1.0.0", "-R", "openclaw/openclaw"}); err != nil {
+		t.Fatalf("liveness read: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "live-1:release view") || !strings.Contains(stderr.String(), "bypassing gh cache") {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "--cached", "release", "view", "v1.0.0", "-R", "openclaw/openclaw"}); err != nil {
+		t.Fatalf("cached read: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "live-1:release view") || !strings.Contains(stderr.String(), "serving cached gh release view") {
+		t.Fatalf("cached stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "--live", "release", "view", "v1.0.0", "-R", "openclaw/openclaw"}); err != nil {
+		t.Fatalf("live read: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "live-2:release view") {
+		t.Fatalf("live stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "xcache", "stats", "--json"}); err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	var stats map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &stats); err != nil {
+		t.Fatalf("decode stats: %v\n%s", err, stdout.String())
+	}
+	if len(stats["liveness"].([]any)) == 0 {
+		t.Fatalf("missing liveness stats: %#v", stats)
+	}
+	counters := stats["counters"].(map[string]any)
+	if int(counters["live_bypasses"].(float64)) < 2 {
+		t.Fatalf("counters = %#v", counters)
+	}
+}
+
+func TestGHRunListBroadBranchFallsThroughToLive(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "count")
+	ghPath := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+count=0
+if [ -f "$GH_SHIM_COUNT" ]; then
+  count=$(cat "$GH_SHIM_COUNT")
+fi
+count=$((count + 1))
+printf "%s" "$count" > "$GH_SHIM_COUNT"
+echo "real-gh:$*"
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("GITCRAWL_GH_PATH", ghPath)
+	t.Setenv("GH_SHIM_COUNT", countPath)
+	t.Setenv("GITCRAWL_GH_CACHE_TTL", "1m")
+
+	app := New()
+	app.configPath = configPath
+	cacheArgs := []string{"run", "list", "-R", "openclaw/openclaw", "--branch", "main"}
+	cacheDir, err := app.ghCommandCacheDir()
+	if err != nil {
+		t.Fatalf("cache dir: %v", err)
+	}
+	entryPath := filepath.Join(cacheDir, app.ghCommandCacheKey(ctx, cacheArgs)+".json")
+	if err := writeGHCommandCache(entryPath, ghCommandCacheEntry{
+		CreatedAt: time.Now().UTC(),
+		Args:      cacheArgs,
+		Tags:      app.ghCommandCacheTags(ctx, cacheArgs),
+		ExitCode:  0,
+		Stdout:    "cached-run-list\n",
+	}); err != nil {
+		t.Fatalf("write cached run list: %v", err)
+	}
+
+	run := New()
+	var stdout, stderr bytes.Buffer
+	run.Stdout = &stdout
+	run.Stderr = &stderr
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "run", "list", "-R", "openclaw/openclaw", "--branch", "main"}); err != nil {
+		t.Fatalf("broad run list: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "real-gh:run list") {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "cached-run-list") {
+		t.Fatalf("served fallthrough cache for broad run list: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	countData, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatalf("read count: %v", err)
+	}
+	if strings.TrimSpace(string(countData)) != "1" {
+		t.Fatalf("fake gh call count = %q, want 1", countData)
+	}
+}
+
+func TestGHRunReadsHonorLivenessBeforeLocalCache(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "count")
+	ghPath := filepath.Join(dir, "gh")
+	script := `#!/bin/sh
+count=0
+if [ -f "$GH_SHIM_COUNT" ]; then
+  count=$(cat "$GH_SHIM_COUNT")
+fi
+count=$((count + 1))
+printf "%s" "$count" > "$GH_SHIM_COUNT"
+echo "real-gh-$count:$*"
+`
+	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("GITCRAWL_GH_PATH", ghPath)
+	t.Setenv("GH_SHIM_COUNT", countPath)
+
+	app := New()
+	app.configPath = configPath
+	if err := app.recordGHLivenessTombstone(ctx, []string{"workflow", "run", "ci.yml", "-R", "openclaw/openclaw"}); err != nil {
+		t.Fatalf("record workflow tombstone: %v", err)
+	}
+
+	run := New()
+	var stdout, stderr bytes.Buffer
+	run.Stdout = &stdout
+	run.Stderr = &stderr
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "run", "view", "99", "-R", "openclaw/openclaw"}); err != nil {
+		t.Fatalf("run view: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "real-gh-1:run view") || !strings.Contains(stderr.String(), "bypassing gh cache") {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "run", "list", "-R", "openclaw/openclaw", "--commit", "abc123"}); err != nil {
+		t.Fatalf("run list commit: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "real-gh-2:run list") || !strings.Contains(stderr.String(), "bypassing gh cache") {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
 func TestGHShimPreservesGHJQWithoutExternalJQ(t *testing.T) {
 	ctx := context.Background()
 	configPath := seedGHShimRepo(t, ctx)

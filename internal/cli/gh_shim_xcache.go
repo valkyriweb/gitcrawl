@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -25,12 +26,22 @@ type ghCommandCacheStats struct {
 	Counters           ghXCacheCounters               `json:"counters"`
 	CumulativeCounters *ghXCacheCounters              `json:"cumulative_counters,omitempty"`
 	RateLimit          *ghSharedRateLimitState        `json:"rate_limit,omitempty"`
+	Shim               ghShimRuntimeStats             `json:"shim"`
+	Liveness           []ghLivenessTombstoneInfo      `json:"liveness,omitempty"`
 	Commands           map[string]ghCommandCacheCount `json:"commands"`
 }
 
 type ghCommandCacheCount struct {
 	Entries int   `json:"entries"`
 	Bytes   int64 `json:"bytes"`
+}
+
+type ghShimRuntimeStats struct {
+	Invocation    string `json:"invocation"`
+	PlainGHPath   string `json:"plain_gh_path,omitempty"`
+	PlainGHIsShim bool   `json:"plain_gh_is_shim"`
+	BackendPath   string `json:"backend_path,omitempty"`
+	LiveEnv       bool   `json:"live_env"`
 }
 
 type ghCommandCacheKeyInfo struct {
@@ -150,12 +161,20 @@ func (a *App) runGHXCacheStats(since time.Duration) error {
 	if stats.Since != "" {
 		_, _ = fmt.Fprintf(a.Stdout, "\nSince: %s\n", stats.Since)
 	}
-	_, _ = fmt.Fprintf(a.Stdout, "\nCounters:\n  local hits:              %d\n  fallback hits:           %d\n  stale hits:              %d\n  low-budget stale hits:   %d\n  backend misses:          %d\n  pass-through writes:     %d\n  hit rate:                %.1f%% (%d/%d reads)\n",
-		stats.Counters.LocalHits, stats.Counters.FallbackHits, stats.Counters.StaleHits, stats.Counters.LowBudgetStaleHits, stats.Counters.BackendMisses, stats.Counters.PassThroughWrites,
+	_, _ = fmt.Fprintf(a.Stdout, "\nCounters:\n  local hits:              %d\n  fallback hits:           %d\n  stale hits:              %d\n  low-budget stale hits:   %d\n  live bypasses:           %d\n  backend misses:          %d\n  pass-through writes:     %d\n  hit rate:                %.1f%% (%d/%d reads)\n",
+		stats.Counters.LocalHits, stats.Counters.FallbackHits, stats.Counters.StaleHits, stats.Counters.LowBudgetStaleHits, stats.Counters.LiveBypasses, stats.Counters.BackendMisses, stats.Counters.PassThroughWrites,
 		stats.HitRatePercent, stats.CacheHits, stats.TotalReads)
+	_, _ = fmt.Fprintf(a.Stdout, "\nShim:\n  invocation: %s\n  plain gh:   %s\n  gh is shim: %t\n  backend:    %s\n  live env:   %t\n",
+		stats.Shim.Invocation, stats.Shim.PlainGHPath, stats.Shim.PlainGHIsShim, stats.Shim.BackendPath, stats.Shim.LiveEnv)
 	if stats.RateLimit != nil {
 		_, _ = fmt.Fprintf(a.Stdout, "\nShared Rate Limit:\n  low:       %t\n  remaining: %d\n  threshold: %d\n  reset:     %s\n",
 			stats.RateLimit.Low, stats.RateLimit.Remaining, stats.RateLimit.Threshold, stats.RateLimit.ResetAt.Format(time.RFC3339))
+	}
+	if len(stats.Liveness) > 0 {
+		_, _ = fmt.Fprintln(a.Stdout, "\nLiveness Bypasses:")
+		for _, tombstone := range stats.Liveness {
+			_, _ = fmt.Fprintf(a.Stdout, "  %s expires in %s tags=%s\n", tombstone.Reason, tombstone.ExpiresIn, strings.Join(tombstone.Tags, ","))
+		}
 	}
 	printGHXCacheMisses(a.Stdout, "Backend Misses by Command", stats.Counters.BackendMissesByCommand)
 	printGHXCacheMisses(a.Stdout, "Backend Misses by Route", stats.Counters.BackendMissesByRoute)
@@ -299,7 +318,8 @@ func (a *App) ghCommandCacheStats(since time.Duration) (ghCommandCacheStats, err
 	}
 	counters, _ := a.ghXCacheCounters()
 	cumulative := counters
-	stats := ghCommandCacheStats{CacheDir: dir, Locks: locks, Counters: counters, Commands: map[string]ghCommandCacheCount{}}
+	liveness, _ := a.activeGHLivenessTombstoneInfos()
+	stats := ghCommandCacheStats{CacheDir: dir, Locks: locks, Counters: counters, Shim: ghShimRuntime(), Liveness: liveness, Commands: map[string]ghCommandCacheCount{}}
 	if state, ok := a.sharedRateLimitState(context.Background()); ok {
 		stats.RateLimit = &state
 	}
@@ -326,6 +346,38 @@ func (a *App) ghCommandCacheStats(since time.Duration) (ghCommandCacheStats, err
 		stats.Commands[key.Command] = count
 	}
 	return stats, nil
+}
+
+func ghShimRuntime() ghShimRuntimeStats {
+	stats := ghShimRuntimeStats{
+		Invocation: strings.Join(os.Args, " "),
+		LiveEnv:    envTruthy("GITCRAWL_GH_LIVE"),
+	}
+	if path, err := exec.LookPath("gh"); err == nil {
+		stats.PlainGHPath = path
+		stats.PlainGHIsShim = ghPathLooksLikeShim(path)
+	}
+	if backend, err := resolveRealGHPath(); err == nil {
+		stats.BackendPath = backend
+	}
+	return stats
+}
+
+func ghPathLooksLikeShim(path string) bool {
+	if path == "" {
+		return false
+	}
+	candidates := []string{path}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		candidates = append(candidates, resolved)
+	}
+	for _, candidate := range candidates {
+		base := strings.ToLower(filepath.Base(candidate))
+		if strings.Contains(base, "gitcrawl") {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) gcGHCommandCache() (ghCommandCacheGCResult, error) {

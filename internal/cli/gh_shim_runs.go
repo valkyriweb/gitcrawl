@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,7 +12,9 @@ import (
 	"github.com/openclaw/gitcrawl/internal/store"
 )
 
-func (a *App) runGHRunList(ctx context.Context, args []string) error {
+var errGHRunListRequiresLive = errors.New("workflow run list requires live gh")
+
+func (a *App) runGHRunList(ctx context.Context, args []string, controls ghShimControls) error {
 	if hasAnyGHFlag(args, "--web") {
 		return localGHUnsupported(fmt.Errorf("web workflow run flags require live gh"))
 	}
@@ -42,16 +45,22 @@ func (a *App) runGHRunList(ctx context.Context, args []string) error {
 		return localGHUnsupported(err)
 	}
 	branch := strings.TrimSpace(*branchRaw)
-	if branch != "" && strings.TrimSpace(*commitRaw) == "" {
+	commit := strings.TrimSpace(*commitRaw)
+	prBranch := false
+	if branch != "" && commit == "" {
 		if number, findErr := a.findGHPullRequestNumberByBranch(ctx, repoValue, branch); findErr == nil {
 			if _, hydrateErr := a.ensureFreshGHPullRequestCache(ctx, repoValue, number); hydrateErr != nil {
 				return hydrateErr
 			}
+			prBranch = true
 		}
+	}
+	if !controls.Cached && commit == "" && !prBranch {
+		return fmt.Errorf("%w: %w without exact commit or cached PR branch", errLocalGHUnsupported, errGHRunListRequiresLive)
 	}
 	runs, err := a.localGHWorkflowRuns(ctx, repoValue, store.WorkflowRunListOptions{
 		Branch:  branch,
-		HeadSHA: strings.TrimSpace(*commitRaw),
+		HeadSHA: commit,
 		Limit:   limit,
 	})
 	if err != nil {
@@ -60,6 +69,7 @@ func (a *App) runGHRunList(ctx context.Context, args []string) error {
 	if len(runs) == 0 {
 		return localGHUnsupported(fmt.Errorf("no cached workflow runs"))
 	}
+	a.writeGHLocalRunNotice()
 	if strings.TrimSpace(*jsonFieldsRaw) != "" || strings.TrimSpace(*jqRaw) != "" || a.format == FormatJSON {
 		fields := firstNonEmpty(strings.TrimSpace(*jsonFieldsRaw), "databaseId,workflowName,status,conclusion,url,createdAt,updatedAt")
 		return a.writeJSONValue(ghWorkflowRunJSONRows(runs, fields), strings.TrimSpace(*jqRaw))
@@ -70,6 +80,10 @@ func (a *App) runGHRunList(ctx context.Context, args []string) error {
 		}
 	}
 	return nil
+}
+
+func isGHRunListLiveRequired(err error) bool {
+	return errors.Is(err, errGHRunListRequiresLive)
 }
 
 func (a *App) runGHRunView(ctx context.Context, args []string) error {
@@ -101,6 +115,7 @@ func (a *App) runGHRunView(ctx context.Context, args []string) error {
 		if run.RunID != runID {
 			continue
 		}
+		a.writeGHLocalRunNotice()
 		if strings.TrimSpace(*jsonFieldsRaw) != "" || strings.TrimSpace(*jqRaw) != "" || a.format == FormatJSON {
 			fields := firstNonEmpty(strings.TrimSpace(*jsonFieldsRaw), "databaseId,workflowName,status,conclusion,url,createdAt,updatedAt")
 			return a.writeJSONValue(ghWorkflowRunJSONRows([]store.WorkflowRun{run}, fields)[0], strings.TrimSpace(*jqRaw))
@@ -109,6 +124,10 @@ func (a *App) runGHRunView(ctx context.Context, args []string) error {
 		return err
 	}
 	return localGHUnsupported(fmt.Errorf("cached workflow run %s was not found", runID))
+}
+
+func (a *App) writeGHLocalRunNotice() {
+	_, _ = fmt.Fprintln(a.Stderr, "gitcrawl: workflow run from local PR cache; use gh run --live or exact check-runs API for release liveness")
 }
 
 func (a *App) localGHWorkflowRuns(ctx context.Context, repoValue string, options store.WorkflowRunListOptions) ([]store.WorkflowRun, error) {

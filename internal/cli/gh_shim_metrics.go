@@ -13,6 +13,7 @@ type ghXCacheCounters struct {
 	FallbackHits           int64                            `json:"fallback_hits"`
 	StaleHits              int64                            `json:"stale_hits"`
 	LowBudgetStaleHits     int64                            `json:"low_budget_stale_hits,omitempty"`
+	LiveBypasses           int64                            `json:"live_bypasses,omitempty"`
 	BackendMisses          int64                            `json:"backend_misses"`
 	PassThroughWrites      int64                            `json:"pass_through_writes"`
 	BackendMissesByCommand map[string]int64                 `json:"backend_misses_by_command,omitempty"`
@@ -27,6 +28,7 @@ type ghXCacheCounterBucket struct {
 	FallbackHits           int64            `json:"fallback_hits,omitempty"`
 	StaleHits              int64            `json:"stale_hits,omitempty"`
 	LowBudgetStaleHits     int64            `json:"low_budget_stale_hits,omitempty"`
+	LiveBypasses           int64            `json:"live_bypasses,omitempty"`
 	BackendMisses          int64            `json:"backend_misses,omitempty"`
 	PassThroughWrites      int64            `json:"pass_through_writes,omitempty"`
 	BackendMissesByCommand map[string]int64 `json:"backend_misses_by_command,omitempty"`
@@ -105,6 +107,8 @@ func incrementGHXCacheCounters(stats *ghXCacheCounters, name string, args []stri
 		stats.StaleHits++
 	case "low_budget_stale_hits":
 		stats.LowBudgetStaleHits++
+	case "live_bypasses":
+		stats.LiveBypasses++
 	case "backend_misses":
 		stats.BackendMisses++
 		incrementGHXCacheMissMaps(&stats.BackendMissesByCommand, &stats.BackendMissesByRoute, &stats.BackendMissesByKey, args)
@@ -126,6 +130,8 @@ func incrementGHXCacheCounterBucket(bucket *ghXCacheCounterBucket, name string, 
 		bucket.StaleHits++
 	case "low_budget_stale_hits":
 		bucket.LowBudgetStaleHits++
+	case "live_bypasses":
+		bucket.LiveBypasses++
 	case "backend_misses":
 		bucket.BackendMisses++
 		incrementGHXCacheMissMaps(&bucket.BackendMissesByCommand, &bucket.BackendMissesByRoute, &bucket.BackendMissesByKey, args)
@@ -213,6 +219,7 @@ func (c ghXCacheCounters) since(since time.Duration, now time.Time) ghXCacheCoun
 		out.FallbackHits += bucket.FallbackHits
 		out.StaleHits += bucket.StaleHits
 		out.LowBudgetStaleHits += bucket.LowBudgetStaleHits
+		out.LiveBypasses += bucket.LiveBypasses
 		out.BackendMisses += bucket.BackendMisses
 		out.PassThroughWrites += bucket.PassThroughWrites
 		mergeCounterMap(&out.BackendMissesByCommand, bucket.BackendMissesByCommand)
