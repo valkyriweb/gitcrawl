@@ -70,6 +70,35 @@ func TestGHShimFallsBackForUnsupportedRead(t *testing.T) {
 	}
 }
 
+func TestGHShimSanitizesSearchAPIFields(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\necho fallback:$*\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("GITCRAWL_GH_PATH", ghPath)
+
+	run := New()
+	var stdout bytes.Buffer
+	run.Stdout = &stdout
+	err := run.Run(ctx, []string{
+		"--config", configPath,
+		"gh", "api", "search/issues",
+		"-f", "q=repo:openclaw/gitcrawl+is:pr",
+		"-f", "per_page=1",
+		"--jq", ".total_count",
+	})
+	if err != nil {
+		t.Fatalf("fallback search api: %v", err)
+	}
+	want := "fallback:api --method GET search/issues -f q=repo:openclaw/gitcrawl+is:pr -f per_page=1 --jq .total_count"
+	if got := strings.TrimSpace(stdout.String()); got != want {
+		t.Fatalf("fallback output = %q, want %q", got, want)
+	}
+}
+
 func TestGHShimPRStatusCompactUsesLocalCache(t *testing.T) {
 	ctx := context.Background()
 	configPath := seedGHShimRepo(t, ctx)

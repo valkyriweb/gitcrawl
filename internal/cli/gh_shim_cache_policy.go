@@ -70,11 +70,18 @@ func ghAPIReadOnly(args []string) bool {
 	if path == "graphql" {
 		return ghGraphQLReadOnly(args)
 	}
+	hasFields := false
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		switch arg {
-		case "--input", "-F", "-f", "--field", "--raw-field":
+		case "--input":
 			return false
+		case "-F", "-f", "--field", "--raw-field":
+			if index+1 >= len(args) {
+				return false
+			}
+			hasFields = true
+			index++
 		case "--method", "-X":
 			if index+1 >= len(args) {
 				return false
@@ -85,9 +92,79 @@ func ghAPIReadOnly(args []string) bool {
 			if strings.HasPrefix(arg, "--method=") {
 				method = strings.ToUpper(strings.TrimPrefix(arg, "--method="))
 			}
+			for _, prefix := range []string{"-f=", "-F=", "--field=", "--raw-field="} {
+				if strings.HasPrefix(arg, prefix) {
+					hasFields = true
+				}
+			}
 		}
 	}
+	// REST field flags usually make gh send a request body, so keep them
+	// mutating unless this is a GET-only Search endpoint sanitized above.
+	if hasFields && !ghAPISearchEndpoint(path) {
+		return false
+	}
 	return method == "GET"
+}
+
+func sanitizeGHShimArgs(args []string) []string {
+	if len(args) == 0 || args[0] != "api" {
+		return args
+	}
+	apiArgs := args[1:]
+	if !ghAPISearchEndpoint(ghAPIPathArg(apiArgs)) || ghAPIHasExplicitMethod(apiArgs) || !ghAPIHasFieldArgs(apiArgs) {
+		return args
+	}
+	// Raw gh treats `gh api <path> -f name=value` as a POST unless the method
+	// is explicit. GitHub Search REST endpoints are GET-only, so agent-shaped
+	// field calls need this before they fall through to real gh or the cache.
+	out := make([]string, 0, len(args)+2)
+	out = append(out, "api", "--method", "GET")
+	out = append(out, args[1:]...)
+	return out
+}
+
+func ghAPISearchEndpoint(path string) bool {
+	// Keep this route-only so normal mutating `gh api repos/... -f ...` calls
+	// are not accidentally reclassified as safe reads.
+	path = strings.TrimPrefix(path, "https://api.github.com/")
+	path = strings.TrimPrefix(path, "http://api.github.com/")
+	path = strings.TrimPrefix(path, "/")
+	if before, _, found := strings.Cut(path, "?"); found {
+		path = before
+	}
+	return path == "search" || strings.HasPrefix(path, "search/")
+}
+
+func ghAPIHasExplicitMethod(args []string) bool {
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		switch arg {
+		case "--method", "-X":
+			return true
+		default:
+			if strings.HasPrefix(arg, "--method=") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func ghAPIHasFieldArgs(args []string) bool {
+	for _, arg := range args {
+		switch arg {
+		case "-f", "-F", "--field", "--raw-field":
+			return true
+		default:
+			for _, prefix := range []string{"-f=", "-F=", "--field=", "--raw-field="} {
+				if strings.HasPrefix(arg, prefix) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func ghGraphQLReadOnly(args []string) bool {

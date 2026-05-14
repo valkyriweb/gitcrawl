@@ -18,6 +18,7 @@ import (
 
 func (a *App) runGHShim(ctx context.Context, args []string) error {
 	args, controls := parseGHShimControls(args)
+	args = sanitizeGHShimArgs(args)
 	if len(args) == 0 {
 		return a.execRealGHWithMutationTracking(ctx, args)
 	}

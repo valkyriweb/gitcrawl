@@ -1,8 +1,9 @@
 # Changelog
 
-## 0.3.4 - Unreleased
+## 0.3.4 - 2026-05-14
 
 - Docker: add a local image with `/data` persistence and CI smoke coverage.
+- Make the `gh` shim force `GET` for GitHub Search API field calls so `gh api search/* -f q=...` agent invocations do not fall through as `POST`.
 
 ## 0.3.3 - 2026-05-11
 

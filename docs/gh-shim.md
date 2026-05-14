@@ -130,6 +130,8 @@ These commands always run real `gh` but the response body is cached for the next
 - `gh api <GET path>` — only `GET` requests for REST; never cached for `POST`/`PATCH`/`DELETE`/`PUT`.
 - `gh api graphql` — cached only when the `query` field is a read-only query. Mutations, file-backed query fields, and `--input` calls pass through uncached.
 
+For GitHub Search REST paths, the shim injects `--method GET` when callers pass field flags without an explicit method. This keeps agent-style `gh api search/issues -f q=...` calls on GitHub's GET-only search endpoint instead of inheriting raw `gh`'s POST default for field arguments.
+
 Common Actions REST reads such as run status, job lists, and logs get Actions-aware TTLs.
 
 Default cache TTLs are command-aware: active `gh run list` and run-status reads use `30s`; completed run views, completed Actions job lists, and run/job logs are kept for `12h`; completed run lists are kept for `30m`; workflow reads use `15m`; search reads use `15m`; issue/PR views use `15m` and closed thread reads are kept for `24h`; repo and release metadata use `1h`; GitHub user profile reads use `7d`; read-only GraphQL queries use `6h`; GitHub Pages metadata uses `15m` to `30m`; tagged/SHA `contents` API reads use `7d`; `gh pr diff` uses `5m` without a stable SHA and `7d` with one. Override with `GITCRAWL_GH_CACHE_TTL=5m` or similar.

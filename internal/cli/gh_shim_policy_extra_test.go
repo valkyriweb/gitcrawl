@@ -125,6 +125,16 @@ func TestGHShimCachePolicyExtraBranches(t *testing.T) {
 	if !ghAPIReadOnly([]string{"repos/openclaw/gitcrawl", "--method=GET"}) {
 		t.Fatal("GET API command should be read-only")
 	}
+	sanitizedSearch := sanitizeGHShimArgs([]string{"api", "search/issues", "-f", "q=repo:openclaw/gitcrawl+is:pr", "-f", "per_page=1"})
+	if got := strings.Join(sanitizedSearch, " "); got != "api --method GET search/issues -f q=repo:openclaw/gitcrawl+is:pr -f per_page=1" {
+		t.Fatalf("sanitized search api = %q", got)
+	}
+	if !cacheableGHRead(sanitizedSearch) {
+		t.Fatal("sanitized search API command should be cacheable")
+	}
+	if got := strings.Join(sanitizeGHShimArgs([]string{"api", "repos/openclaw/gitcrawl/issues", "-f", "title=x"}), " "); got != "api repos/openclaw/gitcrawl/issues -f title=x" {
+		t.Fatalf("non-search API command should stay unchanged: %q", got)
+	}
 	if ghGraphQLReadOnly([]string{"graphql"}) || ghGraphQLReadOnly([]string{"graphql", "-X"}) || ghGraphQLReadOnly([]string{"graphql", "-X", "PUT", "-f", "query={ viewer { login } }"}) || ghGraphQLReadOnly([]string{"graphql", "--field=query=@query.graphql"}) {
 		t.Fatal("malformed or mutating GraphQL command should not be read-only")
 	}

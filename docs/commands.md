@@ -118,7 +118,7 @@ This applies to `sync --numbers`, `threads --numbers`, `embed --number`,
 | `gitcrawl gh workflow list\|view ...` | Falls through; cached briefly | [gh shim](/gh-shim/#read-only-fallthroughs-cached) |
 | `gitcrawl gh secret list ...` / `variable get\|list ...` | Falls through; cached briefly | [gh shim](/gh-shim/#read-only-fallthroughs-cached) |
 | `gitcrawl gh label list ...` | Falls through; cached briefly | [gh shim](/gh-shim/) |
-| `gitcrawl gh api <GET path>` | Falls through; cached briefly (GET-only REST) | [gh shim](/gh-shim/) |
+| `gitcrawl gh api <GET path>` | Falls through; cached briefly; search paths auto-force GET when field flags are used | [gh shim](/gh-shim/) |
 | `gitcrawl gh api graphql -f query=...` | Falls through; read-only queries are cached | [gh shim](/gh-shim/#read-only-fallthroughs-cached) |
 | `gitcrawl gh xcache stats [--since <duration>] \| keys \| gc \| flush \| reset \| snapshot [--reset] [--json]` | Cache inspection / housekeeping | [gh shim](/gh-shim/#cache-inspection-xcache) |
 | _Anything else_ | Falls through to real `gh` | [gh shim](/gh-shim/) |
