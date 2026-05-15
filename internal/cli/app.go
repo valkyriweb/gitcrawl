@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2097,6 +2098,9 @@ func syncPortableStore(ctx context.Context, remoteURL, dir string) (string, erro
 	}
 	gitDir := filepath.Join(dir, ".git")
 	if info, err := os.Stat(gitDir); err == nil && info.IsDir() {
+		if err := ensurePortableStoreRemote(ctx, remoteURL, dir); err != nil {
+			return "", err
+		}
 		if !gitWorktreeClean(ctx, dir) {
 			if resetErr := runGit(ctx, "", "-C", dir, "reset", "--hard", "HEAD"); resetErr != nil {
 				return "", resetErr
@@ -2146,6 +2150,74 @@ func syncPortableStore(ctx context.Context, remoteURL, dir string) (string, erro
 	return "cloned", nil
 }
 
+func ensurePortableStoreRemote(ctx context.Context, remoteURL, dir string) error {
+	remote := gitBranchRemote(ctx, dir, currentGitBranch(ctx, dir))
+	origin, err := gitConfigValue(ctx, dir, "remote."+remote+".url")
+	if err != nil {
+		return fmt.Errorf("read portable store remote %q: %w", remote, err)
+	}
+	if !sameGitRemote(origin, remoteURL) {
+		return fmt.Errorf("portable store directory %s is a checkout of %q, not %q", dir, gitRemoteForMessage(origin), gitRemoteForMessage(remoteURL))
+	}
+	return nil
+}
+
+func sameGitRemote(left, right string) bool {
+	left = canonicalGitRemote(left)
+	right = canonicalGitRemote(right)
+	return left != "" && left == right
+}
+
+func canonicalGitRemote(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(value); err == nil && parsed.Scheme != "" {
+		parsed.Scheme = strings.ToLower(parsed.Scheme)
+		parsed.Host = strings.ToLower(parsed.Host)
+		if parsed.Scheme == "http" || parsed.Scheme == "https" {
+			parsed.User = nil
+		}
+		parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+		if parsed.Scheme != "file" {
+			parsed.Path = strings.TrimSuffix(parsed.Path, ".git")
+		}
+		return parsed.String()
+	}
+	if !filepath.IsAbs(value) && strings.Contains(value, ":") && !strings.Contains(value, "://") {
+		value = strings.TrimSuffix(strings.TrimSuffix(value, "/"), ".git")
+		return canonicalSCPGitRemote(value)
+	}
+	if abs, err := filepath.Abs(value); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(value)
+}
+
+func canonicalSCPGitRemote(value string) string {
+	userHost, path, ok := strings.Cut(value, ":")
+	if !ok {
+		return value
+	}
+	user := ""
+	host := userHost
+	if before, after, ok := strings.Cut(userHost, "@"); ok {
+		user = before + "@"
+		host = after
+	}
+	return user + strings.ToLower(host) + ":" + path
+}
+
+func gitRemoteForMessage(value string) string {
+	value = strings.TrimSpace(value)
+	if parsed, err := url.Parse(value); err == nil && parsed.Scheme != "" {
+		parsed.User = nil
+		return parsed.String()
+	}
+	return value
+}
+
 func removePortableSQLiteSidecars(dir string) error {
 	return filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
@@ -2173,16 +2245,7 @@ func isDirtyPortablePullError(err error) bool {
 
 func fastForwardGitCheckout(ctx context.Context, dir string, quiet bool) error {
 	branch := currentGitBranch(ctx, dir)
-	remote := ""
-	if branch != "" {
-		value, err := gitConfigValue(ctx, dir, "branch."+branch+".remote")
-		if err == nil {
-			remote = value
-		}
-	}
-	if strings.TrimSpace(remote) == "" {
-		remote = "origin"
-	}
+	remote := gitBranchRemote(ctx, dir, branch)
 	fetchArgs := []string{"-C", dir, "fetch", "--prune"}
 	if quiet {
 		fetchArgs = append(fetchArgs, "--quiet")
@@ -2208,6 +2271,16 @@ func fastForwardGitCheckout(ctx context.Context, dir string, quiet bool) error {
 	}
 	mergeArgs = append(mergeArgs, target)
 	return runGit(ctx, "", mergeArgs...)
+}
+
+func gitBranchRemote(ctx context.Context, dir, branch string) string {
+	if branch != "" {
+		value, err := gitConfigValue(ctx, dir, "branch."+branch+".remote")
+		if err == nil && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return "origin"
 }
 
 func currentGitBranch(ctx context.Context, dir string) string {
