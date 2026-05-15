@@ -2,10 +2,11 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/openclaw/gitcrawl/internal/store/storedb"
 )
 
 type RunRecord struct {
@@ -21,68 +22,99 @@ type RunRecord struct {
 }
 
 func (s *Store) RecordRun(ctx context.Context, run RunRecord) (int64, error) {
-	table, err := runTable(run.Kind)
-	if err != nil {
-		return 0, err
+	params := storedb.RecordSyncRunParams{
+		RepoID:     run.RepoID,
+		Scope:      run.Scope,
+		Status:     run.Status,
+		StartedAt:  run.StartedAt,
+		FinishedAt: nullString(run.FinishedAt),
+		StatsJson:  nullString(run.StatsJSON),
+		ErrorText:  nullString(run.ErrorText),
 	}
-	var id int64
-	err = s.q().QueryRowContext(ctx, `
-		insert into `+table+`(repo_id, scope, status, started_at, finished_at, stats_json, error_text)
-		values(?, ?, ?, ?, ?, ?, ?)
-		returning id
-	`, run.RepoID, run.Scope, run.Status, run.StartedAt, nullString(run.FinishedAt), nullString(run.StatsJSON), nullString(run.ErrorText)).Scan(&id)
+	id, err := s.recordRun(ctx, run.Kind, params)
 	if err != nil {
 		return 0, fmt.Errorf("record %s run: %w", run.Kind, err)
 	}
 	return id, nil
 }
 
-func (s *Store) ListRuns(ctx context.Context, repoID int64, kind string, limit int) ([]RunRecord, error) {
-	table, err := runTable(kind)
-	if err != nil {
-		return nil, err
+func (s *Store) recordRun(ctx context.Context, kind string, params storedb.RecordSyncRunParams) (int64, error) {
+	switch kind {
+	case "sync":
+		return s.qsql().RecordSyncRun(ctx, params)
+	case "summary":
+		return s.qsql().RecordSummaryRun(ctx, storedb.RecordSummaryRunParams(params))
+	case "embedding":
+		return s.qsql().RecordEmbeddingRun(ctx, storedb.RecordEmbeddingRunParams(params))
+	case "cluster":
+		return s.qsql().RecordClusterRun(ctx, storedb.RecordClusterRunParams(params))
+	default:
+		return 0, fmt.Errorf("unsupported run kind %q", kind)
 	}
+}
+
+func (s *Store) ListRuns(ctx context.Context, repoID int64, kind string, limit int) ([]RunRecord, error) {
 	if limit <= 0 {
 		limit = 20
 	}
-	rows, err := s.q().QueryContext(ctx, `
-		select id, repo_id, scope, status, started_at, finished_at, stats_json, error_text
-		from `+table+`
-		where repo_id = ?
-		order by id desc
-		limit ?
-	`, repoID, limit)
+	out, err := s.listRuns(ctx, repoID, kind, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list %s runs: %w", kind, err)
-	}
-	defer rows.Close()
-
-	var out []RunRecord
-	for rows.Next() {
-		var run RunRecord
-		var finishedAt, statsJSON, errorText sql.NullString
-		if err := rows.Scan(&run.ID, &run.RepoID, &run.Scope, &run.Status, &run.StartedAt, &finishedAt, &statsJSON, &errorText); err != nil {
-			return nil, fmt.Errorf("scan %s run: %w", kind, err)
-		}
-		run.Kind = kind
-		run.FinishedAt = finishedAt.String
-		run.StatsJSON = statsJSON.String
-		run.ErrorText = errorText.String
-		out = append(out, run)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate %s runs: %w", kind, err)
 	}
 	return out, nil
 }
 
+func (s *Store) listRuns(ctx context.Context, repoID int64, kind string, limit int) ([]RunRecord, error) {
+	params := storedb.ListSyncRunsParams{RepoID: repoID, RowLimit: int64(limit)}
+	switch kind {
+	case "sync":
+		rows, err := s.qsql().ListSyncRuns(ctx, params)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]RunRecord, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, runRecordFromDB(kind, row))
+		}
+		return out, nil
+	case "summary":
+		rows, err := s.qsql().ListSummaryRuns(ctx, storedb.ListSummaryRunsParams(params))
+		if err != nil {
+			return nil, err
+		}
+		out := make([]RunRecord, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, summaryRunRecordFromDB(kind, row))
+		}
+		return out, nil
+	case "embedding":
+		rows, err := s.qsql().ListEmbeddingRuns(ctx, storedb.ListEmbeddingRunsParams(params))
+		if err != nil {
+			return nil, err
+		}
+		out := make([]RunRecord, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, embeddingRunRecordFromDB(kind, row))
+		}
+		return out, nil
+	case "cluster":
+		rows, err := s.qsql().ListClusterRuns(ctx, storedb.ListClusterRunsParams(params))
+		if err != nil {
+			return nil, err
+		}
+		out := make([]RunRecord, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, clusterRunRecordFromDB(kind, row))
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unsupported run kind %q", kind)
+	}
+}
+
 func (s *Store) LastSuccessfulSyncAt(ctx context.Context, repoID int64) (time.Time, error) {
-	var lastSync string
-	if err := s.q().QueryRowContext(ctx, `
-		select coalesce(max(finished_at), '')
-		from sync_runs
-		where repo_id = ? and status in ('success', 'completed')
-	`, repoID).Scan(&lastSync); err != nil {
+	lastSync, err := s.qsql().LastSuccessfulSyncAt(ctx, repoID)
+	if err != nil {
 		return time.Time{}, fmt.Errorf("read last successful sync: %w", err)
 	}
 	if lastSync == "" {
@@ -96,23 +128,14 @@ func (s *Store) LastSuccessfulSyncAt(ctx context.Context, repoID int64) (time.Ti
 }
 
 func (s *Store) LastSuccessfulListSyncAt(ctx context.Context, repoID int64, state string) (time.Time, error) {
-	scopes := listSyncScopesForState(state)
-	if len(scopes) == 0 {
+	state = normalizedListSyncState(state)
+	if state == "" {
 		return time.Time{}, nil
 	}
-	placeholders := make([]string, len(scopes))
-	args := make([]any, 0, 1+len(scopes))
-	args = append(args, repoID)
-	for i, scope := range scopes {
-		placeholders[i] = "?"
-		args = append(args, scope)
-	}
-	var lastSync string
-	err := s.q().QueryRowContext(ctx, `
-		select coalesce(max(finished_at), '')
-		from sync_runs
-		where repo_id = ? and status in ('success', 'completed') and scope in (`+strings.Join(placeholders, ",")+`)
-	`, args...).Scan(&lastSync)
+	lastSync, err := s.qsql().LastSuccessfulListSyncAt(ctx, storedb.LastSuccessfulListSyncAtParams{
+		RepoID: repoID,
+		State:  state,
+	})
 	if err != nil {
 		return time.Time{}, fmt.Errorf("read last successful list sync: %w", err)
 	}
@@ -126,30 +149,15 @@ func (s *Store) LastSuccessfulListSyncAt(ctx context.Context, repoID int64, stat
 	return parsed, nil
 }
 
-func listSyncScopesForState(state string) []string {
+func normalizedListSyncState(state string) string {
 	switch strings.TrimSpace(strings.ToLower(state)) {
 	case "", "open":
-		return []string{"open", "all"}
+		return "open"
 	case "closed":
-		return []string{"closed", "all"}
+		return "closed"
 	case "all":
-		return []string{"all"}
+		return "all"
 	default:
-		return nil
-	}
-}
-
-func runTable(kind string) (string, error) {
-	switch kind {
-	case "sync":
-		return "sync_runs", nil
-	case "summary":
-		return "summary_runs", nil
-	case "embedding":
-		return "embedding_runs", nil
-	case "cluster":
-		return "cluster_runs", nil
-	default:
-		return "", fmt.Errorf("unsupported run kind %q", kind)
+		return ""
 	}
 }
