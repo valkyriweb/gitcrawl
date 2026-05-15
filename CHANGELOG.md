@@ -2,6 +2,7 @@
 
 ## 0.3.5 - Unreleased
 
+- Ignore cross-repository `owner/repo#number` references when building deterministic cluster edges for the current repository.
 - Reject non-finite CLI float options such as `NaN` before commands can mutate local cluster state.
 - Fetch all paginated GitHub check runs and workflow runs instead of only the first 100 rows.
 - Fix GitHub Enterprise pagination when API `Link` headers include the `/api/v3` base path, avoiding duplicated paths on follow-up pages.

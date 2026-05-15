@@ -3285,6 +3285,78 @@ func TestBuildDurableClusterInputsKeepsDeterministicReferenceEdges(t *testing.T)
 	}
 }
 
+func TestBuildDurableClusterInputsIgnoresCrossRepoQualifiedReferences(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	repoID, err := st.UpsertRepository(ctx, store.Repository{
+		Owner:     "openclaw",
+		Name:      "openclaw",
+		FullName:  "openclaw/openclaw",
+		RawJSON:   "{}",
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("seed repository: %v", err)
+	}
+	issueID, err := st.UpsertThread(ctx, store.Thread{
+		RepoID:        repoID,
+		GitHubID:      "901",
+		Number:        901,
+		Kind:          "issue",
+		State:         "open",
+		Title:         "Gateway token regression",
+		Body:          "Users cannot authorize device tokens.",
+		HTMLURL:       "https://github.com/openclaw/openclaw/issues/901",
+		LabelsJSON:    "[]",
+		AssigneesJSON: "[]",
+		RawJSON:       "{}",
+		ContentHash:   "hash-901",
+		UpdatedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	prID, err := st.UpsertThread(ctx, store.Thread{
+		RepoID:        repoID,
+		GitHubID:      "902",
+		Number:        902,
+		Kind:          "pull_request",
+		State:         "open",
+		Title:         "Repair auth scope migration",
+		Body:          "Fixes otherorg/other#901 by preserving the device-token scope during upgrade.",
+		HTMLURL:       "https://github.com/openclaw/openclaw/pull/902",
+		LabelsJSON:    "[]",
+		AssigneesJSON: "[]",
+		RawJSON:       "{}",
+		ContentHash:   "hash-902",
+		UpdatedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatalf("seed pull request: %v", err)
+	}
+	vectors := []store.ThreadVector{
+		{ThreadID: issueID, Vector: []float64{1, 0}},
+		{ThreadID: prID, Vector: []float64{0, 1}},
+	}
+	inputs, edgeCount, err := buildDurableClusterInputs(ctx, st, repoID, vectors, clusterBuildOptions{
+		Threshold:          0.99,
+		MinSize:            2,
+		MaxClusterSize:     defaultClusterMaxSize,
+		Fanout:             16,
+		CrossKindThreshold: 0.99,
+	})
+	if err != nil {
+		t.Fatalf("build inputs: %v", err)
+	}
+	if edgeCount != 0 || len(inputs) != 0 {
+		t.Fatalf("cross-repo qualified refs should not form evidence edges, edges=%d inputs=%#v", edgeCount, inputs)
+	}
+}
+
 func TestBuildDurableClusterInputsIgnoresBareOneDigitProseRefs(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))

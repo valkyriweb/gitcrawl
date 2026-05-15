@@ -43,7 +43,7 @@ const (
 	bodyRefEvidencePrefixChars = 240
 )
 
-var threadReferencePattern = regexp.MustCompile(`(?i)(?:\b[\w.-]+/[\w.-]+#(\d+)|(?:issues|pull)/(\d+)|#(\d{2,}))`)
+var threadReferencePattern = regexp.MustCompile(`(?i)(?:\b([\w.-]+/[\w.-]+)#(\d+)|(?:issues|pull)/(\d+)|#(\d{2,}))`)
 var githubThreadURLPattern = regexp.MustCompile(`(?i)^https?://github\.com/([\w.-]+)/([\w.-]+)/(?:issues|pull)/(\d+)(?:[/?#].*)?$`)
 var ownerRepoThreadPattern = regexp.MustCompile(`(?i)^([\w.-]+)/([\w.-]+)#(\d+)$`)
 var pathThreadPattern = regexp.MustCompile(`(?i)(?:^|/)(?:issues|pull)/(\d+)(?:[/?#].*)?$`)
@@ -2780,7 +2780,11 @@ func buildDurableClusterInputs(ctx context.Context, st *store.Store, repoID int6
 			upsertClusterEdge(candidateByPair, leftID, rightID, score)
 		}
 	}
-	addDeterministicReferenceEdges(candidateByPair, nodes, threads)
+	repoFullName, err := repositoryFullNameByID(ctx, st, repoID)
+	if err != nil {
+		return nil, 0, err
+	}
+	addDeterministicReferenceEdges(candidateByPair, nodes, threads, repoFullName)
 	candidates := make([]clusterer.Edge, 0, len(candidateByPair))
 	for _, edge := range candidateByPair {
 		candidates = append(candidates, edge)
@@ -2846,7 +2850,20 @@ func upsertClusterEdge(edges map[string]clusterer.Edge, leftID, rightID int64, s
 	edges[key] = clusterer.Edge{LeftThreadID: leftID, RightThreadID: rightID, Score: score}
 }
 
-func addDeterministicReferenceEdges(edges map[string]clusterer.Edge, nodes []clusterer.Node, threads map[int64]store.Thread) {
+func repositoryFullNameByID(ctx context.Context, st *store.Store, repoID int64) (string, error) {
+	repositories, err := st.ListRepositories(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, repo := range repositories {
+		if repo.ID == repoID {
+			return repo.FullName, nil
+		}
+	}
+	return "", fmt.Errorf("repository id %d not found", repoID)
+}
+
+func addDeterministicReferenceEdges(edges map[string]clusterer.Edge, nodes []clusterer.Node, threads map[int64]store.Thread, repoFullName string) {
 	threadIDByNumber := make(map[int]int64, len(nodes))
 	for _, node := range nodes {
 		thread := threads[node.ThreadID]
@@ -2855,7 +2872,7 @@ func addDeterministicReferenceEdges(edges map[string]clusterer.Edge, nodes []clu
 	refIDsByThreadID := make(map[int64]map[int64]bool, len(nodes))
 	for _, node := range nodes {
 		thread := threads[node.ThreadID]
-		refNumbers := referencedThreadNumbersByLocation(thread)
+		refNumbers := referencedThreadNumbersByLocation(thread, repoFullName)
 		refIDs := map[int64]bool{}
 		for number, evidence := range refNumbers {
 			if referencedID, ok := threadIDByNumber[number]; ok && referencedID != node.ThreadID {
@@ -2874,21 +2891,26 @@ func addDeterministicReferenceEdges(edges map[string]clusterer.Edge, nodes []clu
 	}
 }
 
-func referencedThreadNumbersByLocation(thread store.Thread) map[int]referenceEvidence {
+func referencedThreadNumbersByLocation(thread store.Thread, repoFullName string) map[int]referenceEvidence {
 	refs := map[int]referenceEvidence{}
-	collectReferencedThreadNumbers(refs, thread.Number, thread.Body, false)
-	collectReferencedThreadNumbers(refs, thread.Number, thread.Title, true)
+	collectReferencedThreadNumbers(refs, thread.Number, thread.Body, false, repoFullName)
+	collectReferencedThreadNumbers(refs, thread.Number, thread.Title, true, repoFullName)
 	return refs
 }
 
-func collectReferencedThreadNumbers(refs map[int]referenceEvidence, threadNumber int, value string, titleRef bool) {
+func collectReferencedThreadNumbers(refs map[int]referenceEvidence, threadNumber int, value string, titleRef bool, repoFullName string) {
 	for _, match := range threadReferencePattern.FindAllStringSubmatchIndex(value, -1) {
 		numberText := ""
-		for index := 2; index+1 < len(match); index += 2 {
-			if match[index] >= 0 {
-				numberText = value[match[index]:match[index+1]]
-				break
+		if match[2] >= 0 {
+			refRepo := value[match[2]:match[3]]
+			if !strings.EqualFold(refRepo, repoFullName) {
+				continue
 			}
+			numberText = value[match[4]:match[5]]
+		} else if match[6] >= 0 {
+			numberText = value[match[6]:match[7]]
+		} else if match[8] >= 0 {
+			numberText = value[match[8]:match[9]]
 		}
 		number, err := strconv.Atoi(numberText)
 		if err != nil || number <= 0 || number == threadNumber {
