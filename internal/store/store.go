@@ -118,6 +118,9 @@ func (s *Store) WithTx(ctx context.Context, fn func(*Store) error) error {
 
 func (s *Store) Status(ctx context.Context) (Status, error) {
 	status := Status{DBPath: s.path}
+	if !s.hasTable(ctx, "repositories") {
+		return status, nil
+	}
 	repositoryCount, err := s.qsql().CountRepositories(ctx)
 	if err != nil {
 		return Status{}, fmt.Errorf("count repositories: %w", err)
