@@ -417,6 +417,137 @@ func TestSyncPortableStoreIgnoresBrokenPullRebaseConfig(t *testing.T) {
 	}
 }
 
+func TestSyncPortableStoreRejectsDifferentExistingCheckout(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	otherRemoteDir := filepath.Join(dir, "other-remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	for _, repoDir := range []string{remoteDir, otherRemoteDir} {
+		if err := os.MkdirAll(filepath.Join(repoDir, "data"), 0o755); err != nil {
+			t.Fatalf("mkdir repo: %v", err)
+		}
+		if err := runGit(ctx, repoDir, "init", "-b", "main"); err != nil {
+			t.Fatalf("git init: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(repoDir, "data", "openclaw__openclaw.sync.db"), []byte(filepath.Base(repoDir)), 0o644); err != nil {
+			t.Fatalf("write db: %v", err)
+		}
+		if err := runGit(ctx, repoDir, "add", "data/openclaw__openclaw.sync.db"); err != nil {
+			t.Fatalf("git add: %v", err)
+		}
+		if err := runGit(ctx, repoDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+			t.Fatalf("git commit seed: %v", err)
+		}
+	}
+	if _, err := syncPortableStore(ctx, otherRemoteDir, checkoutDir); err != nil {
+		t.Fatalf("initial portable sync: %v", err)
+	}
+	dirtyPath := filepath.Join(checkoutDir, "data", "openclaw__openclaw.sync.db")
+	if err := os.WriteFile(dirtyPath, []byte("dirty local data"), 0o644); err != nil {
+		t.Fatalf("dirty checkout: %v", err)
+	}
+
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err == nil {
+		t.Fatal("mismatched existing checkout should fail")
+	}
+	got, err := os.ReadFile(dirtyPath)
+	if err != nil {
+		t.Fatalf("read dirty checkout: %v", err)
+	}
+	if string(got) != "dirty local data" {
+		t.Fatalf("mismatched checkout was modified: %q", string(got))
+	}
+}
+
+func TestSyncPortableStoreHonorsBranchRemote(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir remote: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	dbPath := filepath.Join(remoteDir, "data", "openclaw__openclaw.sync.db")
+	if err := os.WriteFile(dbPath, []byte("remote-v1"), 0o644); err != nil {
+		t.Fatalf("write db: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "add", "data/openclaw__openclaw.sync.db"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("initial portable sync: %v", err)
+	}
+	if err := runGit(ctx, "", "-C", checkoutDir, "remote", "rename", "origin", "store"); err != nil {
+		t.Fatalf("rename remote: %v", err)
+	}
+	if err := os.WriteFile(dbPath, []byte("remote-v2"), 0o644); err != nil {
+		t.Fatalf("write updated remote db: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "add", "data/openclaw__openclaw.sync.db"); err != nil {
+		t.Fatalf("git add update: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "update store"); err != nil {
+		t.Fatalf("git commit update: %v", err)
+	}
+
+	action, err := syncPortableStore(ctx, remoteDir, checkoutDir)
+	if err != nil {
+		t.Fatalf("portable sync with renamed remote: %v", err)
+	}
+	if action != "pulled" {
+		t.Fatalf("action = %q, want pulled", action)
+	}
+	got, err := os.ReadFile(filepath.Join(checkoutDir, "data", "openclaw__openclaw.sync.db"))
+	if err != nil {
+		t.Fatalf("read checkout db: %v", err)
+	}
+	if string(got) != "remote-v2" {
+		t.Fatalf("checkout db = %q, want remote-v2", string(got))
+	}
+}
+
+func TestSameGitRemoteKeepsLocalDotGitDistinct(t *testing.T) {
+	dir := t.TempDir()
+	repoDir := filepath.Join(dir, "store")
+	bareRepoDir := filepath.Join(dir, "store.git")
+
+	if sameGitRemote(repoDir, bareRepoDir) {
+		t.Fatalf("local paths %q and %q must not compare equal", repoDir, bareRepoDir)
+	}
+}
+
+func TestSameGitRemotePreservesSCPPathCase(t *testing.T) {
+	if !sameGitRemote("git@Example.com:Team/Store.git", "git@example.com:Team/Store") {
+		t.Fatal("scp-style host case and .git suffix should normalize")
+	}
+	if sameGitRemote("git@example.com:Team/Store.git", "git@example.com:team/store.git") {
+		t.Fatal("scp-style repository path case must stay distinct")
+	}
+}
+
+func TestSameGitRemoteIgnoresHTTPSCredentials(t *testing.T) {
+	if !sameGitRemote("https://user:old-token@example.com/org/store.git", "https://user:new-token@example.com/org/store") {
+		t.Fatal("https credential changes should not change remote identity")
+	}
+}
+
+func TestGitRemoteForMessageRedactsURLCredentials(t *testing.T) {
+	got := gitRemoteForMessage("https://user:secret@example.com/org/store.git")
+	if strings.Contains(got, "user") || strings.Contains(got, "secret") {
+		t.Fatalf("remote message leaked credentials: %q", got)
+	}
+	if got != "https://example.com/org/store.git" {
+		t.Fatalf("remote message = %q, want sanitized URL", got)
+	}
+}
+
 func TestInitWithPortableStoreCloneAndPull(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

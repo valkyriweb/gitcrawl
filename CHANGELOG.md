@@ -2,6 +2,7 @@
 
 ## 0.3.5 - Unreleased
 
+- Refuse to refresh a portable store checkout when its Git remote does not match the requested portable store, avoiding accidental resets of unrelated working trees.
 - Ignore non-finite vector similarity scores so malformed embeddings cannot surface as neighbors.
 
 ## 0.3.4 - 2026-05-14
