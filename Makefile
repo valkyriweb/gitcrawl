@@ -1,10 +1,13 @@
 BINARY := gitcrawl
 VERSION ?= dev
 
-.PHONY: build test test-coverage run clean
+.PHONY: build generate-sqlc test test-coverage run clean
 
 build:
 	go build -ldflags "-X github.com/openclaw/gitcrawl/internal/cli.version=$(VERSION)" -o bin/$(BINARY) ./cmd/gitcrawl
+
+generate-sqlc:
+	go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
 
 test:
 	go test ./...

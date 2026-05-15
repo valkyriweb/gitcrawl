@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/openclaw/gitcrawl/internal/store/storedb"
 	crawlstore "github.com/vincentkoc/crawlkit/store"
 )
 
@@ -17,11 +18,13 @@ const (
 type Store struct {
 	db      *sql.DB
 	queries dbQueries
+	sqlc    *storedb.Queries
 	path    string
 }
 
 type dbQueries interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
@@ -41,7 +44,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	db := base.DB()
-	st := &Store{db: db, path: path}
+	st := &Store{db: db, sqlc: storedb.New(db), path: path}
 	if err := st.migrate(ctx); err != nil {
 		_ = base.Close()
 		return nil, err
@@ -55,7 +58,7 @@ func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	db := base.DB()
-	st := &Store{db: db, path: path}
+	st := &Store{db: db, sqlc: storedb.New(db), path: path}
 	current, err := st.schemaVersion(ctx)
 	if err != nil {
 		_ = base.Close()
@@ -90,12 +93,19 @@ func (s *Store) q() dbQueries {
 	return s.db
 }
 
+func (s *Store) qsql() *storedb.Queries {
+	if s.sqlc != nil {
+		return s.sqlc
+	}
+	return storedb.New(s.q())
+}
+
 func (s *Store) WithTx(ctx context.Context, fn func(*Store) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
-	txStore := &Store{db: s.db, queries: tx, path: s.path}
+	txStore := &Store{db: s.db, queries: tx, sqlc: s.qsql().WithTx(tx), path: s.path}
 	if err := fn(txStore); err != nil {
 		_ = tx.Rollback()
 		return err
@@ -108,41 +118,45 @@ func (s *Store) WithTx(ctx context.Context, fn func(*Store) error) error {
 
 func (s *Store) Status(ctx context.Context) (Status, error) {
 	status := Status{DBPath: s.path}
-	if err := s.db.QueryRowContext(ctx, `select count(*) from repositories`).Scan(&status.RepositoryCount); err != nil {
+	if !s.hasTable(ctx, "repositories") {
+		return status, nil
+	}
+	repositoryCount, err := s.qsql().CountRepositories(ctx)
+	if err != nil {
 		return Status{}, fmt.Errorf("count repositories: %w", err)
 	}
-	if err := s.db.QueryRowContext(ctx, `select count(*) from threads`).Scan(&status.ThreadCount); err != nil {
+	status.RepositoryCount = int(repositoryCount)
+	threadCount, err := s.qsql().CountThreads(ctx)
+	if err != nil {
 		return Status{}, fmt.Errorf("count threads: %w", err)
 	}
-	if err := s.db.QueryRowContext(ctx, `select count(*) from threads where state = 'open' and closed_at_local is null`).Scan(&status.OpenThreadCount); err != nil {
+	status.ThreadCount = int(threadCount)
+	openThreadCount, err := s.qsql().CountOpenThreads(ctx)
+	if err != nil {
 		return Status{}, fmt.Errorf("count open threads: %w", err)
 	}
-	if err := s.db.QueryRowContext(ctx, `select count(*) from cluster_groups`).Scan(&status.ClusterCount); err != nil {
+	status.OpenThreadCount = int(openThreadCount)
+	clusterCount, err := s.qsql().CountClusters(ctx)
+	if err != nil {
 		return Status{}, fmt.Errorf("count clusters: %w", err)
 	}
+	status.ClusterCount = int(clusterCount)
 	var lastSync string
 	if s.hasTable(ctx, "sync_runs") {
-		if err := s.db.QueryRowContext(ctx, `select coalesce(max(finished_at), '') from sync_runs where status in ('success', 'completed')`).Scan(&lastSync); err != nil {
+		lastSync, err = s.qsql().MaxSuccessfulSyncFinishedAt(ctx)
+		if err != nil {
 			return Status{}, fmt.Errorf("read last sync: %w", err)
 		}
 	}
 	if lastSync == "" && s.hasTable(ctx, "portable_metadata") {
-		if err := s.db.QueryRowContext(ctx, `select value from portable_metadata where key = 'exported_at'`).Scan(&lastSync); err != nil && err != sql.ErrNoRows {
+		lastSync, err = s.qsql().PortableExportedAt(ctx)
+		if err != nil && err != sql.ErrNoRows {
 			return Status{}, fmt.Errorf("read portable exported timestamp: %w", err)
 		}
 	}
 	if lastSync == "" && s.hasTable(ctx, "repo_sync_state") {
-		if err := s.db.QueryRowContext(ctx, `
-			select coalesce(
-				max(last_open_close_reconciled_at),
-				max(last_overlapping_open_scan_completed_at),
-				max(last_non_overlapping_scan_completed_at),
-				max(last_full_open_scan_started_at),
-				max(updated_at),
-				''
-			)
-			from repo_sync_state
-		`).Scan(&lastSync); err != nil {
+		lastSync, err = s.qsql().RepoSyncStateLastSync(ctx)
+		if err != nil {
 			return Status{}, fmt.Errorf("read portable sync state: %w", err)
 		}
 	}
