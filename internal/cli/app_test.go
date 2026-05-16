@@ -1022,6 +1022,34 @@ func TestPortableRuntimeRejectsManifestMismatchBeforeReplacingMirror(t *testing.
 	if err := validatePortableSQLiteFile(ctx, checkoutDB, checkoutDB); err != nil {
 		t.Fatalf("legacy manifest without quickCheck should remain valid: %v", err)
 	}
+	validManifest := portableDBManifest{
+		Schema:      "gitcrawl-portable-sync-v2",
+		OutputBytes: info.Size(),
+		SHA256:      fmt.Sprintf("%x", sum),
+		QuickCheck:  "ok",
+	}
+	data, err = json.Marshal(validManifest)
+	if err != nil {
+		t.Fatalf("marshal valid manifest: %v", err)
+	}
+	if err := os.WriteFile(portableDBManifestPath(checkoutDB), data, 0o644); err != nil {
+		t.Fatalf("write valid manifest: %v", err)
+	}
+	futureMirror := time.Now().Add(time.Hour)
+	if err := os.Chtimes(mirrorPath, futureMirror, futureMirror); err != nil {
+		t.Fatalf("age stale mirror db: %v", err)
+	}
+	changed, err := refreshPortableRuntimeDB(ctx, checkoutDB, mirrorPath, false, filepath.Join(dir, "config.toml"))
+	if err != nil || !changed {
+		t.Fatalf("runtime mirror manifest mismatch should recopy, changed=%v err=%v", changed, err)
+	}
+	after, err = fileSHA256(mirrorPath)
+	if err != nil {
+		t.Fatalf("hash mirror after recopy: %v", err)
+	}
+	if after != sum {
+		t.Fatal("runtime mirror should match manifest source after recopy")
+	}
 	if err := os.WriteFile(portableDBManifestPath(checkoutDB), []byte("{"), 0o644); err != nil {
 		t.Fatalf("write malformed manifest: %v", err)
 	}
