@@ -274,22 +274,34 @@ type failingReviewThreadsGitHub struct {
 	pullDetailsGitHub
 }
 
+type failingSecondCommentGitHub struct {
+	fakeGitHub
+}
+
 type txProbePullDetailsGitHub struct {
 	fakeGitHub
-	st                    *store.Store
-	sawPersistedThread    bool
-	sawPersistedThreadErr error
+	st                        *store.Store
+	sawPersistedThread        bool
+	sawMissingPersistedThread bool
+	sawPersistedThreadReadErr error
+}
+
+func (failingSecondCommentGitHub) ListIssueComments(ctx context.Context, owner, repo string, number int, reporter gh.Reporter) ([]map[string]any, error) {
+	if number == 8 {
+		return nil, errors.New("comments unavailable")
+	}
+	return fakeGitHub{}.ListIssueComments(ctx, owner, repo, number, reporter)
 }
 
 func (g *txProbePullDetailsGitHub) ListPullFiles(ctx context.Context, owner, repo string, number int, reporter gh.Reporter) ([]map[string]any, error) {
 	storedRepo, err := g.st.RepositoryByFullName(ctx, owner+"/"+repo)
 	if err != nil {
-		g.sawPersistedThreadErr = err
+		g.sawMissingPersistedThread = true
 		return nil, nil
 	}
 	threads, err := g.st.ListThreads(ctx, storedRepo.ID, true)
 	if err != nil {
-		g.sawPersistedThreadErr = err
+		g.sawPersistedThreadReadErr = err
 		return nil, nil
 	}
 	for _, thread := range threads {
@@ -441,6 +453,30 @@ func TestSyncPersistsIssuesAndPullRequests(t *testing.T) {
 	}
 }
 
+func TestSyncWithCommentsRollsBackOnCommentFetchError(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	s := New(failingSecondCommentGitHub{}, st)
+	s.now = func() time.Time { return time.Date(2026, 4, 26, 0, 0, 0, 0, time.UTC) }
+	_, err = s.Sync(ctx, Options{Owner: "openclaw", Repo: "gitcrawl", IncludeComments: true})
+	if err == nil || !strings.Contains(err.Error(), "comments unavailable") {
+		t.Fatalf("sync error = %v", err)
+	}
+	if _, err := st.RepositoryByFullName(ctx, "openclaw/gitcrawl"); err == nil {
+		t.Fatal("repository persisted after failed comment hydration")
+	}
+	assertTableRowCount(t, st, "repositories", 0)
+	assertTableRowCount(t, st, "threads", 0)
+	assertTableRowCount(t, st, "comments", 0)
+	assertTableRowCount(t, st, "documents", 0)
+	assertTableRowCount(t, st, "sync_runs", 0)
+}
+
 func TestMetadataOnlySyncPreservesCommentBackedDocumentText(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
@@ -563,6 +599,70 @@ func TestSyncHydratesPullRequestDetails(t *testing.T) {
 	}
 }
 
+func TestPullRequestDetailsUseFetchTimestampWhenPersistedLater(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	repoID, err := st.UpsertRepository(ctx, store.Repository{
+		Owner:     "openclaw",
+		Name:      "gitcrawl",
+		FullName:  "openclaw/gitcrawl",
+		RawJSON:   "{}",
+		UpdatedAt: "2026-04-26T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("seed repo: %v", err)
+	}
+	issueRow, err := fakeGitHub{}.GetIssue(ctx, "openclaw", "gitcrawl", 8, nil)
+	thread := mapIssueToThread(repoID, mustIssue(t, issueRow, err), "2026-04-26T00:00:00Z")
+	threadID, err := st.UpsertThread(ctx, thread)
+	if err != nil {
+		t.Fatalf("seed thread: %v", err)
+	}
+	thread.ID = threadID
+
+	const fetchTime = "2026-04-26T00:01:00Z"
+	const persistTime = "2026-04-26T00:05:00Z"
+	s := New(pullDetailsGitHub{}, st)
+	s.now = func() time.Time { return mustTime(t, fetchTime) }
+	rows, err := s.fetchPullRequestDetails(ctx, Options{Owner: "openclaw", Repo: "gitcrawl"}, 8)
+	if err != nil {
+		t.Fatalf("fetch details: %v", err)
+	}
+	s.now = func() time.Time { return mustTime(t, persistTime) }
+	if _, err := s.persistPullRequestDetails(ctx, st, thread, rows); err != nil {
+		t.Fatalf("persist details: %v", err)
+	}
+
+	cache, err := st.PullRequestCache(ctx, repoID, 8)
+	if err != nil {
+		t.Fatalf("pr cache: %v", err)
+	}
+	if cache.Detail.FetchedAt != fetchTime || cache.Detail.UpdatedAt != fetchTime {
+		t.Fatalf("detail timestamps = fetched %q updated %q, want %q", cache.Detail.FetchedAt, cache.Detail.UpdatedAt, fetchTime)
+	}
+	if len(cache.Files) != 1 || cache.Files[0].FetchedAt != fetchTime {
+		t.Fatalf("file timestamps = %+v, want %q", cache.Files, fetchTime)
+	}
+	if len(cache.Commits) != 1 || cache.Commits[0].FetchedAt != fetchTime {
+		t.Fatalf("commit timestamps = %+v, want %q", cache.Commits, fetchTime)
+	}
+	if len(cache.Checks) != 1 || cache.Checks[0].FetchedAt != fetchTime {
+		t.Fatalf("check timestamps = %+v, want %q", cache.Checks, fetchTime)
+	}
+	runs, err := st.ListWorkflowRuns(ctx, repoID, store.WorkflowRunListOptions{HeadSHA: "head-sha", Limit: 10})
+	if err != nil {
+		t.Fatalf("workflow runs: %v", err)
+	}
+	if len(runs) != 1 || runs[0].FetchedAt != fetchTime {
+		t.Fatalf("run timestamps = %+v, want %q", runs, fetchTime)
+	}
+}
+
 func TestSyncPullRequestDetailsFailsOnReviewThreadFetchError(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
@@ -576,24 +676,13 @@ func TestSyncPullRequestDetailsFailsOnReviewThreadFetchError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "list pull request review threads for #8") {
 		t.Fatalf("sync error = %v", err)
 	}
-	repo, err := st.RepositoryByFullName(ctx, "openclaw/gitcrawl")
-	if err != nil {
-		t.Fatalf("repo: %v", err)
+	if _, err := st.RepositoryByFullName(ctx, "openclaw/gitcrawl"); err == nil {
+		t.Fatal("repository persisted after failed PR detail hydration")
 	}
-	threads, err := st.ListThreads(ctx, repo.ID, true)
-	if err != nil {
-		t.Fatalf("threads: %v", err)
-	}
-	if len(threads) != 1 {
-		t.Fatalf("threads = %+v", threads)
-	}
-	fetchedAt, err := st.PullRequestReviewThreadsFetchedAt(ctx, threads[0].ID)
-	if err != nil {
-		t.Fatalf("review thread marker: %v", err)
-	}
-	if fetchedAt != "" {
-		t.Fatalf("review thread marker should stay empty after failed fetch, got %q", fetchedAt)
-	}
+	assertTableRowCount(t, st, "repositories", 0)
+	assertTableRowCount(t, st, "threads", 0)
+	assertTableRowCount(t, st, "pull_request_review_thread_syncs", 0)
+	assertTableRowCount(t, st, "sync_runs", 0)
 }
 
 func TestSyncPullRequestDetailsSkipsCheckAndWorkflowFetchWithoutHeadSHA(t *testing.T) {
@@ -634,11 +723,25 @@ func TestSyncPullRequestDetailsDoesNotFetchInsideTransaction(t *testing.T) {
 	if _, err := s.Sync(ctx, Options{Owner: "openclaw", Repo: "gitcrawl", Numbers: []int{8}, IncludePRDetails: true}); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	if client.sawPersistedThreadErr != nil {
-		t.Fatalf("probe persisted thread: %v", client.sawPersistedThreadErr)
+	if client.sawPersistedThreadReadErr != nil {
+		t.Fatalf("probe persisted thread: %v", client.sawPersistedThreadReadErr)
 	}
-	if !client.sawPersistedThread {
-		t.Fatal("PR detail fetch ran before the PR thread was committed")
+	if !client.sawMissingPersistedThread {
+		t.Fatal("PR detail fetch saw repository writes before hydration finished")
+	}
+	if client.sawPersistedThread {
+		t.Fatal("PR detail fetch saw persisted PR thread before hydration finished")
+	}
+	repo, err := st.RepositoryByFullName(ctx, "openclaw/gitcrawl")
+	if err != nil {
+		t.Fatalf("repo after sync: %v", err)
+	}
+	threads, err := st.ListThreads(ctx, repo.ID, true)
+	if err != nil {
+		t.Fatalf("threads after sync: %v", err)
+	}
+	if len(threads) != 1 || threads[0].Number != 8 {
+		t.Fatalf("threads after sync = %+v", threads)
 	}
 }
 
@@ -956,4 +1059,32 @@ func assertDocumentFTSCount(t *testing.T, st *store.Store, query string, want in
 	if got != want {
 		t.Fatalf("document FTS count for %q: got %d want %d", query, got, want)
 	}
+}
+
+func assertTableRowCount(t *testing.T, st *store.Store, table string, want int) {
+	t.Helper()
+	var got int
+	if err := st.DB().QueryRowContext(context.Background(), `select count(*) from `+table).Scan(&got); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	if got != want {
+		t.Fatalf("%s rows: got %d want %d", table, got, want)
+	}
+}
+
+func mustIssue(t *testing.T, row map[string]any, err error) map[string]any {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("issue row: %v", err)
+	}
+	return row
+}
+
+func mustTime(t *testing.T, value string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		t.Fatalf("parse time %q: %v", value, err)
+	}
+	return parsed
 }

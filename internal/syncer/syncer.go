@@ -72,6 +72,15 @@ type Stats struct {
 	FinishedAt          string `json:"finished_at"`
 }
 
+type threadSyncPayload struct {
+	row                    map[string]any
+	commentRows            []commentRow
+	reviewThreads          []map[string]any
+	reviewThreadsFetchedAt string
+	pullDetails            pullRequestDetailRows
+	hasPullDetails         bool
+}
+
 func New(client GitHubClient, st *store.Store) *Syncer {
 	return &Syncer{
 		client: client,
@@ -94,18 +103,6 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 	if err != nil {
 		return Stats{}, err
 	}
-	repoID, err := s.store.UpsertRepository(ctx, store.Repository{
-		Owner:        options.Owner,
-		Name:         options.Repo,
-		FullName:     options.Owner + "/" + options.Repo,
-		GitHubRepoID: jsonID(repoRaw["id"]),
-		RawJSON:      mustJSON(repoRaw),
-		UpdatedAt:    s.now().Format(time.RFC3339Nano),
-	})
-	if err != nil {
-		return Stats{}, err
-	}
-
 	numbers := uniquePositiveNumbers(options.Numbers)
 	rows := make([]map[string]any, 0, len(numbers))
 	if len(numbers) > 0 {
@@ -129,6 +126,44 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 		}
 	}
 
+	payloads := make([]threadSyncPayload, 0, len(rows))
+	for _, row := range rows {
+		payload := threadSyncPayload{row: row}
+		number := intValue(row["number"])
+		kind := issueKind(row)
+		if options.IncludeComments {
+			commentRows, err := s.fetchCommentRows(ctx, options, kind, number)
+			if err != nil {
+				return Stats{}, err
+			}
+			payload.commentRows = commentRows
+		}
+		if options.IncludePRDetails && kind == "pull_request" {
+			reviewThreads, reviewThreadsFetchedAt, err := s.fetchPullReviewThreadRows(ctx, options, number)
+			if err != nil {
+				return Stats{}, err
+			}
+			payload.reviewThreads = reviewThreads
+			payload.reviewThreadsFetchedAt = reviewThreadsFetchedAt
+			pullDetails, err := s.fetchPullRequestDetails(ctx, options, number)
+			if err != nil {
+				return Stats{}, err
+			}
+			payload.pullDetails = pullDetails
+			payload.hasPullDetails = true
+		}
+		payloads = append(payloads, payload)
+	}
+	var closedOverlapRows []map[string]any
+	needsClosedOverlap := len(numbers) == 0 && state == "open" && since != "" && options.Limit <= 0
+	if needsClosedOverlap {
+		var err error
+		closedOverlapRows, err = s.fetchClosedOverlapRows(ctx, options, since)
+		if err != nil {
+			return Stats{}, err
+		}
+	}
+
 	stats := Stats{
 		Repository:     options.Owner + "/" + options.Repo,
 		RequestedSince: since,
@@ -147,8 +182,19 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 		},
 	})
 	persist := func(st *store.Store) error {
-		for _, row := range rows {
-			thread := mapIssueToThread(repoID, row, s.now().Format(time.RFC3339Nano))
+		repoID, err := st.UpsertRepository(ctx, store.Repository{
+			Owner:        options.Owner,
+			Name:         options.Repo,
+			FullName:     options.Owner + "/" + options.Repo,
+			GitHubRepoID: jsonID(repoRaw["id"]),
+			RawJSON:      mustJSON(repoRaw),
+			UpdatedAt:    s.now().Format(time.RFC3339Nano),
+		})
+		if err != nil {
+			return err
+		}
+		for _, payload := range payloads {
+			thread := mapIssueToThread(repoID, payload.row, s.now().Format(time.RFC3339Nano))
 			threadID, err := st.UpsertThread(ctx, thread)
 			if err != nil {
 				return err
@@ -156,8 +202,7 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 			thread.ID = threadID
 			var comments []store.Comment
 			if options.IncludeComments {
-				var err error
-				comments, err = s.syncComments(ctx, options, thread)
+				comments, err = persistComments(ctx, st, thread, payload.commentRows)
 				if err != nil {
 					return err
 				}
@@ -170,20 +215,22 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 				}
 			}
 			if options.IncludePRDetails && thread.Kind == "pull_request" {
-				count, err := s.syncPullReviewThreads(ctx, st, options, thread)
+				count, err := s.persistPullReviewThreads(ctx, st, thread, payload.reviewThreads, payload.reviewThreadsFetchedAt)
 				if err != nil {
 					return err
 				}
 				stats.ReviewThreadsSynced += count
-				detailStats, err := s.syncPullRequestDetails(ctx, st, options, thread)
-				if err != nil {
-					return err
+				if payload.hasPullDetails {
+					detailStats, err := s.persistPullRequestDetails(ctx, st, thread, payload.pullDetails)
+					if err != nil {
+						return err
+					}
+					stats.PRDetailsSynced++
+					stats.PRFilesSynced += detailStats.files
+					stats.PRCommitsSynced += detailStats.commits
+					stats.PRChecksSynced += detailStats.checks
+					stats.WorkflowRunsSynced += detailStats.runs
 				}
-				stats.PRDetailsSynced++
-				stats.PRFilesSynced += detailStats.files
-				stats.PRCommitsSynced += detailStats.commits
-				stats.PRChecksSynced += detailStats.checks
-				stats.WorkflowRunsSynced += detailStats.runs
 			}
 			if _, err := st.UpsertDocument(ctx, documents.BuildWithComments(thread, comments)); err != nil {
 				return err
@@ -200,8 +247,8 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 				"thread_state", thread.State,
 			)
 		}
-		if len(numbers) == 0 && state == "open" && since != "" && options.Limit <= 0 {
-			closed, err := s.applyClosedOverlapSweep(ctx, st, repoID, options, since)
+		if needsClosedOverlap {
+			closed, err := s.applyClosedOverlapRows(ctx, st, repoID, closedOverlapRows, options.Reporter)
 			if err != nil {
 				return err
 			}
@@ -221,15 +268,7 @@ func (s *Syncer) Sync(ctx context.Context, options Options) (Stats, error) {
 		}
 		return nil
 	}
-	if !options.IncludeComments && !options.IncludePRDetails {
-		if err := s.store.WithTx(ctx, persist); err != nil {
-			tracker.Finish(err)
-			return Stats{}, err
-		}
-		tracker.Finish(nil)
-		return stats, nil
-	}
-	if err := persist(s.store); err != nil {
+	if err := s.store.WithTx(ctx, persist); err != nil {
 		tracker.Finish(err)
 		return Stats{}, err
 	}
@@ -267,6 +306,13 @@ func syncRunScope(state string, numbers []int) string {
 	return "numbers:" + strings.Join(parts, ",")
 }
 
+func issueKind(row map[string]any) string {
+	if _, ok := row["pull_request"]; ok {
+		return "pull_request"
+	}
+	return "issue"
+}
+
 func normalizeState(value string) (string, error) {
 	value = strings.TrimSpace(strings.ToLower(value))
 	if value == "" {
@@ -280,14 +326,14 @@ func normalizeState(value string) (string, error) {
 	}
 }
 
-func (s *Syncer) applyClosedOverlapSweep(ctx context.Context, st *store.Store, repoID int64, options Options, since string) (int, error) {
-	rows, err := s.client.ListRepositoryIssues(ctx, options.Owner, options.Repo, gh.ListIssuesOptions{
+func (s *Syncer) fetchClosedOverlapRows(ctx context.Context, options Options, since string) ([]map[string]any, error) {
+	return s.client.ListRepositoryIssues(ctx, options.Owner, options.Repo, gh.ListIssuesOptions{
 		State: "closed",
 		Since: since,
 	}, options.Reporter)
-	if err != nil {
-		return 0, err
-	}
+}
+
+func (s *Syncer) applyClosedOverlapRows(ctx context.Context, st *store.Store, repoID int64, rows []map[string]any, reporter gh.Reporter) (int, error) {
 	closed := 0
 	for _, row := range rows {
 		thread := mapIssueToThread(repoID, row, s.now().Format(time.RFC3339Nano))
@@ -300,7 +346,7 @@ func (s *Syncer) applyClosedOverlapSweep(ctx context.Context, st *store.Store, r
 		}
 	}
 	if closed > 0 {
-		options.Reporter.Printf("[sync] closed overlap sweep matched %d stale open thread(s)", closed)
+		reporter.Printf("[sync] closed overlap sweep matched %d stale open thread(s)", closed)
 	}
 	return closed, nil
 }
@@ -339,10 +385,7 @@ func normalizeSince(value string, now time.Time) (string, error) {
 }
 
 func mapIssueToThread(repoID int64, row map[string]any, pulledAt string) store.Thread {
-	kind := "issue"
-	if _, ok := row["pull_request"]; ok {
-		kind = "pull_request"
-	}
+	kind := issueKind(row)
 	labelsJSON := mustJSON(row["labels"])
 	if labelsJSON == "null" {
 		labelsJSON = "[]"
@@ -377,24 +420,24 @@ func mapIssueToThread(repoID int64, row map[string]any, pulledAt string) store.T
 	}
 }
 
-func (s *Syncer) syncComments(ctx context.Context, options Options, thread store.Thread) ([]store.Comment, error) {
+func (s *Syncer) fetchCommentRows(ctx context.Context, options Options, threadKind string, number int) ([]commentRow, error) {
 	var rows []commentRow
-	issueComments, err := s.client.ListIssueComments(ctx, options.Owner, options.Repo, thread.Number, options.Reporter)
+	issueComments, err := s.client.ListIssueComments(ctx, options.Owner, options.Repo, number, options.Reporter)
 	if err != nil {
 		return nil, err
 	}
 	for _, row := range issueComments {
 		rows = append(rows, commentRow{kind: "issue_comment", raw: row})
 	}
-	if thread.Kind == "pull_request" {
-		reviews, err := s.client.ListPullReviews(ctx, options.Owner, options.Repo, thread.Number, options.Reporter)
+	if threadKind == "pull_request" {
+		reviews, err := s.client.ListPullReviews(ctx, options.Owner, options.Repo, number, options.Reporter)
 		if err != nil {
 			return nil, err
 		}
 		for _, row := range reviews {
 			rows = append(rows, commentRow{kind: "pull_review", raw: row})
 		}
-		reviewComments, err := s.client.ListPullReviewComments(ctx, options.Owner, options.Repo, thread.Number, options.Reporter)
+		reviewComments, err := s.client.ListPullReviewComments(ctx, options.Owner, options.Repo, number, options.Reporter)
 		if err != nil {
 			return nil, err
 		}
@@ -402,13 +445,17 @@ func (s *Syncer) syncComments(ctx context.Context, options Options, thread store
 			rows = append(rows, commentRow{kind: "pull_review_comment", raw: row})
 		}
 	}
+	return rows, nil
+}
+
+func persistComments(ctx context.Context, st *store.Store, thread store.Thread, rows []commentRow) ([]store.Comment, error) {
 	var comments []store.Comment
 	for _, row := range rows {
 		comment := mapComment(thread.ID, row.kind, row.raw)
 		if comment.Body == "" && row.kind != "pull_review" {
 			continue
 		}
-		if _, err := s.store.UpsertComment(ctx, comment); err != nil {
+		if _, err := st.UpsertComment(ctx, comment); err != nil {
 			return nil, err
 		}
 		comments = append(comments, comment)
@@ -416,12 +463,19 @@ func (s *Syncer) syncComments(ctx context.Context, options Options, thread store
 	return comments, nil
 }
 
-func (s *Syncer) syncPullReviewThreads(ctx context.Context, st *store.Store, options Options, thread store.Thread) (int, error) {
-	rows, err := s.client.ListPullReviewThreads(ctx, options.Owner, options.Repo, thread.Number, options.Reporter)
-	if err != nil {
-		return 0, fmt.Errorf("list pull request review threads for #%d: %w", thread.Number, err)
-	}
+func (s *Syncer) fetchPullReviewThreadRows(ctx context.Context, options Options, number int) ([]map[string]any, string, error) {
 	fetchedAt := s.now().Format(time.RFC3339Nano)
+	rows, err := s.client.ListPullReviewThreads(ctx, options.Owner, options.Repo, number, options.Reporter)
+	if err != nil {
+		return nil, "", fmt.Errorf("list pull request review threads for #%d: %w", number, err)
+	}
+	return rows, fetchedAt, nil
+}
+
+func (s *Syncer) persistPullReviewThreads(ctx context.Context, st *store.Store, thread store.Thread, rows []map[string]any, fetchedAt string) (int, error) {
+	if fetchedAt == "" {
+		fetchedAt = s.now().Format(time.RFC3339Nano)
+	}
 	threads := make([]store.PullRequestReviewThread, 0, len(rows))
 	for _, row := range rows {
 		mapped := mapPullReviewThread(thread.ID, row, fetchedAt)

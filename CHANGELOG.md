@@ -10,6 +10,7 @@
 - Preserve multiple thread embeddings for the same thread when basis or model differs.
 - Preserve OpenAI retry backoff defaults when callers provide partial retry overrides.
 - Preserve existing comment text in search documents during metadata-only syncs.
+- Keep comment and PR-detail sync writes atomic when GitHub hydration fails, avoiding partial cache rows without a run record.
 - Fail PR-detail syncs when GitHub review-thread hydration fails instead of recording a successful partial refresh.
 - Fetch all paginated GitHub review-thread comments instead of keeping only the first review-thread comment page.
 - Keep `gh xcache gc` from expiring stable PR diff cache entries with the short fallback TTL while the PR head SHA is unchanged.

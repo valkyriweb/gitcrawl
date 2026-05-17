@@ -15,40 +15,64 @@ type pullDetailStats struct {
 	runs    int
 }
 
-func (s *Syncer) syncPullRequestDetails(ctx context.Context, st *store.Store, options Options, thread store.Thread) (pullDetailStats, error) {
+type pullRequestDetailRows struct {
+	fetchedAt  string
+	pull       map[string]any
+	filesRaw   []map[string]any
+	commitsRaw []map[string]any
+	checksRaw  []map[string]any
+	runsRaw    []map[string]any
+}
+
+func (s *Syncer) fetchPullRequestDetails(ctx context.Context, options Options, number int) (pullRequestDetailRows, error) {
 	fetchedAt := s.now().Format(time.RFC3339Nano)
-	pull, err := s.client.GetPull(ctx, options.Owner, options.Repo, thread.Number, options.Reporter)
+	pull, err := s.client.GetPull(ctx, options.Owner, options.Repo, number, options.Reporter)
 	if err != nil {
-		return pullDetailStats{}, err
+		return pullRequestDetailRows{}, err
 	}
-	filesRaw, err := s.client.ListPullFiles(ctx, options.Owner, options.Repo, thread.Number, options.Reporter)
+	filesRaw, err := s.client.ListPullFiles(ctx, options.Owner, options.Repo, number, options.Reporter)
 	if err != nil {
-		return pullDetailStats{}, err
+		return pullRequestDetailRows{}, err
 	}
-	commitsRaw, err := s.client.ListPullCommits(ctx, options.Owner, options.Repo, thread.Number, options.Reporter)
+	commitsRaw, err := s.client.ListPullCommits(ctx, options.Owner, options.Repo, number, options.Reporter)
 	if err != nil {
-		return pullDetailStats{}, err
+		return pullRequestDetailRows{}, err
 	}
 	headSHA := nestedString(pull, "head", "sha")
 	var checksRaw []map[string]any
 	if headSHA != "" {
 		checksRaw, err = s.client.ListCommitCheckRuns(ctx, options.Owner, options.Repo, headSHA, options.Reporter)
 		if err != nil {
-			return pullDetailStats{}, err
+			return pullRequestDetailRows{}, err
 		}
 	}
 	var runsRaw []map[string]any
 	if headSHA != "" {
 		runsRaw, err = s.client.ListWorkflowRuns(ctx, options.Owner, options.Repo, gh.ListWorkflowRunsOptions{HeadSHA: headSHA, Limit: 20}, options.Reporter)
 		if err != nil {
-			return pullDetailStats{}, err
+			return pullRequestDetailRows{}, err
 		}
 	}
-	detail := mapPullDetail(thread, pull, fetchedAt)
-	files := mapPullFiles(thread.ID, filesRaw, fetchedAt)
-	commits := mapPullCommits(thread.ID, commitsRaw, fetchedAt)
-	checks := mapPullChecks(thread.ID, checksRaw, fetchedAt)
-	runs := mapWorkflowRuns(thread.RepoID, runsRaw, fetchedAt)
+	return pullRequestDetailRows{
+		fetchedAt:  fetchedAt,
+		pull:       pull,
+		filesRaw:   filesRaw,
+		commitsRaw: commitsRaw,
+		checksRaw:  checksRaw,
+		runsRaw:    runsRaw,
+	}, nil
+}
+
+func (s *Syncer) persistPullRequestDetails(ctx context.Context, st *store.Store, thread store.Thread, rows pullRequestDetailRows) (pullDetailStats, error) {
+	fetchedAt := rows.fetchedAt
+	if fetchedAt == "" {
+		fetchedAt = s.now().Format(time.RFC3339Nano)
+	}
+	detail := mapPullDetail(thread, rows.pull, fetchedAt)
+	files := mapPullFiles(thread.ID, rows.filesRaw, fetchedAt)
+	commits := mapPullCommits(thread.ID, rows.commitsRaw, fetchedAt)
+	checks := mapPullChecks(thread.ID, rows.checksRaw, fetchedAt)
+	runs := mapWorkflowRuns(thread.RepoID, rows.runsRaw, fetchedAt)
 	if err := st.UpsertPullRequestCache(ctx, detail, files, commits, checks, runs); err != nil {
 		return pullDetailStats{}, err
 	}
