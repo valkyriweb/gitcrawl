@@ -1,5 +1,7 @@
 # Changelog
 
+## 0.4.4 - Unreleased
+
 ## 0.4.3 - 2026-05-22
 
 - Update `crawlkit` to v0.7.0.
