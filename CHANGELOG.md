@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2 - Unreleased
+
+- Update `crawlkit` to v0.9.0.
+
 ## 0.4.1 - 2026-05-18
 
 - Add cached release checks with `gitcrawl check-update` and passive terminal
