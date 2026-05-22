@@ -2,7 +2,7 @@
 
 ## 0.4.2 - Unreleased
 
-- Update `crawlkit` to v0.9.0.
+- Update `crawlkit` to v0.7.0.
 
 ## 0.4.1 - 2026-05-18
 
