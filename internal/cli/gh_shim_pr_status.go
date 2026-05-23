@@ -760,6 +760,17 @@ func rawInt(row map[string]any, key string) int {
 	}
 }
 
+func rawBool(row map[string]any, key string) bool {
+	switch typed := row[key].(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(typed, "true")
+	default:
+		return false
+	}
+}
+
 func isGHBot(login, authorType string) bool {
 	return strings.EqualFold(authorType, "Bot") || strings.HasSuffix(strings.ToLower(login), "[bot]")
 }

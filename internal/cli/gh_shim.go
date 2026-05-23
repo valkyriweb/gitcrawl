@@ -122,8 +122,7 @@ func (a *App) runGHShim(ctx context.Context, args []string) error {
 							return err
 						}
 						if isGHRunListLiveRequired(err) {
-							_ = a.incrementGHXCacheCounter("live_bypasses")
-							return a.execRealGHWithMutationTracking(ctx, args)
+							return a.execRealGHMaybeCached(ctx, args, controls)
 						}
 						return a.execRealGHMaybeCached(ctx, args, controls)
 					}

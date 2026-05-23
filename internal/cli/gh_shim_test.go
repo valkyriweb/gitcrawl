@@ -56,7 +56,7 @@ func TestGHShimFallsBackForUnsupportedRead(t *testing.T) {
 	}
 	t.Setenv("GITCRAWL_GH_PATH", ghPath)
 
-	for _, fields := range []string{"unsupportedField", "reviews", "reviewDecision"} {
+	for _, fields := range []string{"unsupportedField", "closingIssuesReferences", "autoMergeRequest", "isInMergeQueue"} {
 		run := New()
 		var stdout bytes.Buffer
 		run.Stdout = &stdout
@@ -699,7 +699,7 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 		Additions:        10,
 		Deletions:        2,
 		ChangedFiles:     1,
-		RawJSON:          `{"head":{"sha":"abc123"}}`,
+		RawJSON:          `{"base":{"ref":"main"},"head":{"sha":"abc123"},"maintainer_can_modify":true,"merge_commit_sha":"merge123","auto_merge":null}`,
 		FetchedAt:        fetchedAt,
 		UpdatedAt:        fetchedAt,
 	}, []store.PullRequestFile{{

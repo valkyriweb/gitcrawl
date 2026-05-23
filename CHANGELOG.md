@@ -2,6 +2,8 @@
 
 ## 0.4.4 - Unreleased
 
+- Improve gh-shim cache hit rates for API projections, explicit `--cache` reads, broad run-list fallbacks, stable dated searches, `pr checks --watch=false`, and common local PR view fields.
+
 ## 0.4.3 - 2026-05-22
 
 - Update `crawlkit` to v0.7.0.
