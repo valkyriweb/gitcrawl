@@ -57,7 +57,7 @@ func TestGHShimFallsBackForUnsupportedRead(t *testing.T) {
 	t.Setenv("GITCRAWL_GH_PATH", ghPath)
 	t.Setenv("GITCRAWL_GH_AUTO_HYDRATE", "0")
 
-	for _, fields := range []string{"unsupportedField", "closingIssuesReferences", "autoMergeRequest", "isInMergeQueue", "reviewDecision", "reviews", "latestReviews"} {
+	for _, fields := range []string{"unsupportedField", "closingIssuesReferences", "isInMergeQueue", "merged", "baseRepository", "reviewDecision", "reviews", "latestReviews"} {
 		run := New()
 		var stdout bytes.Buffer
 		run.Stdout = &stdout
@@ -700,7 +700,7 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 		Additions:        10,
 		Deletions:        2,
 		ChangedFiles:     1,
-		RawJSON:          `{"base":{"ref":"main"},"head":{"sha":"abc123"},"maintainer_can_modify":true,"merge_commit_sha":"merge123","auto_merge":null}`,
+		RawJSON:          `{"id":12,"user":{"login":"bob","id":42},"labels":[{"name":"bug","id":7,"default":true}],"base":{"ref":"main"},"head":{"sha":"abc123","repo":{"full_name":"openclaw/openclaw","id":99,"owner":{"login":"openclaw"},"default_branch":"main"}},"draft":true,"closed_at":null,"merged_at":null,"maintainer_can_modify":true,"merge_commit_sha":"merge123","auto_merge":null}`,
 		FetchedAt:        fetchedAt,
 		UpdatedAt:        fetchedAt,
 	}, []store.PullRequestFile{{

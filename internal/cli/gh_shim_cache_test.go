@@ -283,7 +283,7 @@ if [ -f "$GH_SHIM_COUNT" ]; then
 fi
 count=$((count + 1))
 printf "%s" "$count" > "$GH_SHIM_COUNT"
-printf '{"number":12,"title":"Manifest cache update"}\n'
+printf '{"id":123,"name":"v1.2.3"}\n'
 `
 	if err := os.WriteFile(ghPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake gh: %v", err)
@@ -296,14 +296,14 @@ printf '{"number":12,"title":"Manifest cache update"}\n'
 		jq   string
 		want string
 	}{
-		{".number", "12"},
-		{".title", "Manifest cache update"},
+		{".id", "123"},
+		{".name", "v1.2.3"},
 	} {
 		run := New()
 		var stdout, stderr bytes.Buffer
 		run.Stdout = &stdout
 		run.Stderr = &stderr
-		if err := run.Run(ctx, []string{"--config", configPath, "gh", "api", "repos/openclaw/openclaw/pulls/12", "--jq", tc.jq}); err != nil {
+		if err := run.Run(ctx, []string{"--config", configPath, "gh", "api", "repos/openclaw/openclaw/releases/latest", "--jq", tc.jq}); err != nil {
 			t.Fatalf("gh api --jq %s: %v\nstderr=%s", tc.jq, err, stderr.String())
 		}
 		if got := strings.TrimSpace(stdout.String()); got != tc.want {

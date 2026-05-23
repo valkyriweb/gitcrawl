@@ -97,6 +97,22 @@ func (a *App) ghThreadViewJSONRow(ctx context.Context, repoValue string, thread 
 	return row, nil
 }
 
+func (a *App) ghPRListJSONRows(ctx context.Context, repoValue string, threads []store.Thread, fieldsRaw string, controls ghShimControls) ([]map[string]any, error) {
+	fields := parseJSONFields(fieldsRaw)
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("--json requires at least one field")
+	}
+	rows := make([]map[string]any, 0, len(threads))
+	for _, thread := range threads {
+		row, err := a.ghThreadViewJSONRow(ctx, repoValue, thread, fieldsRaw, controls)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
 func (a *App) hydrateGHPRViewReviews(ctx context.Context, repoValue string, number int) error {
 	if !a.shouldAutoHydrateGHThread(nil) {
 		return localGHUnsupported(fmt.Errorf("fresh PR reviews require live hydration"))
@@ -316,7 +332,7 @@ func ghPRDetailJSONValue(thread store.Thread, cache store.PullRequestCache, fiel
 	case "headRepository":
 		return map[string]any{"nameWithOwner": cache.Detail.HeadRepoFullName}, nil
 	case "mergeCommit":
-		if strings.TrimSpace(thread.MergedAtGitHub) == "" {
+		if !ghPRDetailMerged(thread, cache) {
 			return nil, nil
 		}
 		sha := rawString(decodeRawJSON(cache.Detail.RawJSON), "merge_commit_sha")
@@ -324,6 +340,48 @@ func ghPRDetailJSONValue(thread store.Thread, cache store.PullRequestCache, fiel
 			return nil, nil
 		}
 		return map[string]any{"oid": sha}, nil
+	case "potentialMergeCommit":
+		if ghPRDetailMerged(thread, cache) {
+			return nil, nil
+		}
+		sha := rawString(decodeRawJSON(cache.Detail.RawJSON), "merge_commit_sha")
+		if sha == "" {
+			return nil, nil
+		}
+		return map[string]any{"oid": sha}, nil
+	case "autoMergeRequest":
+		return ghAutoMergeRequestFromREST(decodeRawJSON(cache.Detail.RawJSON)["auto_merge"]), nil
+	case "mergedBy":
+		mergedBy := rawMap(decodeRawJSON(cache.Detail.RawJSON), "merged_by")
+		if len(mergedBy) == 0 {
+			return nil, nil
+		}
+		return mergedBy, nil
+	case "isCrossRepository":
+		baseFullName := ""
+		if ref, ok := parseThreadReference(thread.HTMLURL); ok {
+			baseFullName = ref.FullName()
+		}
+		headFullName := strings.TrimSpace(cache.Detail.HeadRepoFullName)
+		return baseFullName != "" && headFullName != "" && !strings.EqualFold(baseFullName, headFullName), nil
+	case "reviewRequests":
+		raw := decodeRawJSON(cache.Detail.RawJSON)
+		requests := []map[string]any{}
+		for _, reviewer := range rawSlice(raw["requested_reviewers"]) {
+			login := rawString(reviewer, "login")
+			if login == "" {
+				continue
+			}
+			requests = append(requests, map[string]any{"requestedReviewer": map[string]any{"login": login}})
+		}
+		for _, team := range rawSlice(raw["requested_teams"]) {
+			slug := rawString(team, "slug")
+			if slug == "" {
+				continue
+			}
+			requests = append(requests, map[string]any{"requestedReviewer": map[string]any{"slug": slug}})
+		}
+		return requests, nil
 	case "mergeStateStatus":
 		return strings.ToUpper(cache.Detail.MergeableState), nil
 	case "mergeable":
@@ -369,6 +427,52 @@ func ghStatusCheckRollup(checks []store.PullRequestCheck) []map[string]any {
 			"startedAt":    check.StartedAt,
 			"completedAt":  check.CompletedAt,
 		})
+	}
+	return out
+}
+
+func rawSlice(value any) []map[string]any {
+	rows, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		if typed, ok := row.(map[string]any); ok {
+			out = append(out, typed)
+		}
+	}
+	return out
+}
+
+func ghPRDetailMerged(thread store.Thread, cache store.PullRequestCache) bool {
+	raw := decodeRawJSON(cache.Detail.RawJSON)
+	if merged, ok := raw["merged"].(bool); ok {
+		return merged
+	}
+	return strings.TrimSpace(firstNonEmpty(rawString(raw, "merged_at"), thread.MergedAtGitHub)) != ""
+}
+
+func ghAutoMergeRequestFromREST(value any) any {
+	rest, ok := value.(map[string]any)
+	if !ok || len(rest) == 0 {
+		return nil
+	}
+	out := map[string]any{}
+	if enabledBy := rawMap(rest, "enabled_by"); len(enabledBy) > 0 {
+		out["enabledBy"] = enabledBy
+	}
+	if mergeMethod := rawString(rest, "merge_method"); mergeMethod != "" {
+		out["mergeMethod"] = mergeMethod
+	}
+	if commitHeadline := firstNonEmpty(rawString(rest, "commit_title"), rawString(rest, "commit_headline")); commitHeadline != "" {
+		out["commitHeadline"] = commitHeadline
+	}
+	if commitBody := firstNonEmpty(rawString(rest, "commit_message"), rawString(rest, "commit_body")); commitBody != "" {
+		out["commitBody"] = commitBody
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

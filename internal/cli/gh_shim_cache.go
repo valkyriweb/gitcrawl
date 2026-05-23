@@ -30,6 +30,9 @@ func (a *App) execRealGHWithMutationTracking(ctx context.Context, args []string)
 }
 
 func (a *App) execRealGHMaybeCached(ctx context.Context, args []string, controls ghShimControls) error {
+	if handled, err := a.execLocalGHAPI(ctx, args, controls); handled {
+		return err
+	}
 	if !cacheableGHRead(args) {
 		return a.execRealGHWithMutationTracking(ctx, args)
 	}

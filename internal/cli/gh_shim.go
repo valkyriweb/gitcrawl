@@ -96,7 +96,7 @@ func (a *App) runGHShim(ctx context.Context, args []string) error {
 					return runPRStatus()
 				}
 			case "list":
-				if err := a.runGHThreadList(ctx, args[0], args[2:]); err != nil {
+				if err := a.runGHThreadList(ctx, args[0], args[2:], controls); err != nil {
 					if isLocalGHUnsupported(err) {
 						if controls.Cached {
 							return err
@@ -215,7 +215,7 @@ func (a *App) runGHThreadView(ctx context.Context, resource string, args []strin
 	return err
 }
 
-func (a *App) runGHThreadList(ctx context.Context, resource string, args []string) error {
+func (a *App) runGHThreadList(ctx context.Context, resource string, args []string, controls ghShimControls) error {
 	fs := flag.NewFlagSet(resource+" list", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	repoShort := fs.String("R", "", "repository")
@@ -284,7 +284,13 @@ func (a *App) runGHThreadList(ctx context.Context, resource string, args []strin
 		if jsonFields == "" {
 			jsonFields = "number,title,state,url"
 		}
-		rows, err := ghSearchJSONRows(threads, jsonFields)
+		var rows []map[string]any
+		var err error
+		if resource == "pr" {
+			rows, err = a.ghPRListJSONRows(ctx, repoValue, threads, jsonFields, controls)
+		} else {
+			rows, err = ghSearchJSONRows(threads, jsonFields)
+		}
 		if err != nil {
 			return localGHUnsupported(err)
 		}

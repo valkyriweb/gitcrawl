@@ -24,6 +24,9 @@ func (a *App) loadGHPullRequestCache(ctx context.Context, repoValue string, numb
 	if err == nil && (!requireFresh || ghPullRequestCacheFresh(cache)) {
 		return cache, nil
 	}
+	if err == nil && requireFresh {
+		err = localGHUnsupported(fmt.Errorf("cached pull request detail is stale"))
+	}
 	if !a.shouldAutoHydrateGHPRDetails(err) {
 		return cache, err
 	}
@@ -44,7 +47,7 @@ func (a *App) loadGHPullRequestCache(ctx context.Context, repoValue string, numb
 func ghPRFieldsNeedFresh(fields []string) bool {
 	for _, field := range fields {
 		switch field {
-		case "statusCheckRollup", "mergeStateStatus", "mergeable", "reviewDecision", "reviews", "latestReviews":
+		case "statusCheckRollup", "mergeStateStatus", "mergeable", "reviewDecision", "reviews", "latestReviews", "mergeCommit", "potentialMergeCommit", "autoMergeRequest", "mergedBy", "reviewRequests":
 			return true
 		}
 	}
