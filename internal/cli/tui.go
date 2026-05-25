@@ -61,6 +61,7 @@ type clusterBrowserPayload struct {
 	DBRuntimePath      string                 `json:"-"`
 	ConfigPath         string                 `json:"-"`
 	Sort               string                 `json:"sort"`
+	Layout             string                 `json:"layout,omitempty"`
 	MinSize            int                    `json:"min_size"`
 	Limit              int                    `json:"limit,omitempty"`
 	HideClosed         bool                   `json:"hide_closed,omitempty"`
@@ -93,6 +94,7 @@ type tuiWideLayout string
 const (
 	wideLayoutColumns    tuiWideLayout = "columns"
 	wideLayoutRightStack tuiWideLayout = "right-stack"
+	wideLayoutFocus      tuiWideLayout = "focus"
 )
 
 type tuiRect struct {
@@ -314,7 +316,7 @@ func newClusterBrowserModel(ctx context.Context, st *store.Store, repoID int64, 
 		showClosed:    !payload.HideClosed,
 		minSize:       maxInt(1, payload.MinSize),
 		memberSort:    memberSortKind,
-		wideLayout:    wideLayoutColumns,
+		wideLayout:    normalizeTUILayout(payload.Layout),
 		memberIndex:   -1,
 		detailView:    viewport.New(1, 1),
 		searchInput:   search,
@@ -562,6 +564,10 @@ func (m clusterBrowserModel) View() string {
 	detail := m.renderDetail(layout.detail)
 	footer := m.renderFooter(layout.footer.w)
 	body := lipgloss.JoinHorizontal(lipgloss.Top, clusters, members, detail)
+	if !layout.stacked && layout.mode == string(wideLayoutFocus) {
+		top := lipgloss.JoinHorizontal(lipgloss.Top, clusters, detail)
+		body = lipgloss.JoinVertical(lipgloss.Left, top, members)
+	}
 	if !layout.stacked && layout.detail.y > layout.members.y {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, clusters, lipgloss.JoinVertical(lipgloss.Left, members, detail))
 	}
@@ -602,6 +608,18 @@ func (m clusterBrowserModel) layout() tuiLayout {
 		footer: tuiRect{x: 0, y: headerH + bodyH, w: width, h: footerH},
 	}
 	if width >= 140 {
+		if m.wideLayout == wideLayoutFocus {
+			topH := maxInt(10, bodyH*68/100)
+			memberH := maxInt(6, bodyH-topH)
+			topH = bodyH - memberH
+			clusterW := maxInt(48, width*32/100)
+			detailW := width - clusterW
+			layout.mode = string(wideLayoutFocus)
+			layout.clusters = tuiRect{x: 0, y: headerH, w: clusterW, h: topH}
+			layout.detail = tuiRect{x: clusterW, y: headerH, w: detailW, h: topH}
+			layout.members = tuiRect{x: 0, y: headerH + topH, w: width, h: memberH}
+			return layout
+		}
 		if m.wideLayout == wideLayoutRightStack {
 			clusterW := maxInt(56, width*44/100)
 			rightW := width - clusterW
@@ -888,7 +906,7 @@ func (m clusterBrowserModel) helpLines(width int) []string {
 		"  d: toggle compact/full detail",
 		"  r: refresh from local store",
 		"  p: switch repository",
-		"  l: toggle wide layout",
+		"  l: cycle layout",
 		"  f: cycle minimum cluster size",
 		"  x: show/hide closed clusters",
 		"  o: open selected thread or representative",
@@ -4013,12 +4031,38 @@ func nextMemberSort(current tuiMemberSort) tuiMemberSort {
 }
 
 func (m *clusterBrowserModel) toggleWideLayout() {
-	if m.wideLayout == wideLayoutColumns {
+	switch m.wideLayout {
+	case wideLayoutColumns:
 		m.wideLayout = wideLayoutRightStack
-	} else {
+	case wideLayoutRightStack:
+		m.wideLayout = wideLayoutFocus
+	default:
 		m.wideLayout = wideLayoutColumns
 	}
 	m.status = "Layout: " + string(m.wideLayout)
+}
+
+func normalizeTUILayout(value string) tuiWideLayout {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case string(wideLayoutColumns), "":
+		return wideLayoutColumns
+	case string(wideLayoutRightStack), "right_stack", "rightstack":
+		return wideLayoutRightStack
+	case string(wideLayoutFocus):
+		return wideLayoutFocus
+	default:
+		return wideLayoutColumns
+	}
+}
+
+func isSupportedTUILayout(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	switch normalized {
+	case string(wideLayoutColumns), string(wideLayoutRightStack), "right_stack", "rightstack", string(wideLayoutFocus), "":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *clusterBrowserModel) toggleDetailMode() {

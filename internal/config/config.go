@@ -42,7 +42,8 @@ type OpenAIConfig struct {
 }
 
 type TUIConfig struct {
-	DefaultSort string `toml:"default_sort"`
+	DefaultSort   string `toml:"default_sort"`
+	DefaultLayout string `toml:"default_layout"`
 }
 
 type TokenResolution struct {
@@ -80,7 +81,8 @@ func Default() Config {
 			Concurrency:     2,
 		},
 		TUI: TUIConfig{
-			DefaultSort: "size",
+			DefaultSort:   "size",
+			DefaultLayout: "columns",
 		},
 	}
 }
@@ -177,6 +179,11 @@ func (c *Config) Normalize() error {
 	}
 	if c.TUI.DefaultSort == "" {
 		c.TUI.DefaultSort = def.TUI.DefaultSort
+	}
+	if c.TUI.DefaultLayout == "" {
+		c.TUI.DefaultLayout = c.envOrDefault("GITCRAWL_TUI_LAYOUT", def.TUI.DefaultLayout)
+	} else {
+		c.TUI.DefaultLayout = c.envOrDefault("GITCRAWL_TUI_LAYOUT", c.TUI.DefaultLayout)
 	}
 	c.DBPath = expandHome(c.DBPath)
 	c.CacheDir = expandHome(c.CacheDir)

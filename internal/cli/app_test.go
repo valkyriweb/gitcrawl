@@ -191,11 +191,11 @@ func TestControlRepositoryAndClusterHelperBranches(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.Default()
 	cfg.DBPath = filepath.Join(dir, "gitcrawl.db")
-	payload := emptyClusterBrowserPayload(ctx, cfg, "", "recent", 2, 50, true)
+	payload := emptyClusterBrowserPayload(ctx, cfg, "", "recent", "focus", 2, 50, true)
 	if payload.DBSource != "local" || payload.DBLocation != "gitcrawl.db" {
 		t.Fatalf("empty payload source = %s/%s", payload.DBSource, payload.DBLocation)
 	}
-	if payload.Sort != "recent" || payload.MinSize != 2 || payload.Limit != 50 || !payload.HideClosed {
+	if payload.Sort != "recent" || payload.Layout != "focus" || payload.MinSize != 2 || payload.Limit != 50 || !payload.HideClosed {
 		t.Fatalf("empty payload options = %#v", payload)
 	}
 
@@ -1705,7 +1705,7 @@ func TestTUIJSONUsesDefaultsWhenConfigMissing(t *testing.T) {
 	run := New()
 	var stdout bytes.Buffer
 	run.Stdout = &stdout
-	if err := run.Run(ctx, []string{"--config", configPath, "tui", "--json"}); err != nil {
+	if err := run.Run(ctx, []string{"--config", configPath, "tui", "--json", "--layout", "focus"}); err != nil {
 		t.Fatalf("tui: %v", err)
 	}
 	var payload map[string]any
@@ -1715,12 +1715,20 @@ func TestTUIJSONUsesDefaultsWhenConfigMissing(t *testing.T) {
 	if payload["mode"] != "cluster-browser" {
 		t.Fatalf("mode = %#v", payload["mode"])
 	}
+	if payload["layout"] != "focus" {
+		t.Fatalf("layout = %#v", payload["layout"])
+	}
 	clusters, ok := payload["clusters"].([]any)
 	if !ok || len(clusters) != 0 {
 		t.Fatalf("clusters = %#v", payload["clusters"])
 	}
 	if _, err := os.Stat(configPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("config file should not be created, stat err=%v", err)
+	}
+
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "tui", "--json", "--layout", "bogus"}); err == nil || !strings.Contains(err.Error(), `unsupported layout "bogus"`) {
+		t.Fatalf("bogus layout err = %v", err)
 	}
 }
 
@@ -1737,16 +1745,24 @@ func TestTUIJSONHandlesEmptyStoreWithoutRepository(t *testing.T) {
 	run := New()
 	var stdout bytes.Buffer
 	run.Stdout = &stdout
-	if err := run.Run(ctx, []string{"--config", configPath, "tui", "--json"}); err != nil {
+	if err := run.Run(ctx, []string{"--config", configPath, "tui", "--json", "--layout", "focus"}); err != nil {
 		t.Fatalf("tui: %v", err)
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
 		t.Fatalf("decode tui payload: %v\n%s", err, stdout.String())
 	}
+	if payload["layout"] != "focus" {
+		t.Fatalf("layout = %#v", payload["layout"])
+	}
 	clusters, ok := payload["clusters"].([]any)
 	if !ok || len(clusters) != 0 {
 		t.Fatalf("clusters = %#v", payload["clusters"])
+	}
+
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "tui", "--json", "--layout", "bogus"}); err == nil || !strings.Contains(err.Error(), `unsupported layout "bogus"`) {
+		t.Fatalf("bogus layout err = %v", err)
 	}
 }
 

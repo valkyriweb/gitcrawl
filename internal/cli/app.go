@@ -1644,10 +1644,11 @@ func (a *App) runTUI(ctx context.Context, args []string) error {
 	minSizeRaw := fs.String("min-size", "", "minimum active member count")
 	limitRaw := fs.String("limit", "", "maximum cluster rows")
 	sortMode := fs.String("sort", "", "sort mode: recent|oldest|size")
+	layoutMode := fs.String("layout", "", "layout mode: focus|columns|right-stack")
 	includeClosed := fs.Bool("include-closed", false, "deprecated; closed clusters are shown by default")
 	hideClosed := fs.Bool("hide-closed", false, "hide locally closed clusters")
 	jsonOut := fs.Bool("json", false, "write JSON output")
-	if err := fs.Parse(normalizeCommandArgs(args, map[string]bool{"min-size": true, "limit": true, "sort": true})); err != nil {
+	if err := fs.Parse(normalizeCommandArgs(args, map[string]bool{"min-size": true, "limit": true, "sort": true, "layout": true})); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return a.printCommandUsage("tui")
 		}
@@ -1688,7 +1689,11 @@ func (a *App) runTUI(ctx context.Context, args []string) error {
 			if sortErr != nil {
 				return sortErr
 			}
-			return a.writeOutput("tui", emptyClusterBrowserPayload(ctx, cfg, cfg.DBPath, sort, minSize, limit, *hideClosed), true)
+			layout, layoutErr := resolveTUILayout(*layoutMode, cfg)
+			if layoutErr != nil {
+				return layoutErr
+			}
+			return a.writeOutput("tui", emptyClusterBrowserPayload(ctx, cfg, cfg.DBPath, sort, layout, minSize, limit, *hideClosed), true)
 		}
 		return err
 	}
@@ -1701,11 +1706,19 @@ func (a *App) runTUI(ctx context.Context, args []string) error {
 			if sortErr != nil {
 				return sortErr
 			}
-			return a.writeOutput("tui", emptyClusterBrowserPayload(ctx, rt.Config, rt.SourceDBPath, sort, minSize, limit, *hideClosed), true)
+			layout, layoutErr := resolveTUILayout(*layoutMode, rt.Config)
+			if layoutErr != nil {
+				return layoutErr
+			}
+			return a.writeOutput("tui", emptyClusterBrowserPayload(ctx, rt.Config, rt.SourceDBPath, sort, layout, minSize, limit, *hideClosed), true)
 		}
 		return err
 	}
 	sort, err := resolveTUISort(*sortMode, rt.Config)
+	if err != nil {
+		return err
+	}
+	layout, err := resolveTUILayout(*layoutMode, rt.Config)
 	if err != nil {
 		return err
 	}
@@ -1747,6 +1760,7 @@ func (a *App) runTUI(ctx context.Context, args []string) error {
 		DBRuntimePath:      remoteRuntimePath(rt),
 		ConfigPath:         a.configPath,
 		Sort:               sort,
+		Layout:             layout,
 		MinSize:            minSize,
 		Limit:              limit,
 		HideClosed:         !showClosed,
@@ -1777,7 +1791,18 @@ func resolveTUISort(raw string, cfg config.Config) (string, error) {
 	return sort, nil
 }
 
-func emptyClusterBrowserPayload(ctx context.Context, cfg config.Config, sourceDBPath, sort string, minSize, limit int, hideClosed bool) clusterBrowserPayload {
+func resolveTUILayout(raw string, cfg config.Config) (string, error) {
+	layout := strings.TrimSpace(raw)
+	if layout == "" {
+		layout = strings.TrimSpace(cfg.TUI.DefaultLayout)
+	}
+	if !isSupportedTUILayout(layout) {
+		return "", usageErr(fmt.Errorf("unsupported layout %q", layout))
+	}
+	return string(normalizeTUILayout(layout)), nil
+}
+
+func emptyClusterBrowserPayload(ctx context.Context, cfg config.Config, sourceDBPath, sort, layout string, minSize, limit int, hideClosed bool) clusterBrowserPayload {
 	if strings.TrimSpace(sourceDBPath) == "" {
 		sourceDBPath = cfg.DBPath
 	}
@@ -1786,6 +1811,7 @@ func emptyClusterBrowserPayload(ctx context.Context, cfg config.Config, sourceDB
 		DBSource:       databaseSourceKind(sourceDBPath),
 		DBLocation:     databaseSourceLocation(ctx, sourceDBPath),
 		Sort:           sort,
+		Layout:         layout,
 		MinSize:        minSize,
 		Limit:          limit,
 		HideClosed:     hideClosed,
@@ -4061,10 +4087,10 @@ Usage:
 const tuiUsageText = `gitcrawl tui opens the local terminal cluster browser.
 
 Usage:
-  gitcrawl tui [owner/repo] [--limit N] [--min-size N] [--sort recent|oldest|size] [--hide-closed]
+  gitcrawl tui [owner/repo] [--limit N] [--min-size N] [--sort recent|oldest|size] [--layout focus|columns|right-stack] [--hide-closed]
 
 If owner/repo is omitted, gitcrawl uses the most recently updated repository in the local database.
-The TUI starts with ghcrawl-style cluster display defaults: --min-size 5, --sort size, and closed historical clusters visible. Pass --min-size 1 for singleton clusters or --hide-closed to focus open-only.
+The TUI starts with ghcrawl-style cluster display defaults: --min-size 5, --sort size, --layout columns, and closed historical clusters visible. Pass --min-size 1 for singleton clusters or --hide-closed to focus open-only.
 Mouse is supported: click rows, wheel panes, right-click for actions, and use the menu for copy/sort/filter/jump/member triage controls.
 Press a to open the same action menu from the keyboard.
 Press # to jump directly to an issue or PR number.
