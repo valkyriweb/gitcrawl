@@ -778,7 +778,12 @@ func TestTUIWideLayoutToggle(t *testing.T) {
 	columns := model.layout()
 	model.toggleWideLayout()
 	rightStack := model.layout()
+	model.toggleWideLayout()
+	focus := model.layout()
 
+	if focus.mode != string(wideLayoutFocus) || focus.detail.x <= focus.clusters.x || focus.members.y <= focus.detail.y {
+		t.Fatalf("focus layout should keep clusters/detail on top and members below: %+v", focus)
+	}
 	if columns.detail.y != columns.members.y {
 		t.Fatalf("columns layout should align detail and members: %+v", columns)
 	}

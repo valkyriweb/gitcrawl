@@ -67,6 +67,19 @@ func TestApplyRuntimeEnvUsesDBEnv(t *testing.T) {
 	}
 }
 
+func TestNormalizeUsesTUILayoutEnv(t *testing.T) {
+	t.Setenv("GITCRAWL_TUI_LAYOUT", "right-stack")
+
+	cfg := Default()
+	cfg.TUI.DefaultLayout = ""
+	if err := cfg.Normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if cfg.TUI.DefaultLayout != "right-stack" {
+		t.Fatalf("tui layout: got %q want right-stack", cfg.TUI.DefaultLayout)
+	}
+}
+
 func TestResolveTokens(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "ghp_test")
 	t.Setenv("OPENAI_API_KEY", "sk_test")
