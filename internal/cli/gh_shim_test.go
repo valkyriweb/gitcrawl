@@ -710,7 +710,7 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 		Additions: 10,
 		Deletions: 2,
 		Changes:   12,
-		RawJSON:   "{}",
+		RawJSON:   `{"sha":"file-sha","filename":"internal/cache.go","status":"modified","additions":10,"deletions":2,"changes":12}`,
 		FetchedAt: fetchedAt,
 	}}, []store.PullRequestCommit{{
 		ThreadID:    prID,
@@ -720,7 +720,7 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 		AuthorName:  "Alice",
 		CommittedAt: "2026-04-27T01:00:00Z",
 		HTMLURL:     "https://github.com/openclaw/openclaw/commit/commit123",
-		RawJSON:     "{}",
+		RawJSON:     `{"sha":"commit123","commit":{"message":"feat: cache","author":{"name":"Alice","date":"2026-04-27T01:00:00Z"}},"author":{"login":"alice"},"html_url":"https://github.com/openclaw/openclaw/commit/commit123"}`,
 		FetchedAt:   fetchedAt,
 	}}, []store.PullRequestCheck{{
 		ThreadID:     prID,
@@ -729,7 +729,7 @@ func seedGHShimRepo(t *testing.T, ctx context.Context) string {
 		Conclusion:   "success",
 		DetailsURL:   "https://github.com/openclaw/openclaw/actions/runs/99",
 		WorkflowName: "CI",
-		RawJSON:      "{}",
+		RawJSON:      `{"id":99,"name":"test","status":"completed","conclusion":"success","details_url":"https://github.com/openclaw/openclaw/actions/runs/99","check_suite":{"app":{"name":"CI"}}}`,
 		FetchedAt:    fetchedAt,
 	}}, []store.WorkflowRun{{
 		RepoID:       repoID,

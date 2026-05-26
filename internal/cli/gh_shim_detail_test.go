@@ -198,6 +198,223 @@ func TestGHShimViewAndListUseLocalCache(t *testing.T) {
 	if apiView["mergedAt"] != nil || apiView["closedAt"] != nil {
 		t.Fatalf("api nullable timestamps = %#v", apiView)
 	}
+
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "api", "repos/openclaw/openclaw/pulls/12/files", "--paginate", "--jq", ".[0] | {filename,status,additions}"}); err != nil {
+		t.Fatalf("gh api cached pull files: %v", err)
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &apiView); err != nil {
+		t.Fatalf("decode API files: %v\n%s", err, stdout.String())
+	}
+	if apiView["filename"] != "internal/cache.go" || apiView["status"] != "modified" || int(apiView["additions"].(float64)) != 10 {
+		t.Fatalf("api files = %#v", apiView)
+	}
+
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "api", "repos/openclaw/openclaw/pulls/12/commits", "--paginate", "--jq", ".[0] | {sha,message:.commit.message,author:.author.login}"}); err != nil {
+		t.Fatalf("gh api cached pull commits: %v", err)
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &apiView); err != nil {
+		t.Fatalf("decode API commits: %v\n%s", err, stdout.String())
+	}
+	if apiView["sha"] != "commit123" || apiView["message"] != "feat: cache" || apiView["author"] != "alice" {
+		t.Fatalf("api commits = %#v", apiView)
+	}
+
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "api", "repos/openclaw/openclaw/commits/abc123/check-runs?per_page=100", "--paginate", "--jq", ".check_runs[] | {name,status,conclusion,workflow:.check_suite.app.name}"}); err != nil {
+		t.Fatalf("gh api cached check-runs: %v", err)
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &apiView); err != nil {
+		t.Fatalf("decode API check-runs: %v\n%s", err, stdout.String())
+	}
+	if apiView["name"] != "test" || apiView["status"] != "completed" || apiView["conclusion"] != "success" || apiView["workflow"] != "CI" {
+		t.Fatalf("api check-runs = %#v", apiView)
+	}
+}
+
+func TestGHAPILocalCollectionsRequireEquivalentPagination(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	expandGHShimPullFiles(t, ctx, configPath, 31)
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nprintf '{\"source\":\"real\"}\\n'\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("GITCRAWL_GH_PATH", ghPath)
+
+	for _, tc := range []struct {
+		route    string
+		paginate bool
+	}{
+		{route: "repos/openclaw/openclaw/pulls/12/files"},
+		{route: "repos/openclaw/openclaw/pulls/12/files", paginate: true},
+		{route: "repos/openclaw/openclaw/commits/abc123/check-runs?status=completed"},
+	} {
+		args := []string{"--config", configPath, "gh", "api", tc.route, "--jq", ".source"}
+		if tc.paginate {
+			args = append(args, "--paginate")
+		}
+		run := New()
+		var stdout bytes.Buffer
+		run.Stdout = &stdout
+		if err := run.Run(ctx, args); err != nil {
+			t.Fatalf("gh api collection fallback %s: %v", tc.route, err)
+		}
+		if got := strings.TrimSpace(stdout.String()); got != "real" {
+			t.Fatalf("api output for %s = %q, want real", tc.route, got)
+		}
+	}
+}
+
+func TestGHAPILocalCollectionsRequireRawJSON(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+	stripGHShimPullFileRawJSON(t, ctx, configPath)
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nprintf '{\"source\":\"real\"}\\n'\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("GITCRAWL_GH_PATH", ghPath)
+
+	run := New()
+	var stdout bytes.Buffer
+	run.Stdout = &stdout
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "api", "repos/openclaw/openclaw/pulls/12/files", "--paginate", "--jq", ".source"}); err != nil {
+		t.Fatalf("gh api raw-stripped collection fallback: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "real") {
+		t.Fatalf("stdout=%q, want real fallback", stdout.String())
+	}
+}
+
+func TestGHAPILocalCheckRunsHonorsLivenessAndEmptyCache(t *testing.T) {
+	ctx := context.Background()
+	configPath := seedGHShimRepo(t, ctx)
+
+	dir := t.TempDir()
+	ghPath := filepath.Join(dir, "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nprintf '{\"source\":\"real\"}\\n'\n"), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("GITCRAWL_GH_PATH", ghPath)
+
+	app := New()
+	app.configPath = configPath
+	if err := app.recordGHLivenessTombstone(ctx, []string{"workflow", "run", "ci.yml", "-R", "openclaw/openclaw"}); err != nil {
+		t.Fatalf("record workflow tombstone: %v", err)
+	}
+
+	run := New()
+	var stdout, stderr bytes.Buffer
+	run.Stdout = &stdout
+	run.Stderr = &stderr
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "api", "repos/openclaw/openclaw/commits/abc123/check-runs", "--paginate", "--jq", ".source"}); err != nil {
+		t.Fatalf("gh api check-runs liveness: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "real") || !strings.Contains(stderr.String(), "bypassing gh cache") {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+
+	clearGHShimPullChecks(t, ctx, configPath)
+	stdout.Reset()
+	stderr.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "gh", "--cached", "api", "repos/openclaw/openclaw/commits/abc123/check-runs", "--paginate", "--jq", ".total_count"}); err != nil {
+		t.Fatalf("gh api empty cached check-runs: %v\nstderr=%s", err, stderr.String())
+	}
+	if got := strings.TrimSpace(stdout.String()); got != "0" {
+		t.Fatalf("empty check-runs total = %q, want 0", got)
+	}
+}
+
+func expandGHShimPullFiles(t *testing.T, ctx context.Context, configPath string, count int) {
+	t.Helper()
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	st, err := store.Open(ctx, cfg.DBPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	repo, err := st.RepositoryByFullName(ctx, "openclaw/openclaw")
+	if err != nil {
+		t.Fatalf("repo: %v", err)
+	}
+	cache, err := st.PullRequestCache(ctx, repo.ID, 12)
+	if err != nil {
+		t.Fatalf("pull request cache: %v", err)
+	}
+	files := make([]store.PullRequestFile, 0, count)
+	for index := 0; index < count; index++ {
+		path := fmt.Sprintf("file-%02d.go", index)
+		files = append(files, store.PullRequestFile{
+			ThreadID:  cache.Detail.ThreadID,
+			Path:      path,
+			Status:    "modified",
+			RawJSON:   fmt.Sprintf(`{"filename":%q,"status":"modified"}`, path),
+			FetchedAt: cache.Detail.FetchedAt,
+		})
+	}
+	if err := st.UpsertPullRequestCache(ctx, cache.Detail, files, cache.Commits, cache.Checks, nil); err != nil {
+		t.Fatalf("expand pull files: %v", err)
+	}
+}
+
+func clearGHShimPullChecks(t *testing.T, ctx context.Context, configPath string) {
+	t.Helper()
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	st, err := store.Open(ctx, cfg.DBPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	repo, err := st.RepositoryByFullName(ctx, "openclaw/openclaw")
+	if err != nil {
+		t.Fatalf("repo: %v", err)
+	}
+	cache, err := st.PullRequestCache(ctx, repo.ID, 12)
+	if err != nil {
+		t.Fatalf("pull request cache: %v", err)
+	}
+	if err := st.UpsertPullRequestCache(ctx, cache.Detail, cache.Files, cache.Commits, nil, nil); err != nil {
+		t.Fatalf("clear pull checks: %v", err)
+	}
+}
+
+func stripGHShimPullFileRawJSON(t *testing.T, ctx context.Context, configPath string) {
+	t.Helper()
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	st, err := store.Open(ctx, cfg.DBPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	repo, err := st.RepositoryByFullName(ctx, "openclaw/openclaw")
+	if err != nil {
+		t.Fatalf("repo: %v", err)
+	}
+	cache, err := st.PullRequestCache(ctx, repo.ID, 12)
+	if err != nil {
+		t.Fatalf("pull request cache: %v", err)
+	}
+	for index := range cache.Files {
+		cache.Files[index].RawJSON = ""
+	}
+	if err := st.UpsertPullRequestCache(ctx, cache.Detail, cache.Files, cache.Commits, cache.Checks, nil); err != nil {
+		t.Fatalf("strip pull file raw json: %v", err)
+	}
 }
 
 func TestParseLocalGHAPIArgsDeclinesBehaviorChangingFlags(t *testing.T) {
@@ -225,6 +442,14 @@ func TestParseLocalGHAPIArgsAcceptedForms(t *testing.T) {
 	if !ok || route != "repos/openclaw/openclaw/pulls/12?foo=bar" || jqExpr != ".title" {
 		t.Fatalf("parseLocalGHAPIArgs equals flags = %q %q %v", route, jqExpr, ok)
 	}
+	route, jqExpr, ok = parseLocalGHAPIArgs([]string{"api", "repos/openclaw/openclaw/commits/abc123/check-runs", "--paginate", "--jq", ".check_runs[]"})
+	if !ok || route != "repos/openclaw/openclaw/commits/abc123/check-runs" || jqExpr != ".check_runs[]" {
+		t.Fatalf("parseLocalGHAPIArgs paginate = %q %q %v", route, jqExpr, ok)
+	}
+	request, ok := parseLocalGHAPIArgsDetailed([]string{"api", "repos/openclaw/openclaw/commits/abc123/check-runs", "--paginate"})
+	if !ok || !request.Paginate {
+		t.Fatalf("parseLocalGHAPIArgsDetailed paginate = %#v %v", request, ok)
+	}
 	if _, _, ok := parseLocalGHAPIArgs([]string{"api", "--method", "POST", "repos/openclaw/openclaw/pulls/12"}); ok {
 		t.Fatal("POST should not be locally handled")
 	}
@@ -234,6 +459,17 @@ func TestParsePullAPIRouteAndRESTPullID(t *testing.T) {
 	owner, repo, number, ok := parsePullAPIRoute("/repos/openclaw/gitcrawl/pulls/42?ignored=true")
 	if !ok || owner != "openclaw" || repo != "gitcrawl" || number != 42 {
 		t.Fatalf("parsePullAPIRoute = %q %q %d %v", owner, repo, number, ok)
+	}
+	parsed, ok := parseLocalGHAPIRoute("/repos/openclaw/gitcrawl/pulls/42/files")
+	if !ok || parsed.Kind != "pull_files" || parsed.Owner != "openclaw" || parsed.Repo != "gitcrawl" || parsed.Number != 42 {
+		t.Fatalf("parseLocalGHAPIRoute files = %#v %v", parsed, ok)
+	}
+	parsed, ok = parseLocalGHAPIRoute("/repos/openclaw/gitcrawl/commits/abc123/check-runs?per_page=100")
+	if !ok || parsed.Kind != "commit_check_runs" || parsed.SHA != "abc123" || parsed.RawQuery != "per_page=100" {
+		t.Fatalf("parseLocalGHAPIRoute checks = %#v %v", parsed, ok)
+	}
+	if !localGHCollectionQuerySupported("per_page=100") || localGHCollectionQuerySupported("status=completed") {
+		t.Fatal("collection query support mismatch")
 	}
 	for _, route := range []string{"repos/openclaw/gitcrawl/issues/42", "repos/openclaw/gitcrawl/pulls/nope", "repos/openclaw//pulls/42"} {
 		if _, _, _, ok := parsePullAPIRoute(route); ok {
@@ -258,6 +494,13 @@ func TestParsePullAPIRouteAndRESTPullID(t *testing.T) {
 		if ok != tc.ok || got != tc.want {
 			t.Fatalf("restPullID(%#v,%q) = %#v %v, want %#v %v", tc.raw, tc.fallback, got, ok, tc.want, tc.ok)
 		}
+	}
+	rows := localGHCheckRunsAPIRows([]store.PullRequestCheck{{Name: "pending", Status: "queued", RawJSON: `{"name":"pending","status":"queued","conclusion":null}`}})
+	if len(rows) != 1 {
+		t.Fatalf("check rows = %#v", rows)
+	}
+	if value, ok := rows[0]["conclusion"]; !ok || value != nil {
+		t.Fatalf("check conclusion = %#v, want explicit null", value)
 	}
 }
 

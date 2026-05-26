@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"github.com/openclaw/gitcrawl/internal/store/storedb"
@@ -299,6 +300,37 @@ func (s *Store) PullRequestChecks(ctx context.Context, threadID int64) ([]PullRe
 			RawJSON:      row.RawJson,
 			FetchedAt:    row.FetchedAt,
 		})
+	}
+	return out, nil
+}
+
+func (s *Store) PullRequestChecksAPIOrder(ctx context.Context, threadID int64) ([]PullRequestCheck, error) {
+	rows, err := s.q().QueryContext(ctx, `
+		select id, thread_id, name, status, conclusion, details_url, workflow_name, started_at, completed_at, raw_json, fetched_at
+		from pull_request_checks
+		where thread_id = ?
+		order by id`, threadID)
+	if err != nil {
+		return nil, fmt.Errorf("list pull request checks: %w", err)
+	}
+	defer rows.Close()
+	out := []PullRequestCheck{}
+	for rows.Next() {
+		var check PullRequestCheck
+		var status, conclusion, detailsURL, workflowName, startedAt, completedAt sql.NullString
+		if err := rows.Scan(&check.ID, &check.ThreadID, &check.Name, &status, &conclusion, &detailsURL, &workflowName, &startedAt, &completedAt, &check.RawJSON, &check.FetchedAt); err != nil {
+			return nil, err
+		}
+		check.Status = stringValue(status)
+		check.Conclusion = stringValue(conclusion)
+		check.DetailsURL = stringValue(detailsURL)
+		check.WorkflowName = stringValue(workflowName)
+		check.StartedAt = stringValue(startedAt)
+		check.CompletedAt = stringValue(completedAt)
+		out = append(out, check)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

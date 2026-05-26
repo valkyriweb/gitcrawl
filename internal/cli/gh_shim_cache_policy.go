@@ -329,8 +329,12 @@ func ghAPICacheTTL(args []string) time.Duration {
 		return 15 * time.Minute
 	case strings.Contains(route, "/actions/runs"):
 		return 30 * time.Second
+	case strings.Contains(route, "/commits/:sha/check-runs"):
+		return 2 * time.Minute
 	case strings.Contains(route, "/releases"):
 		return 1 * time.Hour
+	case strings.Contains(route, "/pulls/:id/files") || strings.Contains(route, "/pulls/:id/commits"):
+		return 2 * time.Hour
 	case strings.Contains(route, "/issues/:id/comments") || strings.Contains(route, "/pulls/:id/comments") || strings.Contains(route, "/pulls/:id/reviews"):
 		return time.Hour
 	case strings.Contains(route, "/issues/:id") || strings.Contains(route, "/pulls/:id"):
@@ -547,6 +551,8 @@ func normalizeGHAPIRoute(args []string) string {
 			break
 		}
 		switch {
+		case index > 0 && parts[index-1] == "commits" && isHexString(part) && len(part) >= 7:
+			parts[index] = ":sha"
 		case isDecimalString(part):
 			parts[index] = ":id"
 		case index >= 2 && parts[index-2] == "repos":

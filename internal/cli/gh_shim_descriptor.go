@@ -296,6 +296,10 @@ func ghAPITags(args []string) []string {
 		if len(parts) >= 6 && parts[4] == "runs" && isDecimalString(parts[5]) {
 			tags = append(tags, "run:"+parts[5])
 		}
+	case "commits":
+		if len(parts) >= 6 && parts[5] == "check-runs" {
+			tags = append(tags, "actions")
+		}
 	case "issues":
 		tags = append(tags, "issues")
 		if len(parts) >= 5 && isDecimalString(parts[4]) {

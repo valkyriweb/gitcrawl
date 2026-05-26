@@ -800,6 +800,18 @@ func TestGHShimCommandAwareCacheTTLs(t *testing.T) {
 	if got := normalizeGHAPIRoute([]string{"repos/openclaw/openclaw/actions/runs?per_page=1"}); got != "api repos/:owner/:repo/actions/runs" {
 		t.Fatalf("normalized actions route = %q", got)
 	}
+	if got := normalizeGHAPIRoute([]string{"repos/openclaw/openclaw/commits/abc123def456/check-runs"}); got != "api repos/:owner/:repo/commits/:sha/check-runs" {
+		t.Fatalf("normalized check-runs route = %q", got)
+	}
+	if got := normalizeGHAPIRoute([]string{"repos/openclaw/openclaw/commits/1234567/check-runs"}); got != "api repos/:owner/:repo/commits/:sha/check-runs" {
+		t.Fatalf("normalized numeric check-runs route = %q", got)
+	}
+	if got := ghCommandCacheTTL([]string{"api", "repos/openclaw/openclaw/pulls/12/files"}); got != 2*time.Hour {
+		t.Fatalf("pull files api ttl = %s, want 2h", got)
+	}
+	if got := ghCommandCacheTTL([]string{"api", "repos/openclaw/openclaw/commits/abc123def456/check-runs"}); got != 2*time.Minute {
+		t.Fatalf("check-runs api ttl = %s, want 2m", got)
+	}
 	if got := normalizeGHAPIRoute([]string{"--paginate", "repos/openclaw/openclaw/issues?state=all&creator=octocat", "--jq", ".[].number"}); got != "api repos/:owner/:repo/issues" {
 		t.Fatalf("normalized paginated issues route = %q", got)
 	}

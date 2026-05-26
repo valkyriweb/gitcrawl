@@ -2,6 +2,7 @@
 
 ## 0.4.6 - Unreleased
 
+- Serve cached local `gh api` reads for PR files, PR commits, and commit check-runs, including common `--paginate --jq` Codex command shapes.
 - Add an optional TUI focus layout, configurable with `gitcrawl tui --layout focus`, `tui.default_layout`, or `GITCRAWL_TUI_LAYOUT`, thanks @RomneyDa.
 - Add `gitcrawl clusters-report` for Markdown or JSON cluster triage reports, thanks @RomneyDa.
 - Add extra regression coverage for TUI detail-pane keyboard and wheel scrolling, thanks @RomneyDa.
