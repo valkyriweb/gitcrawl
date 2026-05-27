@@ -91,16 +91,15 @@ If the most recent successful sync for this repo is older than `5m`, gitcrawl ru
 
 This is the right pattern for agents: keep latency predictable on cache hits, and bound the staleness window for everything else.
 
-## Search vs. the `gh` shim
+## Search and Octopool
 
-There are two ways to run cached searches:
+`gitcrawl search issues|prs ...` is the local mirror search path. It accepts the common `gh search` argument shape for easy migration:
 
-| Command | Best for |
-| --- | --- |
-| `gitcrawl search issues|prs ...` | Human use; mixes naturally with the rest of the gitcrawl CLI |
-| `gitcrawl gh search issues|prs ...` | Agents and scripts that call `gh` directly — symlinked as `gh` or `gitcrawl-gh` it is invisible to callers |
+```bash
+gitcrawl search issues "download stalls" -R owner/repo --json number,title,url
+```
 
-Both paths share the same local cache and produce gh-shaped JSON. The shim adds the additional `gh issue/pr view`, `gh issue/pr list`, `gh pr checks`, `gh run`, and `xcache` surface — see [gh shim](/gh-shim/).
+The old `gitcrawl gh` compatibility cache moved to Octopool. Use `octopool gh ...` for pooled GitHub reads.
 
 ## Combining with sync
 

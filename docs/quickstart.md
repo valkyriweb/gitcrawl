@@ -117,14 +117,12 @@ Add `--sync-if-stale 5m` to refresh the local mirror first when it is older than
 ## 7. Wire up the `gh` shim (optional)
 
 ```bash
-mkdir -p "$HOME/bin"
-ln -sf "$(command -v gitcrawl)" "$HOME/bin/gitcrawl-gh"
-gitcrawl-gh search issues "download stalls" -R openclaw/gitcrawl --json number,title,url
-gitcrawl-gh pr view 123 -R openclaw/gitcrawl --json number,title,state,url
-gitcrawl-gh xcache stats
+gitcrawl search issues "download stalls" -R openclaw/gitcrawl --json number,title,url
+octopool login
+octopool gh api repos/openclaw/gitcrawl/pulls/123
 ```
 
-Most read-only `gh` calls answer locally, mutating commands pass straight through to the real `gh`. See [gh shim](/gh-shim/) for the full surface.
+The old `gitcrawl gh` shim moved to Octopool. See [gh shim](/gh-shim/) for the migration note.
 
 ## Where to next
 

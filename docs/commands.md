@@ -66,10 +66,7 @@ Commands that accept a thread number also accept thread references:
 - full GitHub issue or pull request URLs
 
 This applies to `sync --numbers`, `threads --numbers`, `embed --number`,
-`neighbors --number`, all governance `--number` flags, gh-shim
-`issue/pr view`, `pr checks`, `pr diff`, and TUI jump input. In gh-shim
-`view`/`checks`/`diff`, a full GitHub URL also supplies `owner/repo`, so
-`-R owner/repo` is optional.
+`neighbors --number`, all governance `--number` flags, and TUI jump input.
 
 ## Cluster
 
@@ -102,29 +99,16 @@ This applies to `sync --numbers`, `threads --numbers`, `embed --number`,
 
 ## gh shim
 
-| Command | Purpose | Docs |
-| --- | --- | --- |
-| `gitcrawl gh search issues\|prs <query> -R owner/repo [...]` | Local-first `gh search` | [gh shim](/gh-shim/) |
-| `gitcrawl gh issue view <n-or-url> [-R owner/repo] --json <fields>` | Local-first thread view | [gh shim](/gh-shim/) |
-| `gitcrawl gh pr view <n-or-url> [-R owner/repo] --json <fields>` | Same, for PRs (with auto-hydration) | [gh shim](/gh-shim/) |
-| `gitcrawl gh issue list -R owner/repo [--state --search --author --assignee --label --json]` | Local-first list | [gh shim](/gh-shim/) |
-| `gitcrawl gh pr list -R owner/repo [...]` | Same, for PRs | [gh shim](/gh-shim/) |
-| `gitcrawl gh pr checks <n-or-url> [-R owner/repo] --json <fields>` | Cached PR checks (auto-hydrates if stale) | [gh shim](/gh-shim/) |
-| `gitcrawl gh pr diff <n-or-url> [-R owner/repo]` | Falls through; cached by head SHA | [gh shim](/gh-shim/) |
-| `gitcrawl gh run list -R owner/repo [--commit --branch --json]` | Exact cached workflow runs; broad branches fall through live | [gh shim](/gh-shim/) |
-| `gitcrawl gh run view <run-id> -R owner/repo [--json]` | Same, single run | [gh shim](/gh-shim/) |
-| `gitcrawl gh --live ...` | Bypass SQLite/fallthrough cache for CI/release liveness | [gh shim](/gh-shim/) |
-| `gitcrawl gh repo view\|list ...` | Falls through; cached briefly | [gh shim](/gh-shim/) |
-| `gitcrawl gh release list\|view ...` | Falls through; cached briefly | [gh shim](/gh-shim/#read-only-fallthroughs-cached) |
-| `gitcrawl gh workflow list\|view ...` | Falls through; cached briefly | [gh shim](/gh-shim/#read-only-fallthroughs-cached) |
-| `gitcrawl gh secret list ...` / `variable get\|list ...` | Falls through; cached briefly | [gh shim](/gh-shim/#read-only-fallthroughs-cached) |
-| `gitcrawl gh label list ...` | Falls through; cached briefly | [gh shim](/gh-shim/) |
-| `gitcrawl gh api <GET path>` | Falls through; cached briefly; search paths auto-force GET when field flags are used | [gh shim](/gh-shim/) |
-| `gitcrawl gh api graphql -f query=...` | Falls through; read-only queries are cached | [gh shim](/gh-shim/#read-only-fallthroughs-cached) |
-| `gitcrawl gh xcache stats [--since <duration>] \| keys \| gc \| flush \| reset \| snapshot [--reset] [--json]` | Cache inspection / housekeeping | [gh shim](/gh-shim/#cache-inspection-xcache) |
-| _Anything else_ | Falls through to real `gh` | [gh shim](/gh-shim/) |
+`gitcrawl gh` moved to Octopool and now exits with a migration note.
 
-The shim binary can be installed standalone by symlinking the `gitcrawl` binary as `gh` or `gitcrawl-gh`.
+Use:
+
+```bash
+octopool login
+octopool gh api repos/openclaw/openclaw/pulls/123
+```
+
+`gitcrawl search issues|prs ...` remains the local mirror search path.
 
 ## Portable stores
 

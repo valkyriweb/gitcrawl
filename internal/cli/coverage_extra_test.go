@@ -194,6 +194,91 @@ func TestCLIAppVectorFallbackCoveragePaths(t *testing.T) {
 	}
 }
 
+func seedGHShimRepo(t *testing.T, ctx context.Context) string {
+	t.Helper()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	app := New()
+	if err := app.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	cfg.CacheDir = filepath.Join(dir, "cache")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, store.Repository{
+		Owner:     "openclaw",
+		Name:      "openclaw",
+		FullName:  "openclaw/openclaw",
+		RawJSON:   "{}",
+		UpdatedAt: "2026-04-27T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("seed repository: %v", err)
+	}
+	issueID, err := st.UpsertThread(ctx, store.Thread{
+		RepoID:          repoID,
+		GitHubID:        "10",
+		Number:          10,
+		Kind:            "issue",
+		State:           "open",
+		Title:           "Hot loop burns CPU",
+		Body:            "the runtime has a hot loop",
+		AuthorLogin:     "alice",
+		AuthorType:      "User",
+		HTMLURL:         "https://github.com/openclaw/openclaw/issues/10",
+		LabelsJSON:      "[]",
+		AssigneesJSON:   "[]",
+		RawJSON:         "{}",
+		ContentHash:     "issue-10",
+		UpdatedAtGitHub: "2026-04-27T01:00:00Z",
+		UpdatedAt:       "2026-04-27T01:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	if _, err := st.UpsertDocument(ctx, store.Document{ThreadID: issueID, Title: "Hot loop burns CPU", RawText: "runtime hot loop burns CPU", DedupeText: "runtime hot loop burns cpu", UpdatedAt: "2026-04-27T01:00:00Z"}); err != nil {
+		t.Fatalf("seed issue document: %v", err)
+	}
+	prID, err := st.UpsertThread(ctx, store.Thread{
+		RepoID:          repoID,
+		GitHubID:        "12",
+		Number:          12,
+		Kind:            "pull_request",
+		State:           "open",
+		Title:           "Manifest cache update",
+		AuthorLogin:     "bob",
+		AuthorType:      "User",
+		HTMLURL:         "https://github.com/openclaw/openclaw/pull/12",
+		LabelsJSON:      "[]",
+		AssigneesJSON:   "[]",
+		RawJSON:         `{"head":{"sha":"abc123"}}`,
+		ContentHash:     "pr-12",
+		IsDraft:         true,
+		UpdatedAtGitHub: "2026-04-27T02:00:00Z",
+		UpdatedAt:       "2026-04-27T02:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("seed pr: %v", err)
+	}
+	if _, err := st.UpsertDocument(ctx, store.Document{ThreadID: prID, Title: "Manifest cache update", RawText: "manifest cache refresh", DedupeText: "manifest cache refresh", UpdatedAt: "2026-04-27T02:00:00Z"}); err != nil {
+		t.Fatalf("seed pr document: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	return configPath
+}
+
 func TestDedupeThreadVectorsByThreadPrefersNewest(t *testing.T) {
 	vectors := dedupeThreadVectorsByThread([]store.ThreadVector{
 		{ThreadID: 1, Basis: "z_basis", Model: "model", UpdatedAt: "2026-05-15T00:00:00.12Z", Vector: []float64{1, 0}},

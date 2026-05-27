@@ -21,7 +21,7 @@ The mirror is metadata-first: titles, bodies, authors, labels, state, timestamps
 
 ## Thread
 
-A **thread** is a single GitHub issue or pull request, with its body and metadata. The CLI exposes threads via `gitcrawl threads` and via the `gh` shim's `gh issue/pr view` and `gh issue/pr list` paths.
+A **thread** is a single GitHub issue or pull request, with its body and metadata. The CLI exposes threads via `gitcrawl threads` and `gitcrawl search`; use Octopool for pooled live `gh` reads.
 
 Threads have two state dimensions:
 
@@ -94,7 +94,7 @@ A **portable store** is a Git-backed publish target for a `gitcrawl.db` plus its
 
 The `cache/` directory under `~/.config/gitcrawl/` holds:
 
-- `cache/gh-shim/` — the short-lived fallthrough cache for the `gh` shim, keyed by config path, CWD, `GH_HOST`, `GH_REPO`, and command args. Inspect or clean it with `gitcrawl gh xcache stats|keys|gc|flush`.
-- `cache/pr/` — hydrated PR detail blobs used to answer `gh pr view`, `gh pr checks`, and `gh run` reads from local SQLite.
+- local runtime caches used by sync/search/cluster workflows.
+- hydrated PR detail rows in SQLite for local review and TUI workflows.
 
-See [gh shim](/gh-shim/) for the cache key composition and TTL behavior.
+The old `gitcrawl gh` command cache moved to Octopool.

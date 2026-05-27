@@ -19,8 +19,7 @@ Lookup tables for paths, environment variables, and defaults.
 | --- | --- |
 | `~/.config/gitcrawl/config.toml` | Configuration file |
 | `~/.config/gitcrawl/gitcrawl.db` | SQLite database |
-| `~/.config/gitcrawl/cache/` | Caches (PR detail, gh-shim fallthrough) |
-| `~/.config/gitcrawl/cache/gh-shim/` | gh-shim fallthrough cache |
+| `~/.config/gitcrawl/cache/` | Local runtime caches |
 | `~/.config/gitcrawl/vectors/` | Vector store backing embeddings |
 | `~/.config/gitcrawl/logs/` | Operational logs |
 | `~/.config/gitcrawl/portable/` | Portable-store checkout (when configured) |
@@ -36,7 +35,7 @@ Override the config root with `--config <path>` or `GITCRAWL_CONFIG`.
 | `GITCRAWL_CONFIG` | `~/.config/gitcrawl/config.toml` | All commands | Override config path |
 | `GITCRAWL_DB_PATH` | `~/.config/gitcrawl/gitcrawl.db` | All commands | Override database path |
 | `GITCRAWL_TUI_LAYOUT` | `columns` | `tui` | Override default wide-screen layout |
-| `GITHUB_TOKEN` | _(none)_ | `sync`, `gh` shim | GitHub API token |
+| `GITHUB_TOKEN` | _(none)_ | `sync` | GitHub API token |
 | `OPENAI_API_KEY` | _(none)_ | `embed`, `refresh` | OpenAI API key |
 
 ### Models
@@ -53,19 +52,11 @@ Override the config root with `--config <path>` or `GITCRAWL_CONFIG`.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `GITCRAWL_GITHUB_BASE_URL` / `GITHUB_BASE_URL` | GitHub default | Custom GitHub API endpoint |
-| `GH_HOST` | _(none)_ | Included in gh-shim cache key |
-| `GH_REPO` | _(none)_ | Default `-R` value; included in gh-shim cache key |
+| `GH_REPO` | _(none)_ | Default repository for compatible local search shapes |
 
 ### gh shim
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `GITCRAWL_GH_PATH` | _(probed)_ | Path to the real `gh` binary |
-| `GITCRAWL_GH_LIVE` | _(off)_ | Set `1` to make `gh` shim reads bypass local/fallthrough caches by default |
-| `GITCRAWL_GH_LIVENESS_TTL` | `5m` | How long Actions/release reads bypass cache after matching mutations |
-| `GITCRAWL_GH_AUTO_HYDRATE` | _(on)_ | Set `0` to disable PR auto-hydration on cache miss |
-| `GITCRAWL_GH_CACHE_TTL` | `30s` for most commands | Override fallthrough cache TTL (e.g., `5m`, `1h`) |
-| `GITCRAWL_GH_CACHE_ERRORS` | _(on)_ | Set `0` to avoid caching non-zero read-only fallthroughs |
+`gitcrawl gh` moved to Octopool. Run `octopool login`, then use `octopool gh ...`.
 
 ## Configuration defaults
 
@@ -104,46 +95,6 @@ Override the config root with `--config <path>` or `GITCRAWL_CONFIG`.
 | Working set limit | `500` rows |
 | Refresh interval | `15s` |
 
-## gh shim cache TTLs
-
-| Cache class | TTL |
-| --- | --- |
-| Most read-only fallthroughs | `5m`-`10m` |
-| `gh run list` / run status | `30s` |
-| `gh run view --log` / `--log-failed` | `12h` |
-| `gh run view --job` | `1m` |
-| `gh search ...` | `15m` |
-| `gh release ...` | `1h` |
-| `gh api` Actions run status | `30s` |
-| `gh api` Actions job lists | `1m` active, `12h` completed |
-| `gh api` workflow reads | `15m` |
-| `gh api` Actions run/job logs | `12h` |
-| `gh api` Pages metadata | `15m`-`30m` |
-| `gh api` tagged/SHA contents | `7d` |
-| `gh pr diff` without stable head SHA | `5m` |
-| `gh pr diff` with stable head SHA | `7d` |
-| Override | `GITCRAWL_GH_CACHE_TTL` |
-| Stale-while-revalidate grace | command-aware; override with `GITCRAWL_GH_STALE_GRACE` |
-| Low-budget stale grace | command-aware; override with `GITCRAWL_GH_LOW_BUDGET_STALE_GRACE` |
-| Low-budget threshold | `250` remaining shared core requests; override with `GITCRAWL_GH_RATE_LIMIT_LOW_REMAINING` |
-| Web fallback | `--web-fallback` / `GITCRAWL_GH_WEB=1` for supported public PR diff, commit/compare media, and contents-at-ref reads |
-| Auto web fallback | on by default when shared core remaining is below 50% |
-| Cache read failures | on by default; error TTL is capped (`2m` for rate-limit errors); disable with `GITCRAWL_GH_CACHE_ERRORS=0` |
-
-## gh shim cache key composition
-
-A SHA-256 hash of:
-
-- Version tag (`v2`)
-- Resolved gitcrawl config path
-- Current working directory
-- `GH_HOST` env var
-- `GH_REPO` env var
-- For `gh pr diff`: `pr-diff:owner/repo:number:head-sha` (when head SHA is known)
-- Full command argument vector (null-separated)
-
-This isolates sibling checkouts and portable stores while coalescing repeated calls from the same workspace.
-
 ## Output formats
 
 | Format | Where to use |
@@ -168,8 +119,7 @@ stderr always carries error messages. stdout is reserved for command output.
 ├── gitcrawl.db-shm              # SQLite shared-memory file
 ├── gitcrawl.db-wal              # SQLite write-ahead log
 ├── cache/
-│   ├── gh-shim/                 # gh fallthrough cache; inspect with xcache
-│   └── pr/                      # hydrated PR detail blobs
+│   └── pr/                      # local runtime cache
 ├── vectors/                     # vector store backing embeddings
 ├── logs/
 └── portable/                    # portable-store checkout (optional)

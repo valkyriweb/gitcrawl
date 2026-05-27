@@ -14,9 +14,9 @@ permalink: /installation/
 
 - **Go 1.26+** if building from source
 - **Git** for cloning the repository (and for portable stores)
-- **A GitHub token** for any command that talks to GitHub (`sync`, `refresh`, `gh` shim fallthroughs)
+- **A GitHub token** for any command that talks to GitHub (`sync`, `refresh`)
 - **An OpenAI API key** only for `embed`, `refresh` (embed stage), and any future summary commands
-- **`gh` CLI** if you want the shim to fall through to the real GitHub CLI for unsupported commands
+- **`gh` CLI** optional, used by gitcrawl only as a token source via `gh auth token`
 
 gitcrawl runs on macOS and Linux. Windows is not actively tested.
 
@@ -26,7 +26,7 @@ gitcrawl runs on macOS and Linux. Windows is not actively tested.
 brew install openclaw/tap/gitcrawl
 ```
 
-Homebrew installs the `gitcrawl` binary. If you also want the GitHub CLI shim behavior, add a `gh` or `gitcrawl-gh` symlink as shown below.
+Homebrew installs the `gitcrawl` binary. GitHub CLI shim behavior moved to Octopool.
 
 ## Install from a GitHub release
 
@@ -71,22 +71,16 @@ go build \
 
 Symlink or copy `bin/gitcrawl` somewhere on your `PATH` (`~/bin`, `/usr/local/bin`, `~/.local/bin`).
 
-## Install the `gh` shim
+## GitHub CLI shim migration
 
-The shim is the same binary. Symlink it as `gh` (replacing the real CLI) or as `gitcrawl-gh` (running side by side):
+`gitcrawl gh` moved to Octopool:
 
 ```bash
-# Side-by-side install — agents can opt in by calling `gitcrawl-gh`.
-mkdir -p "$HOME/bin"
-ln -sf "$(command -v gitcrawl)" "$HOME/bin/gitcrawl-gh"
-
-# Or replace the global `gh` so every agent picks up the cache automatically.
-REAL_GH="$(command -v gh)"              # capture this before shadowing gh
-ln -sf "$(command -v gitcrawl)" "$HOME/bin/gh"
-export GITCRAWL_GH_PATH="$REAL_GH"      # point shim at the real gh
+octopool login
+octopool gh api repos/openclaw/openclaw/pulls/123
 ```
 
-When invoked as `gh` or `gitcrawl-gh`, the binary auto-detects shim mode. See [the gh shim guide](/gh-shim/) for details.
+See [the gh shim guide](/gh-shim/) for migration details.
 
 ## Verify the install
 

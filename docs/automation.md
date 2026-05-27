@@ -38,7 +38,7 @@ Three patterns, in increasing order of automation:
 
 ### On-demand staleness check
 
-Use `--sync-if-stale` on `gitcrawl search` (or the gh-shim's search):
+Use `--sync-if-stale` on `gitcrawl search`:
 
 ```bash
 gitcrawl search issues "manifest cache" \
@@ -49,15 +49,9 @@ gitcrawl search issues "manifest cache" \
 
 Best for ad-hoc agent tools that should bound staleness but minimize sync calls.
 
-### Auto-hydration via the gh shim
-
-Symlink the gitcrawl binary as `gh` (or `gitcrawl-gh`) and let the shim pull a single PR's detail when an agent calls `gh pr view` or `gh pr checks` against an unhydrated PR. See [gh shim → auto-hydration](/gh-shim/#auto-hydration).
-
-This is the lowest-overhead pattern for fleets of agents — no scheduling required.
-
 ### Periodic background refresh
 
-Run `gitcrawl refresh owner/repo` on a cron, systemd timer, or `launchd` agent every few minutes per repo. Combine with the gh shim and your agents almost never have to wait on GitHub.
+Run `gitcrawl refresh owner/repo` on a cron, systemd timer, or `launchd` agent every few minutes per repo.
 
 ```cron
 # Every 5 minutes, refresh the active repos.
@@ -71,15 +65,15 @@ For multiple repos, loop in a small shell script — gitcrawl is happy to run se
 ### "Look up an issue without burning quota"
 
 ```bash
-gh issue view 123 -R owner/repo --json number,title,state,body,labels,author
+octopool gh api repos/owner/repo/issues/123
 ```
 
-With the shim symlinked as `gh`, this answers from local SQLite if the issue is cached. Auto-hydration covers PR-detail fields. The agent prompt does not change.
+Octopool owns pooled GitHub reads. Use `gitcrawl search` first when local discovery is enough.
 
 ### "Find candidates, hydrate them, summarize"
 
 ```bash
-NUMS=$(gh search issues "checksum mismatch" -R owner/repo \
+NUMS=$(gitcrawl search issues "checksum mismatch" -R owner/repo \
         --json number --limit 30 \
         | jq -r '[.[].number] | join(",")')
 
@@ -116,21 +110,14 @@ gitcrawl close-cluster owner/repo --id "$ID" --reason "consolidated under #123"
 gh issue comment 456 -R owner/repo --body "Duplicate of #123"
 ```
 
-### "Prove the shim is paying off"
+### Shared GitHub cache
 
 ```bash
-# Periodically log cache stats — watch local_hits climb relative to backend_misses.
-gitcrawl gh xcache stats --json \
-  | jq '{local: .counters.local_hits, fallback: .counters.fallback_hits, github: .counters.backend_misses}'
-
-# During release/debug sessions, compare a recent window or snapshot before reset.
-gitcrawl gh xcache stats --since 1h --json
-gitcrawl gh xcache snapshot --reset --json
-
-# For release liveness, bypass local/fallthrough caches.
-gitcrawl gh --live run list -R owner/repo --commit "$sha" --json databaseId,status,conclusion,url
-gitcrawl gh --live release view "$tag" -R owner/repo
+octopool login
+octopool gh api repos/openclaw/openclaw/pulls/123
 ```
+
+Gitcrawl no longer maintains a runtime `gh` command cache. Use Octopool for org-authenticated pooled GitHub reads, and keep using gitcrawl for local mirror/search/cluster automation.
 
 ## Multi-repo automation
 
@@ -178,6 +165,4 @@ The artifact gives reviewers a structured view of what changed and how the clust
 
 - **Set both tokens in a single place.** Either env or `[env]` in `config.toml`. Mixing sources tends to confuse `doctor` reports.
 - **Bound the staleness window.** `--sync-if-stale` on every agent-driven search is cheaper than a hot cron loop.
-- **Monitor `xcache stats`.** If `backend_misses` dwarfs `local_hits`, you are not yet getting the shim's benefit — usually means agents are calling `gh` directly without going through the symlink.
 - **Re-cluster after a backfill.** A large `--state all` sync should be followed by `gitcrawl refresh --no-sync` (or just `gitcrawl embed && gitcrawl cluster`) so the durable graph reflects the new content.
-- **Pin the `gh` binary.** Set `GITCRAWL_GH_PATH` explicitly so the shim does not accidentally invoke itself.

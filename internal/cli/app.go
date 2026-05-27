@@ -3942,7 +3942,7 @@ Core commands:
   cluster-explain      alias for cluster-detail
   neighbors            list vector-nearest local issue and pull request rows
   search               search local thread documents; also supports search issues|prs gh syntax
-  gh                   gh-compatible local cache shim with fallback to real gh
+  gh                   moved to Octopool; prints migration note
   portable prune       prune volatile payloads from a portable store
   tui [owner/repo]     browse clusters in the terminal UI; repo is inferred when omitted
 
@@ -4076,11 +4076,11 @@ Usage:
 Usage:
   gitcrawl set-cluster-canonical owner/repo --id N --number ref [--reason text] [--json]
 `,
-	"gh": `gitcrawl gh runs a gh-compatible local cache shim with fallback to real gh.
+	"gh": `gitcrawl gh moved to octopool.
 
 Usage:
-  gitcrawl gh <gh command>
-  gitcrawl gh xcache stats|keys|gc|flush|reset|snapshot [--json]
+  octopool login
+  octopool gh <gh command>
 `,
 }
 

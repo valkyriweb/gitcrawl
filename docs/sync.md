@@ -63,8 +63,6 @@ gitcrawl sync owner/repo --numbers https://github.com/owner/repo/issues/123 --wi
 `123`, `#123`, `issues/123`, `pull/123`, `owner/repo#123`, and full GitHub
 issue or pull request URLs.
 
-This is also what the `gh` shim uses internally for [auto-hydration](/gh-shim/#auto-hydration).
-
 ## Hydration depth
 
 | Flag | What it adds |
@@ -73,7 +71,7 @@ This is also what the `gh` shim uses internally for [auto-hydration](/gh-shim/#a
 | `--include-pr-details` | PR files, commits, status checks, workflow runs |
 | `--with pr-details` | Same as `--include-pr-details` (gh-style flag) |
 
-PR details land in `pr_files`, `pr_commits`, `pr_checks`, and `pr_runs` tables and back the `gh pr view`, `gh pr checks`, and `gh run list/view` shim paths. See [gh shim](/gh-shim/).
+PR details land in `pr_files`, `pr_commits`, `pr_checks`, and `pr_runs` tables for local review, search, clustering, and TUI workflows.
 
 `--include-code` is accepted for compatibility but is currently a no-op.
 
@@ -144,7 +142,7 @@ gitcrawl sync owner/repo --numbers 123 --include-comments --with pr-details
 ### Refresh a batch you got from search
 
 ```bash
-NUMS=$(gitcrawl gh search issues "manifest cache" -R owner/repo --json number --limit 20 \
+NUMS=$(gitcrawl search issues "manifest cache" -R owner/repo --json number --limit 20 \
         | jq -r '[.[].number] | join(",")')
 gitcrawl sync owner/repo --numbers "$NUMS" --with pr-details
 ```
@@ -156,5 +154,5 @@ gitcrawl sync owner/repo --numbers "$NUMS" --with pr-details
 ## See also
 
 - [Refresh and embed](/refresh-and-embed/) — the wrapper that runs sync, embed, and cluster end to end
-- [gh shim](/gh-shim/) — how synced PR details power `gh pr view` / `gh pr checks` / `gh run` from local cache
+- [gh shim migration](/gh-shim/) — Octopool owns pooled `gh` reads now
 - [Portable stores](/portable-stores/) — sharing the synced cache across machines

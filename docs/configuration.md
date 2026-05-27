@@ -29,8 +29,7 @@ For each setting, gitcrawl looks in this order and uses the first match:
 | --- | --- |
 | `~/.config/gitcrawl/config.toml` | Configuration file |
 | `~/.config/gitcrawl/gitcrawl.db` | SQLite database |
-| `~/.config/gitcrawl/cache/` | Caches (PR detail, gh shim fallthrough) |
-| `~/.config/gitcrawl/cache/gh-shim/` | gh shim fallthrough cache |
+| `~/.config/gitcrawl/cache/` | Local caches |
 | `~/.config/gitcrawl/vectors/` | Vector store backing embeddings |
 | `~/.config/gitcrawl/logs/` | Operational logs |
 
@@ -78,7 +77,7 @@ checkout_dir = "/Users/me/.config/gitcrawl/portable"
 | `GITCRAWL_CONFIG` | Override config path |
 | `GITCRAWL_DB_PATH` | Override database path |
 | `GITCRAWL_TUI_LAYOUT` | Override default TUI layout (`columns`, `right-stack`, or `focus`) |
-| `GITHUB_TOKEN` | GitHub API token (required for `sync`, `gh` shim fallthroughs) |
+| `GITHUB_TOKEN` | GitHub API token (required for `sync`) |
 | `OPENAI_API_KEY` | OpenAI API key (required for `embed`) |
 
 ### Model overrides
@@ -94,25 +93,12 @@ checkout_dir = "/Users/me/.config/gitcrawl/portable"
 
 | Variable | Purpose |
 | --- | --- |
-| `GITCRAWL_GITHUB_BASE_URL` / `GITHUB_BASE_URL` | Custom GitHub API endpoint (used by `sync` and the `gh` shim) |
-| `GH_HOST` | GitHub host; included in the `gh` shim cache key |
-| `GH_REPO` | Default repo when `-R` is omitted; included in the `gh` shim cache key |
+| `GITCRAWL_GITHUB_BASE_URL` / `GITHUB_BASE_URL` | Custom GitHub API endpoint used by `sync` |
+| `GH_REPO` | Default repository for compatible local search shapes |
 
 ### gh shim
 
-| Variable | Purpose |
-| --- | --- |
-| `GITCRAWL_GH_PATH` | Path to the real `gh` binary used for fallthrough |
-| `GITCRAWL_GH_AUTO_HYDRATE` | Set to `0` to disable PR auto-hydration on cache miss |
-| `GITCRAWL_GH_CACHE_TTL` | Override fallthrough cache TTL (e.g., `5m`, `1h`) |
-| `GITCRAWL_GH_STALE_GRACE` | Override stale-while-revalidate grace for expired successful fallthrough entries |
-| `GITCRAWL_GH_LOW_BUDGET_STALE_GRACE` | Override extra stale grace when the shared token budget is low |
-| `GITCRAWL_GH_RATE_LIMIT_LOW_REMAINING` | Remaining core requests threshold for low-budget stale reads (default `250`) |
-| `GITCRAWL_GH_RATE_LIMIT_MAX_AGE` | Max age for trusting the shared rate-limit ledger (default `30m`) |
-| `GITCRAWL_GH_WEB` | Use token-free web reads for supported public GitHub shapes before falling through to `gh` |
-| `GITCRAWL_GH_CACHE_ERRORS` | Set to `0` to avoid caching non-zero read-only fallthroughs |
-
-If `GITCRAWL_GH_PATH` is unset, the shim probes common Homebrew install paths and then your `PATH`. Set it explicitly when you symlink the gitcrawl binary as `gh` (otherwise the shim will recurse into itself).
+`gitcrawl gh` moved to Octopool. Run `octopool login`, then use `octopool gh ...` or symlink Octopool as `gh`.
 
 ## Global flags
 

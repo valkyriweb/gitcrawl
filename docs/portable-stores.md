@@ -57,7 +57,6 @@ Write commands (`embed`, `refresh`, `cluster`, neighbor generation) need to pers
 This separation means:
 
 - You can `gitcrawl embed` against a portable store without dirtying the Git checkout
-- gh-shim exact-thread auto-hydration writes into the same runtime mirror
 - Local cluster overrides (`close-cluster`, exclusions, canonicals) live in the runtime mirror
 - Only the publishing workflow writes back into the portable checkout
 
@@ -112,17 +111,17 @@ Other agents and machines pull the new commit on their next read-only command.
 
 ## Cached search against a portable store
 
-`gitcrawl search` (and the gh-shim's search) work against portable-store data with one wrinkle: when the portable store has been pruned, generated document indexes may not be present. Search falls back to compact thread title/body data automatically — you keep useful results without the publisher needing to ship the full document indexes.
+`gitcrawl search` works against portable-store data with one wrinkle: when the portable store has been pruned, generated document indexes may not be present. Search falls back to compact thread title/body data automatically — you keep useful results without the publisher needing to ship the full document indexes.
 
-The v2 backup also keeps comments and PR-detail tables, so common shim reads such as `gh issue view --json comments`, `gh pr view --json files,commits,statusCheckRollup`, `gh pr checks`, and `gh run list` can be answered from the shared checkout when those details were synced before publishing.
+The v2 backup also keeps comments and PR-detail tables for local review, clustering, search, and TUI workflows.
 
 ## Caveats
 
-- The portable store carries the SQLite database. It does not carry the runtime fallthrough cache.
+- The portable store carries the SQLite database. It does not carry the Octopool `gh` cache.
 - Vectors regenerated on each consumer's machine after `embed` are not shared; portable pruning removes vector tables from the published database.
 - Portable stores are read-mostly. Multiple writers pushing concurrently will race the way any Git workflow does — gate writes through a single publisher or a CI workflow.
 
 ## See also
 
 - [Sync](/sync/) — what gets written into the database that ends up in the portable store
-- [gh shim](/gh-shim/) — agents reading a shared portable store benefit doubly from the shim's local-first answers
+- [gh shim migration](/gh-shim/) — Octopool owns pooled `gh` reads now

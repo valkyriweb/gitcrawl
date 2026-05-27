@@ -104,32 +104,17 @@ gitcrawl search issues <query> -R owner/repo --state open --sync-if-stale 5m --j
 
 This compatibility path reads from local SQLite by default. It avoids GitHub REST search quota and is not a replacement for final live `gh` verification before comments, closes, labels, or merges. `--sync-if-stale <duration>` may run one metadata sync first when the repository mirror is older than the requested max age; the search result itself still comes from SQLite.
 
-`gh` is the agent-facing compatibility shim. It may be invoked as `gitcrawl gh ...` or by installing the binary as `gh`/`gitcrawl-gh`. Supported local reads:
+`gitcrawl gh` moved to Octopool. Invoking it now prints a migration note:
 
 ```text
-gitcrawl gh search issues|prs <query> -R owner/repo --state open --match comments --json number,title,url
-gitcrawl gh issue view 123 -R owner/repo --json number,title,state,url,body
-gitcrawl gh pr view 123 -R owner/repo --json number,title,state,url,isDraft,author
-gitcrawl gh pr status 123 -R owner/repo --compact
-gitcrawl gh issue list -R owner/repo --state open --search "hot loop" --json number,title,url
-gitcrawl gh pr list -R owner/repo --state open --search "manifest cache" --json number,title,url
+gitcrawl gh moved to octopool.
+Run: octopool login
+Then use: octopool gh ... or symlink octopool as gh.
 ```
 
-`gitcrawl gh pr status` is the first read for PR triage. It returns a compact readiness summary from local SQLite when possible, including cached check state, approval/changes-requested review state, unresolved review-thread counts, cache age, and blocking reasons. Exit code `0` means clean, `1` means action needed, `2` means error, and `3` means pending.
+Octopool owns the org-authenticated shared GitHub CLI cache and pooled read relay. Gitcrawl keeps the local mirror/search/cluster/TUI product. Use `gitcrawl search issues|prs ...` for local discovery and `octopool gh ...` or a symlinked Octopool binary for pooled `gh` reads.
 
-Unsupported commands fall through to the real GitHub CLI. Read-only fallthroughs use a command-aware persistent cache in `cache/gh-shim` for repeated agent calls (`run list/view`, `pr diff/list/view/checks/status`, `issue list/status/view`, `repo view/list`, `release list/view`, `workflow list/view`, `secret list`, `variable get/list`, `project` list/view reads, `ruleset` reads, `gist` reads, `org list`, `label list`, read-only `search` kinds, and GET-only `api`). Actions run/job logs are cached much longer than CI status reads, completed run reads receive longer TTLs, and `xcache stats` records hit rate plus backend misses by command and normalized route so remaining GitHub-heavy patterns are visible. Repeat read failures are cached by default so many agents do not rediscover the same missing release, workflow, or field, with short caps for error entries and rate-limit responses; if GitHub rate-limits a refresh and a stale successful entry exists, the stale entry is served with a warning. Set `GITCRAWL_GH_CACHE_ERRORS=0` to disable error caching. Mutating commands are never cached and invalidate matching cache-tag entries on success. Unknown mutation scope falls back to clearing the fallthrough cache. The shim does not add GitHub write-back behavior of its own; writes remain delegated to `gh`.
-
-Cache inspection commands:
-
-```text
-gitcrawl gh xcache stats
-gitcrawl gh xcache keys
-gitcrawl gh xcache reset
-gitcrawl gh xcache flush
-gitcrawl gh xcache snapshot [--reset]
-```
-
-The cache key includes the resolved gitcrawl config path, current working directory, `GH_HOST`, `GH_REPO`, stable PR-diff identity when available, and canonicalized `gh` arguments. This keeps sibling checkouts and portable stores isolated while still coalescing equivalent agent calls such as reordered flags or sorted `--json` fields. Concurrent cache misses use a lock file so one process populates the entry while peers wait for the result; if an expired successful entry is still inside its stale grace window, peers may serve stale while the lock holder refreshes it. `xcache stats --since <duration>` reports recent-window counters from hourly buckets, and miss maps include command, normalized route, and canonical key views.
+Gitcrawl portable stores carry repo snapshots only. They do not carry an Octopool or runtime `gh` cache.
 
 ## Config
 
