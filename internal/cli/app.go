@@ -758,6 +758,7 @@ func (a *App) runNeighbors(ctx context.Context, args []string) error {
 	numberRaw := fs.String("number", "", "issue or pull request number")
 	limitRaw := fs.String("limit", "", "maximum neighbor rows")
 	thresholdRaw := fs.String("threshold", "", "minimum cosine score")
+	includeClosed := fs.Bool("include-closed", false, "include closed issue and pull request vectors")
 	jsonOut := fs.Bool("json", false, "write JSON output")
 	if err := fs.Parse(normalizeCommandArgs(args, map[string]bool{"number": true, "limit": true, "threshold": true})); err != nil {
 		return usageErr(err)
@@ -798,23 +799,69 @@ func (a *App) runNeighbors(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	targetThread, targetVector, err := rt.Store.ThreadVectorByNumber(ctx, store.ThreadVectorQuery{
-		RepoID: repo.ID,
-		Model:  rt.Config.OpenAI.EmbedModel,
-		Basis:  rt.Config.EmbeddingBasis,
-	}, number)
+	targetThread, targetVector, err := configuredNeighborTargetVector(ctx, rt, repo.ID, number, *includeClosed)
 	if err != nil {
-		var fallbackErr error
-		targetThread, targetVector, fallbackErr = rt.Store.ThreadVectorByNumber(ctx, store.ThreadVectorQuery{RepoID: repo.ID}, number)
-		if fallbackErr != nil {
+		if isMissingThreadVectorErr(err, number) {
+			if store.SupportsEmbeddingBasis(rt.Config.EmbeddingBasis) {
+				_ = rt.Store.Close()
+				if embedded, embedErr := a.backfillNeighborEmbedding(ctx, owner, repoName, number, *includeClosed); embedErr != nil {
+					return embedErr
+				} else if embedded {
+					rt, err = a.openLocalRuntimeReadOnly(ctx)
+					if err != nil {
+						return err
+					}
+					defer rt.Store.Close()
+					repo, err = rt.repository(ctx, owner, repoName)
+					if err != nil {
+						return err
+					}
+					targetThread, targetVector, err = configuredNeighborTargetVector(ctx, rt, repo.ID, number, *includeClosed)
+				}
+				if err != nil {
+					return neighborEmbeddingRecoveryError(owner, repoName, number, *includeClosed, err)
+				}
+			} else {
+				targetThread, targetVector, err = fallbackNeighborTargetVector(ctx, rt, repo.ID, number, *includeClosed)
+				if err != nil {
+					return err
+				}
+			}
+		} else {
+			return err
+		}
+	}
+	stale, err := neighborEmbeddingNeedsRefresh(ctx, rt.Store, repo.ID, targetVector, number, *includeClosed)
+	if err != nil {
+		return err
+	}
+	if stale {
+		_ = rt.Store.Close()
+		if embedded, embedErr := a.backfillNeighborEmbedding(ctx, owner, repoName, number, *includeClosed); embedErr != nil {
+			return embedErr
+		} else if !embedded {
+			return neighborEmbeddingRecoveryError(owner, repoName, number, *includeClosed, fmt.Errorf("thread #%d has a stale embedding", number))
+		}
+		rt, err = a.openLocalRuntimeReadOnly(ctx)
+		if err != nil {
+			return err
+		}
+		defer rt.Store.Close()
+		repo, err = rt.repository(ctx, owner, repoName)
+		if err != nil {
+			return err
+		}
+		targetThread, targetVector, err = configuredNeighborTargetVector(ctx, rt, repo.ID, number, *includeClosed)
+		if err != nil {
 			return err
 		}
 	}
 	vectors, err := rt.Store.ListThreadVectorsFiltered(ctx, store.ThreadVectorQuery{
-		RepoID:     repo.ID,
-		Model:      targetVector.Model,
-		Basis:      targetVector.Basis,
-		Dimensions: targetVector.Dimensions,
+		RepoID:        repo.ID,
+		Model:         targetVector.Model,
+		Basis:         targetVector.Basis,
+		Dimensions:    targetVector.Dimensions,
+		IncludeClosed: *includeClosed,
 	})
 	if err != nil {
 		return err
@@ -861,6 +908,81 @@ func (a *App) runNeighbors(ctx context.Context, args []string) error {
 		"thread":     targetThread,
 		"neighbors":  neighbors,
 	}, true)
+}
+
+func configuredNeighborTargetVector(ctx context.Context, rt localRuntime, repoID int64, number int, includeClosed bool) (store.Thread, store.ThreadVector, error) {
+	query := store.ThreadVectorQuery{
+		RepoID:        repoID,
+		Model:         rt.Config.OpenAI.EmbedModel,
+		Basis:         rt.Config.EmbeddingBasis,
+		IncludeClosed: includeClosed,
+	}
+	targetThread, targetVector, err := rt.Store.ThreadVectorByNumber(ctx, query, number)
+	if err == nil {
+		return targetThread, targetVector, nil
+	}
+	return store.Thread{}, store.ThreadVector{}, err
+}
+
+func fallbackNeighborTargetVector(ctx context.Context, rt localRuntime, repoID int64, number int, includeClosed bool) (store.Thread, store.ThreadVector, error) {
+	fallbackQuery := store.ThreadVectorQuery{RepoID: repoID, IncludeClosed: includeClosed}
+	fallbackThread, fallbackVector, fallbackErr := rt.Store.ThreadVectorByNumber(ctx, fallbackQuery, number)
+	if fallbackErr != nil {
+		return store.Thread{}, store.ThreadVector{}, fallbackErr
+	}
+	return fallbackThread, fallbackVector, nil
+}
+
+func isMissingThreadVectorErr(err error, number int) bool {
+	return err != nil && strings.Contains(err.Error(), fmt.Sprintf("thread #%d was not found with an embedding", number))
+}
+
+func (a *App) backfillNeighborEmbedding(ctx context.Context, owner, repoName string, number int, includeClosed bool) (bool, error) {
+	cfg, err := config.LoadRuntime(a.configPath)
+	if err != nil {
+		return false, err
+	}
+	if token := config.ResolveOpenAIKey(cfg); token.Value == "" {
+		return false, nil
+	}
+	result, err := a.embedRepository(ctx, owner, repoName, embedOptions{
+		Number:        number,
+		Limit:         1,
+		IncludeClosed: includeClosed,
+	})
+	if err != nil {
+		return false, fmt.Errorf("backfill neighbor embedding for #%d: %w", number, err)
+	}
+	return result.Embedded > 0, nil
+}
+
+func neighborEmbeddingNeedsRefresh(ctx context.Context, st *store.Store, repoID int64, vector store.ThreadVector, number int, includeClosed bool) (bool, error) {
+	if strings.TrimSpace(vector.Basis) == "" || strings.TrimSpace(vector.Model) == "" {
+		return false, nil
+	}
+	if !store.SupportsEmbeddingBasis(vector.Basis) {
+		return false, nil
+	}
+	tasks, err := st.ListEmbeddingTasks(ctx, store.EmbeddingTaskOptions{
+		RepoID:        repoID,
+		Basis:         vector.Basis,
+		Model:         vector.Model,
+		Number:        number,
+		Limit:         1,
+		IncludeClosed: includeClosed,
+	})
+	if err != nil {
+		return false, err
+	}
+	return len(tasks) > 0, nil
+}
+
+func neighborEmbeddingRecoveryError(owner, repoName string, number int, includeClosed bool, cause error) error {
+	cmd := fmt.Sprintf("gitcrawl embed %s/%s --number %d --limit 1", owner, repoName, number)
+	if includeClosed {
+		cmd += " --include-closed"
+	}
+	return fmt.Errorf("%w; run `%s` and retry neighbors", cause, cmd)
 }
 
 func (a *App) runCluster(ctx context.Context, args []string) error {
@@ -4268,7 +4390,7 @@ Usage:
 	"neighbors": `gitcrawl neighbors lists vector-nearest local issue and pull request rows.
 
 Usage:
-  gitcrawl neighbors owner/repo --number ref [--limit N] [--json]
+  gitcrawl neighbors owner/repo --number ref [--limit N] [--include-closed] [--json]
 `,
 	"runs": `gitcrawl runs lists local pipeline run history.
 

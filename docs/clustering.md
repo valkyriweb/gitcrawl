@@ -123,8 +123,9 @@ gitcrawl neighbors owner/repo --number 123 --limit 10
 | `--number <n>` | _(required)_ | Source issue/PR |
 | `--limit <n>` | `10` | Maximum neighbors |
 | `--threshold <float>` | `0.2` | Minimum cosine score |
+| `--include-closed` | _(off)_ | Include closed issue and pull request vectors |
 
-Useful for "what else looks like this?" without committing to a cluster. The TUI's `n` shortcut and "Enter on a member" both call this path.
+Useful for "what else looks like this?" without committing to a cluster. If the source row is present but lacks a current embedding, the CLI command backfills that one row when an OpenAI key is configured; otherwise it prints the exact `gitcrawl embed --number ... --limit 1` command to run. The TUI's `n` shortcut and "Enter on a member" also load vector neighbors for the selected row.
 
 ## Tuning recipes
 

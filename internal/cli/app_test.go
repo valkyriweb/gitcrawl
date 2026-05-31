@@ -2737,6 +2737,132 @@ func TestCommandFlowCoversSearchEmbedNeighborsClusterDetailRunsAndRefresh(t *tes
 	}
 }
 
+func TestNeighborsBackfillsMissingAndStaleTargetEmbedding(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	if err := New().Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	repoID, firstID, secondID := seedCommandFlowStore(t, dbPath)
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	tasks, err := st.ListEmbeddingTasks(ctx, store.EmbeddingTaskOptions{
+		RepoID: repoID,
+		Basis:  "title_original",
+		Model:  "text-embedding-3-small",
+		Number: 102,
+		Limit:  1,
+	})
+	if err != nil {
+		t.Fatalf("list tasks: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks = %#v, want one task for seeded neighbor", tasks)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := st.UpsertThreadVector(ctx, store.ThreadVector{
+		ThreadID:    firstID,
+		Basis:       "old_basis",
+		Model:       "old-model",
+		Dimensions:  2,
+		ContentHash: "old-hash",
+		Vector:      []float64{0, 1},
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed old target vector: %v", err)
+	}
+	if err := st.UpsertThreadVector(ctx, store.ThreadVector{
+		ThreadID:    secondID,
+		Basis:       "title_original",
+		Model:       "text-embedding-3-small",
+		Dimensions:  2,
+		ContentHash: tasks[0].ContentHash,
+		Vector:      []float64{0.95, 0.05},
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed neighbor vector: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	var calls atomic.Int64
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/embeddings" {
+			t.Fatalf("unexpected OpenAI path: %s", r.URL.Path)
+		}
+		calls.Add(1)
+		var payload struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode embeddings request: %v", err)
+		}
+		if len(payload.Input) != 1 {
+			t.Fatalf("neighbors backfill should embed one row, got %d inputs", len(payload.Input))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"index": 0, "embedding": []float64{1, 0}}},
+		})
+	}))
+	defer openAIServer.Close()
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+	t.Setenv("GITCRAWL_OPENAI_BASE_URL", openAIServer.URL)
+
+	runNeighbors := func() string {
+		t.Helper()
+		var stdout bytes.Buffer
+		app := New()
+		app.Stdout = &stdout
+		if err := app.Run(ctx, []string{"--config", configPath, "neighbors", "openclaw/openclaw", "--number", "101", "--limit", "1", "--threshold", "0.1", "--json"}); err != nil {
+			t.Fatalf("neighbors: %v", err)
+		}
+		return stdout.String()
+	}
+	if out := runNeighbors(); !strings.Contains(out, `"number": 102`) {
+		t.Fatalf("neighbors output after missing backfill = %q", out)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("OpenAI calls after missing backfill = %d, want 1", got)
+	}
+	if out := runNeighbors(); !strings.Contains(out, `"number": 102`) {
+		t.Fatalf("neighbors output after cached vector = %q", out)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("already-current embedding was re-embedded, calls = %d", got)
+	}
+
+	st, err = store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	if _, err := st.UpsertDocument(ctx, store.Document{
+		ThreadID:   firstID,
+		Title:      "Gateway websocket stalls",
+		Body:       "Gateway websocket stalls after a fresh body update.",
+		RawText:    "Gateway websocket stalls after a fresh body update.",
+		DedupeText: "gateway websocket stalls after a fresh body update",
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatalf("update target document: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close stale update store: %v", err)
+	}
+	if out := runNeighbors(); !strings.Contains(out, `"number": 102`) {
+		t.Fatalf("neighbors output after stale backfill = %q", out)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("stale target should be re-embedded once, calls = %d", got)
+	}
+}
+
 func TestClustersReportUsesDisplaySummarySourceForCollidingIDs(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

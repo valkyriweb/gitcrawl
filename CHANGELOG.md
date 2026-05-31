@@ -14,6 +14,7 @@
 - Add `gitcrawl clusters-report` for Markdown or JSON cluster triage reports, thanks @RomneyDa.
 - Add extra regression coverage for TUI detail-pane keyboard and wheel scrolling, thanks @RomneyDa.
 - Bound portable-store Git subprocess cancellation so stale fetch helpers cannot hang read-only commands, and expose the last portable refresh failure in `gitcrawl doctor --json`.
+- Backfill a missing or stale source embedding for `gitcrawl neighbors` with a one-row capped embedding request, and show the exact cheap `gitcrawl embed --number ... --limit 1` recovery command when no OpenAI key is configured.
 
 ## 0.4.5 - 2026-05-23
 
