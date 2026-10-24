@@ -25,19 +25,65 @@ For each setting, gitcrawl looks in this order and uses the first match:
 
 ## Default paths
 
-| Path | Purpose |
-| --- | --- |
-| `~/.config/gitcrawl/config.toml` | Configuration file |
-| `~/.config/gitcrawl/gitcrawl.db` | SQLite database |
-| `~/.config/gitcrawl/cache/` | Local caches |
-| `~/.config/gitcrawl/vectors/` | Vector store backing embeddings |
-| `~/.config/gitcrawl/logs/` | Operational logs |
+Linux uses XDG Base Directory paths. macOS uses the platform's `~/Library`
+locations unless you set XDG environment variables.
 
-Override the config root by setting `GITCRAWL_CONFIG=/path/to/config.toml` or by passing `--config` to any command.
+| Platform | Path | Purpose |
+| --- | --- | --- |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/gitcrawl/config.toml` | Configuration file |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/gitcrawl/gitcrawl.db` | SQLite database |
+| Linux | `${XDG_CACHE_HOME:-~/.cache}/gitcrawl/` | Local caches |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/gitcrawl/vectors/` | Vector store backing embeddings |
+| Linux | `${XDG_STATE_HOME:-~/.local/state}/gitcrawl/logs/` | Operational logs |
+| macOS | `~/Library/Application Support/gitcrawl/config.toml` | Configuration file |
+| macOS | `~/Library/Application Support/gitcrawl/gitcrawl.db` | SQLite database |
+| macOS | `~/Library/Caches/gitcrawl/` | Local caches |
+| macOS | `~/Library/Application Support/gitcrawl/vectors/` | Vector store backing embeddings |
+| macOS | `~/Library/Application Support/gitcrawl/logs/` | Operational logs |
+
+Existing installs with `~/.config/gitcrawl/config.toml` continue to load that
+config when the new platform config path does not exist. Override the config
+path by setting `GITCRAWL_CONFIG=/path/to/config.toml` or by passing `--config`
+to any command.
+
+### Path selection edge cases
+
+- `--config` and `GITCRAWL_CONFIG` are exact config-path overrides. They do not
+  move an existing database, cache, vector, log, or portable-store checkout by
+  themselves; those paths come from the loaded config or defaults.
+- `gitcrawl init --runtime-dir <path>` creates a fully isolated local runtime
+  under that directory: `gitcrawl.db`, `cache/`, `vectors/`, and `logs/`.
+  This is useful for temporary archives and reproducible tests. Existing
+  `init --db` behavior remains database-only. Relative `--db`, `--runtime-dir`,
+  and `--store-dir` filesystem paths are anchored to the current working
+  directory before they are saved, so later commands keep using the same files.
+  All database-path sources, including `--db`, `db_path`, and
+  `GITCRAWL_DB_PATH`, accept durable filesystem paths, not SQLite `file:` URIs
+  or `:memory:`.
+- Absolute XDG environment variables are honored even on macOS. Relative XDG
+  values are ignored and gitcrawl falls back to the platform default for that
+  path.
+- Legacy fallback is per path, not all-or-nothing. If
+  `~/.config/gitcrawl/config.toml`, `gitcrawl.db`, `cache/`, `vectors/`, or
+  `logs/` exists and the corresponding new platform path does not, gitcrawl
+  reuses that legacy path. If the new platform path exists, the new path wins
+  for that component.
+- Creating `~/Library/Application Support/gitcrawl/config.toml` on macOS opts
+  the config file into the new platform location. It does not delete or migrate
+  the old `~/.config/gitcrawl/` tree.
+- Portable stores default to `<config-dir>/stores/<repo-name>` when
+  `--store-dir` is omitted. Existing configs with
+  `[portable_store].checkout_dir` keep using that explicit checkout.
+- Older docs showed `cache/pr`; current gitcrawl stores PR detail data in
+  SQLite tables instead of a `cache/pr` directory.
 
 ## `config.toml`
 
-`gitcrawl init` writes a minimal config. You can edit it by hand or with `gitcrawl configure`:
+`gitcrawl init` writes a minimal config and initializes the local SQLite database
+with the current schema. Sync a repository to populate it. Cloud initialization
+does not create a local database, and portable initialization validates the
+existing source database without migrating it. You can edit the config by hand
+or with `gitcrawl configure`:
 
 ```toml
 summary_model = "gpt-5.4"
@@ -53,22 +99,35 @@ OPENAI_API_KEY = "<openai-api-key>"
 [portable_store]
 url = "https://github.com/org/portable-store.git"
 db_path = "data/openclaw__openclaw.sync.db"
-checkout_dir = "/Users/me/.config/gitcrawl/portable"
+checkout_dir = "/Users/me/Library/Application Support/gitcrawl/stores/portable-store"
+
+[remote]
+mode = "cloud"
+endpoint = "https://crawl.example.com"
+archive = "gitcrawl/org__repo"
+token_env = "CRAWL_REMOTE_TOKEN"
 ```
 
 ### Notable fields
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `summary_model` | `gpt-5.4` | Reserved for future summary commands |
+| `summary_model` | `gpt-5.4` | OpenAI model used by `summarize` |
 | `embed_model` | `text-embedding-3-small` | OpenAI embedding model |
+| `embed_base_url` | _(empty)_ | Embedding-only OpenAI-compatible endpoint; falls back to the shared OpenAI endpoint |
 | `embed_dimensions` | `1024` | Must match the model |
-| `embedding_basis` | `title_original` | Only `title_original` is implemented |
+| `embedding_basis` | `title_original` | Supported: `title_original`, `dedupe_text`, `llm_key_summary` |
 | `vector_backend` | `exact` | Semantic search backend: `exact` or optional `turbovec` via Python `turbovec`; turbovec requires dimensions divisible by 8 |
 | `[tui].default_sort` | `size` | Default TUI cluster ordering |
 | `[tui].default_layout` | `columns` | Default wide-screen TUI layout: `columns`, `right-stack`, or `focus` |
 | `[env]` | _(empty)_ | Config-backed fallback after real process env for env-derived values such as tokens, DB path, and model overrides |
 | `[portable_store]` | _(empty)_ | Used when working from a shared, Git-backed cache |
+| `[remote]` | _(local mode)_ | Worker-backed archive settings for cloud reads and publishing |
+
+Bearer-authenticated remote endpoints must use HTTPS. Plain HTTP is accepted
+only for loopback endpoints (`localhost`, `127.0.0.1`, or `::1`) used during
+local development. Upgrade any non-local `http://` endpoint to `https://`
+before updating gitcrawl.
 
 ## Environment variables
 
@@ -77,10 +136,10 @@ checkout_dir = "/Users/me/.config/gitcrawl/portable"
 | Variable | Purpose |
 | --- | --- |
 | `GITCRAWL_CONFIG` | Override config path |
-| `GITCRAWL_DB_PATH` | Override database path |
+| `GITCRAWL_DB_PATH` | Override the database with a durable filesystem path; SQLite `file:` URIs and `:memory:` are unsupported |
 | `GITCRAWL_TUI_LAYOUT` | Override default TUI layout (`columns`, `right-stack`, or `focus`) |
 | `GITHUB_TOKEN` | GitHub API token (required for `sync`) |
-| `OPENAI_API_KEY` | OpenAI API key (required for `embed`) |
+| `OPENAI_API_KEY` | OpenAI API key (required for `summarize` and `embed`) |
 
 ### Model overrides
 
@@ -91,6 +150,23 @@ checkout_dir = "/Users/me/.config/gitcrawl/portable"
 | `GITCRAWL_VECTOR_BACKEND` | Override semantic vector backend (`exact` or `turbovec`) |
 | `GITCRAWL_OPENAI_RETRY_DISABLED` | Set to `1` to disable OpenAI retry/backoff |
 | `GITCRAWL_OPENAI_BASE_URL` / `OPENAI_BASE_URL` | Custom OpenAI endpoint (e.g., for a proxy) |
+| `GITCRAWL_EMBED_BASE_URL` | Override the endpoint used only for embedding requests |
+
+Embedding requests resolve their endpoint in this order: `GITCRAWL_EMBED_BASE_URL`,
+`embed_base_url`, `GITCRAWL_OPENAI_BASE_URL`, `OPENAI_BASE_URL`, then the OpenAI
+default. This permits a local or provider-specific embedding service without
+moving summary requests away from the shared endpoint:
+
+```toml
+[openai]
+embed_base_url = "http://127.0.0.1:8080/v1"
+```
+
+```bash
+gitcrawl configure --embed-base-url http://127.0.0.1:8080/v1
+```
+
+Pass an empty value to `--embed-base-url` to restore the shared endpoint.
 
 ### GitHub overrides
 
@@ -110,12 +186,44 @@ These flags work on every command:
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--config <path>` | `$GITCRAWL_CONFIG` or default | Override config path for this invocation |
+| `--github-token-command <path>` | _(off)_ | Use an absolute executable for managed GitHub credentials |
 | `--format text\|json\|log` | `text` | Output format |
 | `--json` | _(off)_ | Shorthand for `--format json` |
 | `--no-color` | _(off)_ | Suppress ANSI color codes |
 | `--version` | _(off)_ | Print version and exit (global only) |
 
 `--json` overrides `--format`. Both are honored on subcommands that produce output.
+
+### Managed GitHub credentials
+
+For long synchronizations with expiring credentials, select a trusted executable:
+
+```bash
+gitcrawl --github-token-command /usr/local/bin/github-token sync owner/repo --state all
+```
+
+The executable receives no arguments and inherits the process environment. It
+must print exactly one nonempty token line to stdout. Gitcrawl invokes it before
+each GitHub HTTP dispatch, including after rate-limit waits. The executable owns
+credential caching and renewal; Gitcrawl does not persist its output. Selection
+is exclusive: command failure never falls back to environment, config, or `gh`
+credentials. Remote-store login and session authentication are unchanged.
+
+This mode supports Unix only. Windows returns an unsupported-platform error
+before running a synchronization; static credentials remain supported. Helper
+execution is limited to 30 seconds or parent cancellation, with at most two
+seconds of pipe cleanup. Stdout is capped at 4096 bytes; stderr is discarded.
+Use a trusted executable that manages its own credential storage securely.
+
+The same selection covers `sync`, `refresh`, `fill-pr-details`, and
+`search --sync-if-stale`. Help, status, doctor, and `refresh --no-sync` do not
+execute it. Doctor reports the selected source without asserting credentials
+are available. Quota metadata is unavailable until this invocation observes
+the selected token's response. Provider-mode requests do not follow redirects.
+If credentials rotate during quota reservation, Gitcrawl makes at most one
+replacement quota probe, then stops if the token changes again.
+`capture` rejects this option: offline quota provenance across managed-credential
+invocations is not yet supported. Repeating a sync does not resolve that limitation.
 
 ## `gitcrawl configure`
 
@@ -124,6 +232,7 @@ Interactive-friendly config edits without opening the file:
 ```bash
 gitcrawl configure --summary-model gpt-5.4
 gitcrawl configure --embed-model text-embedding-3-small
+gitcrawl configure --embed-base-url http://127.0.0.1:8080/v1
 gitcrawl configure --embedding-basis title_original
 gitcrawl configure --json
 ```
@@ -137,6 +246,10 @@ A health check for everything covered above:
 ```bash
 gitcrawl doctor          # human-readable
 gitcrawl doctor --json   # for scripts
+gitcrawl doctor --locks --json
 ```
 
-Reports config path and existence, database path, source/runtime SQLite health, portable-store Git status, last repair action, whether `GITHUB_TOKEN` and `OPENAI_API_KEY` are present (and whether they came from env vs. config), the active summary/embed models, the embedding basis, and counts of repositories, threads, open threads, clusters, plus the last sync timestamp. If the API call surface is unsupported (older Go, missing crypto), `api_supported: false` is reported so you can investigate.
+Reports config path and existence, database path, source/runtime SQLite health, portable-store Git status, last repair action, whether `GITHUB_TOKEN` and `OPENAI_API_KEY` are present (and whether they came from env vs. config), the active summary/embed models, embedding base URL, embedding basis, and counts of repositories, threads, open threads, clusters, plus separate `last_sync_at` and `last_export_at` timestamps. Successful sync history determines the former; portable snapshot metadata determines the latter. If the API call surface is unsupported (older Go, missing crypto), `api_supported: false` is reported so you can investigate.
+JSON output also reports the active executable and available Go/build metadata under `runtime`, plus read-only schema compatibility under `db_schema` and `source_db_schema`. Portable stores additionally expose `runtime_db_schema` for the writable runtime mirror. A compatible portable source reports `source_db_schema.state=current` with `portable=true` and its `portable_format`, even when its compatibility version is older than the writable runtime schema. Runtime health checks SQLite integrity independently because expected local writes make its bytes differ from the immutable source manifest. Inspect `state`, `pending_migrations`, `pr_details`, and `next_steps` to distinguish a current store from a pending migration, a newer unsupported schema, or a damaged database. Schema inspection never applies migrations; run a write-path command with the intended binary only after reviewing the reported drift. When the runtime database cannot be opened or its status cannot be read, doctor still writes the JSON diagnostics and includes `runtime_open_error` or `runtime_status_error`, then exits nonzero.
+
+Add `--locks` for read-only SQLite lock diagnostics. The JSON payload includes the database, WAL, SHM, and rollback-journal paths and sizes, read-only open status, `pragma quick_check` status, and best-effort writer-process detection. `safe_read_only_inspection` reflects archive health even when another SQLite connection is open; `writer_activity` separately reports whether `lsof` found another process with writable access to the database. `appears_idle` becomes true only when the archive is healthy, process detection is available, and no writer candidate is found. On platforms without supported process inspection, `process_detection.available` is `false`, `writer_activity` is `unknown`, and `appears_idle` remains false instead of treating missing process data as proof that no writer exists.

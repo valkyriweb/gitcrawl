@@ -24,9 +24,21 @@ This fetches **open** issues and pull requests for the repository. To keep local
 A sync writes:
 
 - `repositories` — repo metadata
-- `threads` — issues and PRs (titles, bodies, authors, labels, state, timestamps)
+- `threads` — issues and PRs (titles, bodies, authors, author association, labels, state, timestamps)
+- `thread_revisions` — immutable revisions with content-addressed canonical evidence payloads when fully hydrated thread or review evidence changes
+- `thread_fingerprints` — one deterministic `thread-fingerprint-v2` row for each persisted revision
 - `documents` — canonical thread documents (when bodies change)
-- `run_records` — sync run statistics
+- `sync_runs` — sync run statistics and retry checkpoints
+
+Revision and fingerprint production fails closed on incomplete evidence. Issues require
+`--include-comments`; pull requests require both `--include-comments` and
+`--include-pr-details` (or `--with pr-details`). Without that hydration, sync still
+updates the thread and document rows but intentionally does not create a revision that
+could appear complete while omitting discussion, review, file, commit, or check evidence.
+Pull request revisions also track draft state, review decisions, workflow runs, and check
+transitions, so those changes invalidate downstream summaries and review evidence even
+when the title and body are unchanged. Summary prompts read the exact canonical payload
+bound to the selected revision and skip revisions whose payload is missing or too large.
 
 ## State filters
 
@@ -63,17 +75,202 @@ gitcrawl sync owner/repo --numbers https://github.com/owner/repo/issues/123 --wi
 `123`, `#123`, `issues/123`, `pull/123`, `owner/repo#123`, and full GitHub
 issue or pull request URLs.
 
+Repository-qualified references must match the `owner/repo` argument
+(case-insensitively). Mismatched repositories, unsupported URL forms, empty
+comma-separated entries, and an explicitly empty `--numbers` value are rejected
+before synchronization starts. Omit `--numbers` to select a repository-wide sync.
+The same rule applies to `threads --numbers` and to `embed` or `summarize
+--number`: an explicitly empty selection is an error, not an omitted filter.
+
 ## Hydration depth
+
+### Batched GraphQL history
+
+```bash
+gitcrawl sync owner/repo --numbers 123,456 --state all --include-comments --with pr-metadata --graphql-history
+```
+
+This opt-in profile fetches exact selections in GraphQL batches of at most 25
+parents. It fully paginates labels, assignees, discussion comments, reviews,
+review threads and both sources' nested inline comments. Review threads include
+standalone comments with no review association; comments found through both
+paths are deduplicated by provider identity while review bodies and metadata
+remain separate. It then uses the existing per-thread transactions,
+observation ordering, failure resolution and document persistence. It performs
+no REST requests or fallback. The regular sync path is unchanged.
+
+The profile requires the flags above; it rejects `--since`, `--limit` and full
+PR-detail hydration. It does not collect files, commit bodies, checks or Actions
+logs. An incomplete GraphQL response, unavailable parent, missing identity,
+duplicate child within a connection, mismatched or changing count, or nonadvancing cursor
+fails the batch before archive writes.
+Supervisors should retry failed selections in isolation. Empty reviews remain
+retained, including approvals without bodies. Minimized comments and null
+(deleted) authors are retained as returned by GitHub; deleted comments that
+GitHub no longer returns cannot be reconstructed. The ordinary empty-comment
+filtering contract is unchanged.
+
+Stored raw maps are explicitly labelled projections: `_gitcrawl_source` is
+`graphql`, and `_graphql` retains the hydrated provider object. Existing thread
+database IDs and legacy `github_id` values are preserved. New threads use the
+opaque GraphQL node ID because a PR's GraphQL database ID is different from its
+REST issue ID. Comments/reviews use exact `fullDatabaseId` strings; PR metadata
+uses its PR database ID. Bot logins receive REST-compatible `[bot]` suffixes in
+normalized fields while raw actor names remain intact. GraphQL review creation,
+update and submission timestamps are retained.
+
+GitHub sometimes names the same bot differently between transports: Copilot
+inline comments can use `Copilot` in REST and `copilot-pull-request-reviewer`
+in GraphQL. This profile keeps the latter as `copilot-pull-request-reviewer[bot]`,
+consistent with its review bodies, and preserves the original provider actor.
+
+Provider differences remain visible: for example GraphQL can return a null head
+repository when REST previously named one. No missing value is invented from
+that earlier observation. Keep a consistent archive backup when migrating
+transports; this mode does not claim every REST-only field is available through
+GraphQL or reconstruct uncaptured historical edits.
+
+Each command probes GraphQL's own quota and preserves a 500-point floor.
+Sanitized `graphql budget` and `graphql cost` log records expose request sequence,
+conservative unanswered-request charge and actual response cost. External
+multi-process supervisors must additionally preserve a shared point budget
+across token renewals and restarts. REST request counts are not GraphQL costs.
+`graphql timing <sequence> <milliseconds>` records elapsed time for each history
+request, including failed requests. Supervisors can use the sum across parallel
+workers to pace work against GitHub's separate compute-time secondary limit.
+Response time is an estimate, not a measurement of GitHub CPU usage; explicit
+provider cooldowns always take precedence. Internal retry waits are included in
+the timing, so consumers should avoid adding another pacing delay after a known
+provider cooldown.
+
+History reads retry transient HTTP 500/502/503/504 responses, transport timeouts
+and truncated/empty response bodies up to two times in place. The same query and
+variables are retained, so a gateway failure does not immediately discard a
+whole selection and force individual-record retries. Delays are one and two
+seconds; an explicit longer `Retry-After` takes precedence, and cancellation
+stops the wait. Authentication, permission, missing-record and GraphQL semantic
+errors do not get this additional retry policy. Existing rate-limit handling is
+unchanged. Exhausted retries still fail acquisition and leave normal isolated
+recovery available to the supervisor.
+
+Each transient attempt has a separate budget/timing identity. Unanswered attempts
+retain their conservative charge even if a later quota receipt looks higher.
+Transient backoff occurs outside the per-attempt timing; the underlying HTTP
+client's rate-limit retry wait can still be included as described above.
 
 | Flag | What it adds |
 | --- | --- |
 | `--include-comments` | Issue comments, PR review comments, reviews |
-| `--include-pr-details` | PR files, commits, status checks, workflow runs |
+| `--with pr-metadata` | PR object, including merge attribution, head/base references, and diff counts |
+| `--include-pr-details` | PR object, files, commits, status checks, workflow runs, review threads |
 | `--with pr-details` | Same as `--include-pr-details` (gh-style flag) |
+| `--force` | Download selected data again, bypassing unchanged issue-comment reuse |
+| `--progress-file <absolute-path>` | Atomically publish sanitized machine-readable activity |
 
-PR details land in `pr_files`, `pr_commits`, `pr_checks`, and `pr_runs` tables for local review, search, clustering, and TUI workflows.
+`pr-metadata` writes only `pull_request_details`, using the normal per-thread
+observation ordering. It does not fetch, clear, or mark files, commits, checks,
+workflow runs, or review-thread resolution as fresh. Comments remain independent:
+add `--include-comments` when needed. Selecting both hydration modes uses full
+`pr-details` hydration. Metadata-only hydration does not create full PR revisions
+or fingerprints. It resolves PR metadata-fetch failures, not failures of omitted
+child collections.
+
+Full PR details also populate `pull_request_files`, `pull_request_commits`,
+`pull_request_checks`, and `github_workflow_runs` for local review and search.
+
+With `--include-comments`, sync reuses issue comments (including the general
+discussion on PRs) when the freshly fetched parent `updated_at` matches the last
+completed comment observation and its `comments` count matches the exact saved
+issue-comment membership. Missing or pruned payloads, observations, membership, timestamps or counts,
+changed timestamps or counts, and unresolved issue-comment failures require a
+download. Historical comments omitted from the last observation are never reused.
+Reused comments remain in the archive and revision evidence; they do not count
+toward `comments_synced` or progress `comments_received`. The saved observation
+is checked again in the item transaction; concurrent replacement requires a retry.
+
+PR reviews, inline review comments, review-thread resolution, and all selected
+PR details are still fetched on every sync: a parent timestamp or head SHA alone
+does not prove those collections are unchanged. This preserves check and workflow
+transitions in fully hydrated revision evidence.
+
+To refresh issue comments that may have changed without moving either parent
+signal, use `gitcrawl sync owner/repo --include-comments --force` (or the same
+flags with `refresh`). `--force` bypasses reuse within the selected state, time
+window, or `--numbers`; it does not expand that scope or select extra families.
+
+`fill-pr-details` selects PRs without a metadata row; it does not upgrade existing
+metadata-only rows. To upgrade them, use
+`gitcrawl sync owner/repo --numbers 123,456 --with pr-details`
+(and `--include-comments` for full revision evidence).
+
+Review-thread and nested-comment pagination fails if GitHub claims another page
+but returns an empty or previously followed `endCursor`. Sync reports a
+`missing endCursor` or `repeated endCursor` error instead of repeatedly fetching
+the same page. Retry after the GitHub API or proxy returns advancing cursors;
+the incomplete review-thread response is not saved as complete evidence.
+
+Use `gitcrawl coverage [owner/repo] --json` to inspect archive completeness after a sync. It reports issue, PR, comment, and review counts alongside hydrated PR detail rows, missing PR details, known failed hydrations, and detail-table row counts per repository. The additive `enrichment` object exposes supported, eligible, covered, fresh, missing, stale, completeness, ratios, and latest timestamps for revisions, fingerprints, key summaries, clusters, and PR details. Use `--repos owner/a,owner/b` to compare selected repositories and `--min-missing-pr-details N` to focus backfill work on repositories with gaps.
+
+`gitcrawl sync-failures owner/repo --json` lists unresolved issue, comment, and PR hydration failures with their operation, error class and message, timestamps, and retry count. Add `--include-resolved` to inspect failures cleared by a later successful hydration of that same family. This operational ledger stays local when `portable prune` runs unless the publisher explicitly passes `--include-sync-failures`, which retains the ledger only after replacing every error message with a redaction marker.
+
+## Partial failures
+
+Each completed issue or PR commits atomically with its requested children,
+document, revision, fingerprint, and failure resolutions. A failed item does not
+roll back completed siblings. Shared-head workflow observations are consolidated
+before those writes, so sibling ordering cannot replace a newer snapshot.
+A consolidation failure excludes only its shared-head group, records those
+items as failed PR-detail hydrations, and preserves unrelated completed items.
+
+An item fetch failure records its actual operation: `issue`, `issue_comments`,
+`pull_reviews`, `pull_review_comments`, `pull_review_threads`,
+`pull_request_metadata`, or `pull_request_details`. A failed issue lookup does
+not create a thread stub. Failed child fetches can retain the observed parent
+metadata, but do not replace incomplete child collections or certify complete
+evidence. Cancellation stops further work; transactions already committed remain.
+A quota-reserve failure also stops new acquisition, including quota probes.
+Completed payloads can still commit. Skipped requests are not recorded as
+failures; shared-head groups that still need verification remain uncommitted.
+
+An item transaction failure records each requested operation after rollback,
+with only an existing parent reference when available. It does not recreate the
+rolled-back item. A retry resolves only the families it actually persists:
+metadata-only retries leave comments and full-detail failures unresolved.
+
+An incomplete batch exits nonzero and never records a successful sync or advances
+the closed-sweep watermark. Before partial writes, archives without a recorded
+watermark retain their previous retry lower bound as a `checkpoint` in
+`sync_runs`. A new archive uses the default 24-hour lower bound. This checkpoint
+is not successful list coverage or freshness. Retry the failed numbers with the
+same hydration flags after resolving the reported cause.
+Older binaries can read these archives but do not honor the retry checkpoint
+when writing. Do not downgrade the writer to resume a partially completed sync.
 
 `--include-code` is accepted for compatibility but is currently a no-op.
+
+## Machine-readable progress
+
+Automation may pass an absolute `--progress-file` path. Gitcrawl atomically
+replaces that private file as synchronization advances, then leaves the
+terminal snapshot in place:
+
+```json
+{
+  "schema": "gitcrawl.sync-progress.v1",
+  "repository": "owner/repo",
+  "state": "running",
+  "stage": "syncing_threads",
+  "issues_received": 56,
+  "pull_requests_received": 238,
+  "comments_received": 350,
+  "observed_at": "2026-07-31T04:17:36.000000000Z"
+}
+```
+
+`state` is `running`, `succeeded`, or `failed`; `stage` is `connecting`,
+`syncing_threads`, or `finalizing`. Counts describe upstream activity observed
+by the current process, not rows committed to SQLite. The snapshot never
+contains credentials, issue content, request URLs, or raw diagnostics.
 
 ## Limit and pagination
 
@@ -83,31 +280,47 @@ gitcrawl sync owner/repo --limit 200
 
 `--limit` caps the number of rows fetched in this invocation. The underlying GitHub paginator surfaces total page counts in run records and honors GitHub's `Retry-After` and rate-limit response headers, so partial syncs interrupted by rate limiting resume cleanly.
 
+REST pagination stops with an error if a `next` link returns to an already
+fetched page. This prevents repeated requests and avoids treating a cyclic
+response as a complete page collection. Retry when GitHub or the proxy returns
+advancing links.
+
 ## JSON output
 
+The result reports processed thread and hydration counts, not separate insert
+and update counts. For a compact view:
+
 ```bash
-gitcrawl sync owner/repo --json
+gitcrawl sync owner/repo --json \
+  | jq '{repository, threads_synced, issues_synced, pull_requests_synced, comments_synced, metadata_only, started_at, finished_at}'
 ```
 
 ```json
 {
   "repository": "owner/repo",
-  "state": "open",
-  "since": "",
-  "selected": 124,
-  "inserted": 12,
-  "updated": 9,
-  "deleted": 0,
-  "comments_inserted": 0,
-  "comments_updated": 0,
-  "reviews_inserted": 0,
-  "pr_files_inserted": 0,
-  "pr_commits_inserted": 0,
-  "run_id": 42,
+  "threads_synced": 124,
+  "issues_synced": 100,
+  "pull_requests_synced": 24,
+  "comments_synced": 0,
+  "metadata_only": true,
   "started_at": "2026-05-05T07:30:11Z",
   "finished_at": "2026-05-05T07:30:43Z"
 }
 ```
+
+The full result also includes PR-detail and enrichment counters, closure and
+stale-observation counts, the requested scope when present, and the database
+write destination. Use `gitcrawl runs owner/repo --kind sync --json` for
+recorded run IDs.
+
+After partial persistence, `sync --json` still emits committed counts, but exits
+nonzero and leaves progress marked `failed`. `fill-pr-details --json` likewise
+reports committed `filled` and remaining selected items, including a partially
+completed batch. A quota stop exits nonzero with
+`stopped_reason: "rate-limit-reserve"`; other sync failures use `"sync-failed"`.
+The partial batch and final result retain the stopping request's quota snapshot
+without a subsequent credential or quota lookup.
+Automation must check the exit status, not treat a JSON result as success.
 
 ## Common workflows
 
@@ -156,3 +369,10 @@ gitcrawl sync owner/repo --numbers "$NUMS" --with pr-details
 - [Refresh and embed](/refresh-and-embed/) — the wrapper that runs sync, embed, and cluster end to end
 - [gh shim migration](/gh-shim/) — Octopool owns pooled `gh` reads now
 - [Portable stores](/portable-stores/) — sharing the synced cache across machines
+
+## Analytics source preparation
+
+The [analytics source command](/analytics-source/) repairs retained review publication
+timestamps without rewriting raw evidence and maintains a full-history archive
+through incremental GraphQL collection. Its actor IDs and coverage receipts are
+source evidence for downstream analytics; account classifications remain derived.

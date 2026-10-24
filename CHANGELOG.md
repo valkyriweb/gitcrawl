@@ -1,6 +1,343 @@
 # Changelog
 
-## 0.6.1 - Unreleased
+## Unreleased
+
+## 0.17.0 - 2026-10-23
+
+**Highlights:** Smaller portable-store updates with split archives, inspectable cluster-candidate generations, and SQLite reliability fixes.
+
+- Add `portable export --compression split`, which publishes the uncompressed portable database as verified 32 MiB parts so Git stores each new generation as a small delta instead of a new 68 MB gzip blob. Refresh, init, status and recovery read split stores; older readers refuse them and keep their last good mirror. After advancing to a split generation, strict refresh geometrically repacks recent objects so subscribers also keep each generation as a delta, skipping a loose backlog of more than 512 objects. Raw and gzip stores are still never repacked.
+- Record every accepted native cluster run's complete computed partition as an immutable, run-scoped `gitcrawl.cluster-candidates.v3` generation, with observed overlaps to durable groups, and select it atomically. Quarantined candidates are visible in this domain without changing durable IDs or their history. Add `cluster-candidates` (also in the native reader) and `--rollback`.
+- Let the native code producer publish from a captured upstream commit when core progress is fresh, even while provider coverage is incomplete. Retries and coverage are not changed.
+- Request `synchronous=FULL` on every SQLite connection and, on macOS, `fullfsync` for commits and checkpoints. Go test binaries skip the macOS full flush.
+- Update CrawlKit to v0.17.3 so SQLite lock waits honor context deadlines, with SQLite 3.54.1 and the matching runtime dependency.
+- Keep the cloud snapshot privacy regression compatible with SQLite 3.53 and 3.54 by explicitly preserving nested JSON arrays across subqueries.
+- Update the pinned TruffleHog secret-scanning action to v3.99.3. Thanks @dependabot.
+
+## 0.16.0 - 2026-10-20
+
+**Highlights:** Time-filtered neighbor discovery, Go security fixes, and reliable large-result lookups.
+
+- Add `neighbors --open-at`, `--created-after`, and `--merged-after` to filter similar rows by time before ranking, with thread metadata and a complete-sync watermark in the output. Thanks @masatohoshino.
+- Build with Go 1.27.3 to fix the reachable crypto/x509 certificate-validation vulnerability GO-2026-6809, retaining the Go 1.27.2 language minimum.
+- Fix large neighbor and search result lookups failing with SQLite's SQL variable limit. Thanks @masatohoshino for reporting.
+- Update the D-Bus dependency used by Linux credential storage to v5.2.4, retaining the Go 1.27.2 minimum.
+- Move macOS CI to Xcode 27 while preserving macOS 13 compatibility, and verify Intel release binaries explicitly under Rosetta.
+- Refresh the vulnerability scanner and dead-code checker to their current compatible releases, retaining the Go 1.27.2 minimum.
+
+## 0.15.2 - 2026-10-16
+
+**Highlights:** Reliable local database initialization inside Git worktrees and refreshed dependencies.
+
+- Create a missing local database during `init` when the path is inside a Git worktree. Leave an existing database unchanged, and leave a gzip portable source without a raw database file unchanged. Thanks @SebTardif.
+- Compare analytics retry deadlines correctly when fractional-second precision differs, so already-due recovery work is not briefly deferred.
+- Update CrawlKit to v0.17.0 and the ANSI helpers to v0.11.9, retaining the Go 1.27.2 minimum; refresh the Node setup, GoReleaser, app-token, and secret-scanning actions. Thanks @dependabot.
+- Add an explicit release workflow dry run that builds, signs, and verifies artifacts without publishing.
+
+## 0.15.1 - 2026-10-11
+
+**Highlights:** Faster embedding on large archives, reliable local database setup, and Go security fixes.
+
+- Speed up `embed --include-closed` on large archives with indexed candidate pagination, preserving ordering and limits and adding the index automatically without a schema version bump. Thanks @masatohoshino.
+- Initialize the local database during `init` so fresh installations are ready to use, while preserving remote and portable sources. Thanks @RomneyDa.
+- Update the Go source and Docker build minimum to 1.27.2 to resolve vulnerability scan failures. Thanks @RomneyDa.
+
+- Load the analytics discovery receipt beside the resolved config, including `GITCRAWL_CONFIG`, instead of the working directory. Thanks @SebTardif.
+- Update `golang.org/x/sys` to v0.49.0 and `go-runewidth` to v0.0.31, retaining the Go 1.27.2 source-build minimum.
+- Update the indirect `go-strftime` dependency to v1.1.0, retaining the existing Go runtime floor.
+- Update the TruffleHog secret-scanning action to v3.98.0. Thanks @dependabot.
+- Use one shared autoreview installation from `openclaw/agent-skills`; repository entrypoints now receive upstream fixes without copied helpers or test suites.
+- Verify every macOS release binary's deployment target before signing and publication to preserve macOS 13 compatibility.
+
+## 0.15.0 - 2026-10-01
+
+**Highlights:** Exact owner-directed archive removal with durable collection exclusions.
+
+- Add `purge-threads` with exact owner-selected plans, atomic local removal, and durable collection exclusions. Thanks @hannesrudolph.
+- Update CrawlKit to v0.16.7. Thanks @vincentkoc.
+
+## 0.14.0 - 2026-09-30
+
+**Highlights:** New `gitcrawl analytics` commands for publication repair, actor evidence, and continuous collection with durable review-state recovery.
+
+- Add `gitcrawl analytics` for publication repair, actor evidence, continuous collection, and durable review-state recovery with separate core/enrichment coverage and private failure receipts. Thanks @hannesrudolph.
+- Update CrawlKit to v0.16.6 for faster vector validation in the TurboVec search backend.
+- Update the transitive golden-test helper to its v0.1.0 release.
+
+## 0.13.0 - 2026-09-28
+
+**Highlights:** New `gitcrawl metrics` commands for repository headline history, and much faster clustering and exact neighbors.
+
+- Add `gitcrawl metrics collect|import|status --config metrics.json` to keep stars, forks, subscribers, open issue/PR counts, completed-day clones, and stable releases in a separate private SQLite store, with atomic imports, preserved unknown values, daily corrections, partial-result reporting when quota runs out, and JSON output. Thanks @hannesrudolph.
+- Prepare vectors once for 2.6× faster cluster scoring and 2.0× faster exact neighbors; enable `GOEXPERIMENT=simd` in release builds for a further 2.6×/1.7× on Apple M3 Ultra (1,024 dimensions).
+- Reject GraphQL history pages whose continuation reports a different total count, so a comment deleted mid-pagination can no longer leave a stale conversation marked complete.
+- Keep arguments after `--` literal (for example `gitcrawl search -- --flag-like-text`) instead of treating them as options.
+- Load TUI neighbors for a selected closed thread that has a stored embedding instead of reporting it missing.
+- Disable automatic Git maintenance during portable-refresh fixture setup so temporary repositories do not launch detached cleanup work.
+
+## 0.12.0 - 2026-09-24
+
+**Highlights:** Batched GraphQL conversation history, including standalone inline review comments.
+
+- Add opt-in `sync --graphql-history` for batched issue and PR conversations with complete nested pagination, standalone review-thread comments, exact provider IDs, bounded retries, and GraphQL point receipts. Thanks @hannesrudolph.
+
+## 0.11.0 - 2026-09-22
+
+**Highlights:** Lower-disk portable exports, preserved body-length metadata, and fewer redundant GitHub comment downloads.
+
+- Add `portable export --consume-source` for exclusively owned, backed-up databases on the same filesystem, avoiding the initial full-size copy while preserving validation and atomic publication. Thanks @obviyus.
+- Preserve original thread and comment body lengths when exporting an already pruned portable archive again. Thanks @obviyus.
+- Reject mismatched repositories in pasted thread references before reads, syncs, enrichment, local overrides, or TUI jumps, and reject empty selections or list entries that could turn a targeted sync into an unrestricted one.
+- Skip unchanged issue-comment downloads on issues and PRs using parent timestamps, comment counts, and completed saved observations; keep PR review and detail data live, and add `sync`/`refresh --force` for a full selected refresh. Thanks @vlsi for the report.
+- Order captured comments chronologically when source timestamps have different fractional-second precision, preserving deterministic ties by kind and stable ID.
+
+## 0.10.0 - 2026-09-13
+
+**Highlights:** Explicit cloud archive admission (thanks @vincentkoc), `last_export_at` for portable publication time, and sync that no longer loses completed items when one fails.
+
+- Add explicit cloud archive admission with immutable source, integrity, enrichment, and warning evidence while preserving strict publication defaults. Thanks @vincentkoc.
+- Compatibility: report portable publication time as `last_export_at`; `last_sync_at` now describes retained successful sync runs instead of old repository scan checkpoints. Thanks @obviyus.
+- Preserve completed issue and PR hydrations when another item fails, with atomic per-item writes, scoped failure resolution, and unchanged successful-sync coverage. Record issue and comment fetch failures in the existing ledger; resolve recovered parent failures even when child fetching still fails. `sync` and `fill-pr-details` return committed counts while exiting nonzero on incomplete acquisition, including quota stops.
+- Isolate shared-head workflow failures without discarding unrelated completed items, stop acquisition and post-batch lookups at the first quota-reserve failure, and retain rolled-back item failures by requested family so metadata-only retries cannot clear failed children.
+- Consolidate repeated check-run IDs from overlapping GitHub pages, preserving API order and the latest fetched observation instead of failing PR hydration.
+- Stop REST pagination when GitHub returns repeated or cyclic next links, preventing repeated requests and incomplete sync results.
+- Honor the global `--no-color` flag in the terminal browser.
+- Keep the documentation index named Gitcrawl in renamed checkouts, validate same-page links, and escape link URLs exactly once.
+- Update SQLite's C-parser dependency to v4.29.6 and pin the automation guide's artifact-upload example to v7.0.1.
+- Validate documentation builds before merge, pin CI actions and build tools to verified releases, update govulncheck to v1.8.0, and avoid duplicate cross-platform snapshot builds.
+
+## 0.9.6 - 2026-09-11
+
+**Highlights:** Exact GitHub IDs and retryable portable-store initialization.
+
+- Preserve newly fetched GitHub numeric IDs exactly across REST and GraphQL syncs, including IDs above the floating-point precision limit. Previously stored IDs are not repaired.
+- Stage initial portable-store clones before publication so failed Git clones leave the destination unchanged and initialization can be retried.
+- Update CrawlKit to v0.16.1, x/sys to v0.48.0 (thanks @dependabot), terminal-width and Go support dependencies, and the deadcode checker; retain Go 1.27.1 and SQLite's required libc v1.75.6.
+
+## 0.9.5 - 2026-09-09
+
+- Update CrawlKit to v0.15.0 while retaining the existing Go 1.27.1 source-build minimum.
+- Reconcile observed closures during default sync, retaining successful sweep coverage across offline periods without retiring omitted threads.
+- Fill bounded embedding runs from older eligible threads when newer vectors are already current.
+- Exclude raw comment and review-thread revision payloads and sync failure diagnostics from cloud SQLite snapshots while preserving canonical bodies, history rows, and PR patches without changing the source archive.
+- Add `sync` and `refresh --with pr-metadata` to hydrate PR metadata without fetching unrelated child collections or claiming their coverage.
+
+- Add `--github-token-command` for managed, rotating GitHub credentials during long synchronizations on Unix. Requests and quota reservations use the current credential without changing static authentication or remote-store sessions.
+
+- Stop review-thread GraphQL pagination when GitHub returns an empty or repeated endCursor. Thanks @SebTardif.
+- Raise the source-build minimum to Go 1.27.1 for CrawlKit v0.14.8 and align the Docker builder; newly built macOS binaries require macOS 13 Ventura or newer.
+- Update SQLite to v1.58.0, compatible Go dependency patches, the Dockerfile frontend to 1.27, and TruffleHog to v3.97.4; retain SQLite's required libc v1.75.6.
+
+## 0.9.4 - 2026-08-30
+
+- Report the actual reset failure when portable-store initialization cannot recover from a dirty merge. Thanks @SebTardif.
+- Replace retired `gitcrawl gh` examples with the local archive and Octopool-backed `gh` workflow.
+
+## 0.9.3 - 2026-08-29
+
+- Fix repeated gzip-only portable initialization and add a locked, bounded, preservation-first `portable refresh` subscriber command with automatic Git maintenance disabled across portable operations.
+- Preserve writable portable runtime data across refresh and ordinary reads, keep prepared raw replicas updating through publisher transitions, report gzip subscriber status from the usable artifact/runtime, and retain explicit Git config isolation with safe scope diagnostics.
+- Reject credential-bearing portable remote URLs while retaining SSH transport usernames.
+- Report actionable portable Git failure categories without exposing raw remote or credential-helper diagnostics.
+- Update the minimum Go toolchain to 1.26.7, SQLite to v1.57.0, and the current compatible Go dependency closure; keep Go 1.27 on hold until managed CodeQL supports it.
+- Refresh govulncheck, deadcode, the Dockerfile frontend, and the docs build's Node runtime.
+- Stabilize the coverage gate with direct tests for immutable SQLite reads, PR detail lookups, and vector scopes.
+
+## v0.9.2 - 2026-08-14
+
+- Update the minimum Go toolchain to 1.26.6 to resolve GO-2026-5026, GO-2026-5972, GO-2026-6090, and GO-2026-6218.
+## 0.9.1 - 2026-08-10
+
+**Highlight:** `portable export` now produces stable artifact identities — local
+ingestion churn no longer changes the output digest, so unchanged data stops
+producing spuriously different exports.
+
+### Portable stores
+
+- Add streamlined `portable export` generations with single-pass sanitized compatibility tables and compact final files. Artifact identity now ignores explicit local ingestion churn while retaining exact SQLite SHA-256 integrity, so re-exporting unchanged data yields the same identity. Includes granular progress reporting and clean interruption handling.
+- Preserve the full schema in current-state exports, so a restored database matches the source structure rather than only its rows.
+- Let `portable export` atomically produce manifest-backed gzip generations with a separate archive byte budget, so growing portable databases stay publishable without moving compression into downstream scripts.
+
+### Dependencies and maintenance
+
+- Update Kong to v1.16.1.
+- Update the minimum Go toolchain to 1.26.6 for the latest standard-library security fixes.
+
+## 0.9.0 - 2026-08-08
+
+### Portable stores
+
+- Load manifest-backed gzip SQLite artifacts into the verified runtime mirror, preserving the uncompressed size, digest, and `quick_check` contract when a portable database outgrows GitHub's single-file limit.
+
+### Maintenance
+
+- Rewrite the README around the local-first quickstart and move deeper cloud archive and Docker material into the documentation.
+- Update `actions/stale` to v11 and expose its debug-only mode for safe manual policy validation.
+- Accept the shared release workflow's leading `./` archive-member notation in local release verification.
+- Update CrawlKit to v0.14.6, SQLite to v1.56.0, the current modernc libc and memory releases, and the golden-test helper.
+
+## 0.8.8 - 2026-08-01
+
+### Maintenance
+
+- Move official releases to the shared signed, notarized, independently verified GitHub Actions pipeline while preserving archive names, contents, checksums, and Homebrew delivery.
+- Reject SQLite `file:` URIs and `:memory:` consistently for configured and environment-supplied database paths, preserving Gitcrawl's filesystem-only archive contract across driver upgrades.
+- Update CrawlKit to v0.14.4, SQLite to v1.55.0, the matching modernc libc runtime to v1.74.4, TruffleHog to v3.96.0, and the current golden-test, profiling, experimental, and modernc compiler helpers.
+
+## 0.8.7 - 2026-07-26
+
+### Portable stores
+
+- Escalate reset-pull repair failures to the reclone fallback with a 15-minute backoff so checkouts with broken Git metadata self-heal instead of requiring manual recovery.
+
+## 0.8.6 - 2026-07-26
+
+### Portable stores
+
+- Remove verified-stale Git index locks during ordinary reads and refreshes instead of treating the checkout as dirty forever.
+- Repair a missing portable source database through the standard reset-pull and reclone flow instead of returning a permanent stat error.
+
+## 0.8.5 - 2026-07-26
+
+### Portable stores
+
+- Report writable-command redirects to portable runtime mirrors on stderr and expose `db_target`, `db_target_path`, and `portable_source_db` in `sync`, `refresh`, `fill-pr-details`, and `portable prune` JSON output.
+- Publish the pruned database and manifest back to the portable checkout by default so the documented publishing flow cannot commit stale data, with `--no-publish` available for mirror-only pruning.
+- Remove temporary SQLite `-wal` and `-shm` sidecars after atomic copies and sweep orphaned aged temp files from portable runtime mirror directories.
+
+### Dependencies and maintenance
+
+- Update `github.com/mattn/go-isatty` to 0.0.24 and `github.com/mattn/go-runewidth` to 0.0.27.
+
+## 0.8.4 - 2026-07-22
+
+### Cached search
+
+- Treat portable runtime mirrors without pruned sync history as stale so `search issues|prs --sync-if-stale` can migrate and refresh them instead of failing on a missing `sync_runs` table.
+
+### Portable diagnostics
+
+- Keep `doctor --json` read-only for Git-backed portable stores by inspecting committed source databases as immutable SQLite files without leaving `-wal` or `-shm` sidecars in the checkout.
+
+### Dependencies and maintenance
+
+- Update the current golden-test helpers, `golang.org/x/exp`, and `modernc.org/libc` patch release.
+
+## 0.8.3 - 2026-07-20
+
+### Highlights
+
+- Close the wave-5 archive data-loss class: partial child responses no longer erase retained pull-request history, and local writes to portable runtime mirrors now survive later commands.
+
+### Archive integrity
+
+- Preserve comments, pull-request reviews, review threads, and commit references as explicit tombstones; comments and review threads retain edit history, and child hydration now merges by identity so only a sourced deletion event deletes an item while a later live observation restores it.
+- Preserve migrated writable runtime mirrors across portable-store commands, validate their SQLite health independently from the immutable source manifest, and report compatible schema-v4 portable sources as current.
+
+## 0.8.2 - 2026-07-18
+
+### Highlights
+
+- Refresh the Go dependency closure to current releases for Unicode text handling, the modernc runtime, diff and golden-test helpers, profiling, and Go tooling.
+
+### Dependencies and maintenance
+
+- Update `golang.org/x/text` to v0.40.0, `modernc.org/libc` to v1.74.2, and `modernc.org/gc/v3` to v3.1.5.
+- Update `github.com/alecthomas/repr` to v0.5.4, `github.com/aymanbagabas/go-udiff` to v0.4.1, `github.com/stretchr/objx` to v0.5.3, and the current `x/exp`, `x/tools`, golden-test, and pprof revisions.
+- Keep CrawlKit on its latest v0.14.3 release and confirm every direct Go dependency, pinned build tool, and GitHub Action is current.
+
+## 0.8.1 - 2026-07-17
+
+### Highlights
+
+- Ship both official macOS architectures through hardened-runtime Foundation signing, Apple notarization, and independent post-packaging verification before release.
+- Route embedding and semantic-search traffic through an optional embedding-only OpenAI-compatible endpoint while preserving the shared endpoint fallback. Thanks @larroy.
+
+### macOS release integrity
+
+- Sign each Darwin target as a temporary candidate with the stable `org.openclaw.gitcrawl` requirement, hardened runtime, and trusted timestamp, replacing GoReleaser output only after notarization succeeds.
+- Submit every signed candidate in an ephemeral ZIP, require an accepted Apple response with a valid submission ID, and verify the online notarized requirement before packaging.
+- Re-verify the Foundation and notarized requirements on both extracted macOS release archives so packaging cannot silently lose artifact trust.
+
+### Configuration
+
+- Add `embed_base_url`, `GITCRAWL_EMBED_BASE_URL`, and `gitcrawl configure --embed-base-url` for embedding-only endpoint routing, with doctor output and documented fallback order. Thanks @larroy.
+
+### Dependencies and maintenance
+
+- Update CrawlKit to v0.14.3, Alpine to 3.24, `actions/setup-node` to v7, govulncheck to v1.6.0, and deadcode to v0.48.0.
+
+## 0.8.0 - 2026-07-17
+
+### Highlights
+
+- Publish cloud archives as content-addressed snapshots through isolated staging, resumable upload, and an explicitly verified reader cutover instead of mutating serving state in place.
+- Make revision enrichment and PR/workflow hydration monotonic and evidence-bound so stale, partial, or reordered observations cannot replace newer accepted archive state.
+- Add fleet-aware bounded PR-detail hydration with a configurable shared-token GitHub rate-limit floor. Thanks @TurboTheTurtle.
+- Add a durable sync failure ledger while excluding it from portable exports by default and redacting error text when explicitly included. Thanks @TurboTheTurtle.
+
+### Cloud publishing
+
+- Stage content-addressed snapshot bundles under isolated identities, stream large SQLite archives in chunks, resume incomplete uploads across processes, tolerate concurrent publishers, and preserve the current reader until explicit cutover.
+- Require compatible reader queries, export schemas, complete enrichment and PR-file coverage, readable chunk hydration, scoped credentials, and snapshot-capable manifests before any remote mutation; operators can explicitly accept incomplete enrichment with `--allow-incomplete`.
+- Bind staging, resume, publication acknowledgements, bundle digests, status, and post-cutover verification to the publisher's exact snapshot ID so a newer concurrent candidate cannot be mistaken for owned work.
+- Update CrawlKit to v0.14.2 for the reviewed snapshot publication APIs.
+
+### Archive and enrichment integrity
+
+- Materialize canonical thread revisions and bind key summaries, embeddings, coverage, and clusters to the latest fully hydrated evidence while rejecting stale, divergent, incomplete, or obsolete projections.
+- Track source, fetch, parent, and child evidence clocks with durable observation generations; atomically reserve hydration families and preserve accepted evidence across tied timestamps, delayed arrivals, portable archives, and migrations.
+- Fence workflow snapshots by pull-request head and accepted evidence generation, commit sibling runs atomically, preserve verified deletions, and reject regressed or resurrected workflow state.
+- Make schema convergence and recovery atomic while preserving legacy freshness floors, observation tuples, portable truncation metadata, incomplete hydration state, and the highest migrated workflow fences.
+- Reuse legacy `llm_key_3line` summaries as canonical key-summary evidence, then remove only byte-identical legacy copies from portable exports so archives stay below GitHub's blob limit without regenerating equivalent work or discarding distinct evidence.
+- Honor issue draft transitions, hydrate overlap closures, and preserve partial cluster memberships when limited or incomplete inputs cannot justify a full replacement.
+
+### Maintainer workflows
+
+- Add `gitcrawl fill-pr-details` for bounded, resumable hydration of missing PR details, probing the shared token's live `/rate_limit` quota before each guarded request and preserving a configurable reserve. Thanks @TurboTheTurtle.
+- Add `gitcrawl sync-failures` and durable retry/resolution tracking; portable exports drop the ledger by default, redact opted-in errors, and securely rewrite current, deleted, and interrupted failure history. Thanks @TurboTheTurtle.
+- Ignore cross-repository issue and pull request URLs when building deterministic local cluster edges while preserving documented unqualified `issues/123` and `pull/123` references. Thanks @GongYuanCaiJi.
+- Ignore stray ancestor `.git` directories when resolving local databases while preserving verified legacy portable-store worktrees and fail-closed probe errors. Thanks @morluto.
+
+### Release and dependency maintenance
+
+- Verify draft release inventories through exact release and asset API identities while keeping validation operations read-only.
+- Update `golang.org/x/sys` to v0.47.0, `modernc.org/sqlite` to v1.54.0, `github.com/mattn/go-isatty` to v0.0.23, and `github.com/alecthomas/kong` to v1.16.0, and replace the unreleased Lip Gloss pseudo-version with stable v1.1.0.
+- Update `actions/setup-go` to v7 and TruffleHog to v3.95.9.
+
+## 0.7.1 - 2026-07-09
+
+- Add local, fail-closed packaging and independent verification for official macOS archives signed as `org.openclaw.gitcrawl` by `Developer ID Application: OpenClaw Foundation (FWJYW4S8P8)`, while keeping CI and cross-platform snapshots credential-free and non-publishing.
+- Require Go 1.26.5 for the standard-library TLS security fix and add a vulnerability scan to CI.
+- Update CrawlKit to the signed v0.13.4 patch release.
+
+## 0.7.0 - 2026-07-06
+
+- Update CrawlKit to v0.13.3 for TOML recursion, panic, and deeply nested input hardening.
+- Resolve relative `gitcrawl init` database, runtime, and portable-store filesystem paths before saving them so later SQLite commands open the intended files instead of failing on an invalid URI, and reject unsupported SQLite URI or in-memory `--db` values.
+- Add `gitcrawl doctor --locks --json` for read-only SQLite health, sidecar state, and best-effort writer-process diagnostics, keeping archive health distinct from detected activity. Thanks @TurboTheTurtle.
+- Add read-only per-repository archive coverage reporting with JSON/table output, repository and missing-PR-detail filters, hydration counts, and explicit failure-ledger availability. Thanks @TurboTheTurtle.
+- Report the active executable/build identity and read-only database schema compatibility in `gitcrawl doctor --json`, including actionable drift diagnostics without applying migrations. Thanks @TurboTheTurtle.
+- Document the first-run local maintainer archive workflow, including targeted PR hydration, bounded-staleness search, run inspection, and the Octopool boundary. Thanks @TurboTheTurtle.
+
+## 0.6.4 - 2026-06-23
+
+- Drain large Cloudflare D1 table resets before sending row batches so `gitcrawl cloud publish` can tolerate bounded Worker resets.
+
+## 0.6.3 - 2026-06-23
+
+- Compact portable thread label and assignee metadata during store pruning so `gitcrawl-store` refreshes keep GitHub archive payloads below GitHub blob limits.
+
+## 0.6.2 - 2026-06-19
+
+- Use CrawlKit's shared safe tokenized FTS5 query and SQL LIKE builders, treating `%`, `_`, and backslashes literally in fallback searches, and update CrawlKit to v0.13.0.
+- Preserve duplicate PR file entries returned by GitHub, including removed and added files sharing one path, as position-keyed snapshots. Thanks @joshka.
+- Add `gitcrawl init --runtime-dir` for fully isolated temporary database, cache, vector, and log paths. Thanks @joshka.
+
+## 0.6.1 - 2026-06-19
+
+- Use platform-native default config, data, cache, and log paths for new installs while preserving existing `~/.config/gitcrawl` installs until the new platform path exists; macOS uses Application Support and Caches, while Linux continues to honor XDG base directory variables, thanks @joshka.
+- Update `crawlkit` to v0.12.2 for Windows SQLite path support and security hardening; bearer-authenticated non-local remote endpoints now require HTTPS, while loopback HTTP remains supported for local development.
 
 ## 0.6.0 - 2026-06-11
 

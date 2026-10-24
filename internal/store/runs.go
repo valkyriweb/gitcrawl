@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -127,9 +129,111 @@ func (s *Store) LastSuccessfulSyncAt(ctx context.Context, repoID int64) (time.Ti
 	return parsed, nil
 }
 
+const recordedClosedSweepWatermarkSQL = `
+	select json_extract(stats_json, '$.closed_sweep_through')
+	from sync_runs
+	where repo_id = ? and status in ('success', 'completed', 'checkpoint')
+	  and scope in ('open', 'closed', 'all')
+	  and json_valid(stats_json)
+	  and json_type(case when json_valid(stats_json) then stats_json else '{}' end,
+	                '$.closed_sweep_through') = 'text'
+	order by julianday(json_extract(stats_json, '$.closed_sweep_through')) desc, id desc
+	limit 1
+`
+
+// PreserveClosedSweepWatermark freezes the legacy lower bound before partial
+// commits can close or refresh its oldest open thread. A checkpoint is not a
+// successful sync and cannot certify list freshness or archive completeness.
+// The caller owns the transaction that precedes thread mutations.
+func (s *Store) PreserveClosedSweepWatermark(ctx context.Context, repoID int64, startedAt time.Time) error {
+	var recorded string
+	err := s.q().QueryRowContext(ctx, recordedClosedSweepWatermarkSQL, repoID).Scan(&recorded)
+	if err == nil {
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	watermark, err := s.ClosedSweepWatermark(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	if watermark.IsZero() {
+		watermark = startedAt.Add(-24 * time.Hour)
+	}
+	stats, err := json.Marshal(map[string]string{"closed_sweep_through": watermark.Format(time.RFC3339Nano)})
+	if err != nil {
+		return err
+	}
+	_, err = s.RecordRun(ctx, RunRecord{
+		RepoID: repoID, Kind: "sync", Scope: "open", Status: "checkpoint",
+		StartedAt:  startedAt.Format(time.RFC3339Nano),
+		FinishedAt: startedAt.Format(time.RFC3339Nano), StatsJSON: string(stats),
+	})
+	return err
+}
+
+// ClosedSweepWatermark ignores incomplete runs. A legacy checkpoint retains
+// only the old retry lower bound; complete default syncs advance it.
+func (s *Store) ClosedSweepWatermark(ctx context.Context, repoID int64) (time.Time, error) {
+	var raw sql.NullString
+	err := s.q().QueryRowContext(ctx, `
+		select coalesce(
+			(`+recordedClosedSweepWatermarkSQL+`),
+			(select min(coalesce(nullif(last_pulled_at, ''), nullif(first_pulled_at, ''),
+			                     nullif(updated_at_gh, ''), updated_at))
+			 from threads where repo_id = ? and state = 'open')
+		)
+	`, repoID, repoID).Scan(&raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read closed sweep watermark: %w", err)
+	}
+	if !raw.Valid || raw.String == "" {
+		return time.Time{}, nil
+	}
+	value, err := time.Parse(time.RFC3339Nano, raw.String)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse closed sweep watermark: %w", err)
+	}
+	return value, nil
+}
+
+// StateAsOf returns the start of the newest successful complete open or all
+// list sync. This is a sweep watermark, not proof of a historical backfill:
+// legacy closed rows may predate sweep coverage. Targeted, limited, failed,
+// or since-bounded syncs do not move it. It is zero without a qualifying run.
+func (s *Store) StateAsOf(ctx context.Context, repoID int64) (time.Time, error) {
+	if !s.hasColumns(ctx, "sync_runs", "repo_id", "scope", "status", "stats_json") {
+		return time.Time{}, nil
+	}
+	var raw string
+	err := s.q().QueryRowContext(ctx, `
+		select json_extract(stats_json, '$.closed_sweep_through')
+		from sync_runs
+		where repo_id = ? and status in ('success', 'completed')
+		  and scope in ('open', 'all')
+		  and json_valid(stats_json)
+		  and json_type(case when json_valid(stats_json) then stats_json else '{}' end,
+		                '$.closed_sweep_through') = 'text'
+		order by julianday(json_extract(stats_json, '$.closed_sweep_through')) desc, id desc
+		limit 1
+	`, repoID).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read state as of: %w", err)
+	}
+	value, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse state as of %q: %w", raw, err)
+	}
+	return value, nil
+}
+
 func (s *Store) LastSuccessfulListSyncAt(ctx context.Context, repoID int64, state string) (time.Time, error) {
 	state = normalizedListSyncState(state)
-	if state == "" {
+	if state == "" || !s.hasColumns(ctx, "sync_runs", "repo_id", "scope", "status", "finished_at") {
 		return time.Time{}, nil
 	}
 	lastSync, err := s.qsql().LastSuccessfulListSyncAt(ctx, storedb.LastSuccessfulListSyncAtParams{
@@ -147,6 +251,62 @@ func (s *Store) LastSuccessfulListSyncAt(ctx context.Context, repoID int64, stat
 		return time.Time{}, fmt.Errorf("parse last successful list sync %q: %w", lastSync, err)
 	}
 	return parsed, nil
+}
+
+// SuccessfulListSyncRuns returns complete non-targeted list runs from newest
+// to oldest for the requested state coverage.
+func (s *Store) SuccessfulListSyncRuns(
+	ctx context.Context,
+	repoID int64,
+	state string,
+) ([]RunRecord, error) {
+	state = normalizedListSyncState(state)
+	if state == "" {
+		return nil, fmt.Errorf("unsupported list sync state")
+	}
+	rows, err := s.q().QueryContext(ctx, `
+		select id, repo_id, scope, status, started_at, finished_at,
+			stats_json, error_text
+		from sync_runs
+		where repo_id = ?
+			and status in ('success', 'completed')
+			and (
+				(? = 'open' and scope in ('open', 'all')) or
+				(? = 'closed' and scope in ('closed', 'all')) or
+				(? = 'all' and scope = 'all')
+			)
+		order by finished_at desc, id desc
+	`, repoID, state, state, state)
+	if err != nil {
+		return nil, fmt.Errorf("list successful list sync runs: %w", err)
+	}
+	defer rows.Close()
+	var runs []RunRecord
+	for rows.Next() {
+		var run RunRecord
+		var finishedAt, statsJSON, errorText sql.NullString
+		if err := rows.Scan(
+			&run.ID,
+			&run.RepoID,
+			&run.Scope,
+			&run.Status,
+			&run.StartedAt,
+			&finishedAt,
+			&statsJSON,
+			&errorText,
+		); err != nil {
+			return nil, fmt.Errorf("scan successful list sync run: %w", err)
+		}
+		run.Kind = "sync"
+		run.FinishedAt = finishedAt.String
+		run.StatsJSON = statsJSON.String
+		run.ErrorText = errorText.String
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate successful list sync runs: %w", err)
+	}
+	return runs, nil
 }
 
 func normalizedListSyncState(state string) string {

@@ -555,7 +555,7 @@ func TestTUIClusterAgeHeaderTogglesDirection(t *testing.T) {
 	})
 	model.width = 140
 	model.height = 32
-	columns := clusterColumns(maxInt(24, model.layout().clusters.w-4), model.payload.Sort)
+	columns := clusterColumns(max(24, model.layout().clusters.w-4), model.payload.Sort)
 	ageX := columnLeftEdge(columns, len(columns)-1)
 
 	model.sortClustersFromHeader(ageX)
@@ -566,7 +566,7 @@ func TestTUIClusterAgeHeaderTogglesDirection(t *testing.T) {
 		t.Fatalf("oldest sort first cluster id = %d, want 1", model.payload.Clusters[0].ID)
 	}
 
-	columns = clusterColumns(maxInt(24, model.layout().clusters.w-4), model.payload.Sort)
+	columns = clusterColumns(max(24, model.layout().clusters.w-4), model.payload.Sort)
 	model.sortClustersFromHeader(columnLeftEdge(columns, len(columns)-1))
 	if model.payload.Sort != "recent" {
 		t.Fatalf("age header second sort = %q, want recent", model.payload.Sort)
@@ -590,7 +590,7 @@ func TestTUIMemberAgeHeaderTogglesDirection(t *testing.T) {
 	}}
 	model.hasDetail = true
 	model.sortMembers()
-	columns := memberColumns(maxInt(24, model.layout().members.w-4), model.memberSort)
+	columns := memberColumns(max(24, model.layout().members.w-4), model.memberSort)
 	ageX := columnLeftEdge(columns, 2)
 
 	model.sortMembersFromHeader(ageX)
@@ -601,7 +601,7 @@ func TestTUIMemberAgeHeaderTogglesDirection(t *testing.T) {
 		t.Fatalf("recent member first id = %d, want 2", model.memberRows[0].member.Thread.ID)
 	}
 
-	columns = memberColumns(maxInt(24, model.layout().members.w-4), model.memberSort)
+	columns = memberColumns(max(24, model.layout().members.w-4), model.memberSort)
 	model.sortMembersFromHeader(columnLeftEdge(columns, 2))
 	if model.memberSort != memberSortOldest {
 		t.Fatalf("member age header second sort = %q, want oldest", model.memberSort)
@@ -2053,7 +2053,7 @@ func TestTUIJumpAndSortHelpersCoverStoreBackedBranches(t *testing.T) {
 	model.jumping = true
 	updated, _ := model.handleJumpKey(tea.KeyMsg{Type: tea.KeyEnter})
 	model = updated
-	if !strings.Contains(model.status, "Enter a positive") {
+	if !strings.Contains(model.status, "expected positive") {
 		t.Fatalf("bad jump status = %q", model.status)
 	}
 	model.startJumpInput()
@@ -2709,6 +2709,49 @@ func TestTUILoadNeighborsFromStore(t *testing.T) {
 	}
 	if model.focus != focusDetail {
 		t.Fatalf("enter focus = %s, want detail", model.focus)
+	}
+}
+
+func TestTUILoadNeighborsForClosedSelection(t *testing.T) {
+	for _, modelName := range []string{"test", "missing-configured-model"} {
+		t.Run(modelName, func(t *testing.T) {
+			ctx := context.Background()
+			st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			repoID, err := st.UpsertRepository(ctx, store.Repository{Owner: "fixture", Name: "repo", FullName: "fixture/repo", RawJSON: "{}"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			targetID, err := seedTUIThreadVector(ctx, st, repoID, 1, "Closed target", []float64{1, 0})
+			if err != nil {
+				t.Fatal(err)
+			}
+			neighborID, err := seedTUIThreadVector(ctx, st, repoID, 2, "Open neighbor", []float64{0.9, 0.1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.DB().ExecContext(ctx, `update threads set state = 'closed' where id = ?`, targetID); err != nil {
+				t.Fatal(err)
+			}
+			model := newClusterBrowserModel(ctx, st, repoID, clusterBrowserPayload{Repository: "fixture/repo", EmbedModel: modelName, EmbeddingBasis: "title_original"})
+			model.memberIndex = 0
+			model.memberRows = []memberRow{{selectable: true, member: store.ClusterMemberDetail{Thread: store.Thread{
+				ID: targetID, Number: 1, State: "closed", HTMLURL: "https://github.com/fixture/repo/issues/1",
+			}}}}
+			cmd := model.requestSelectedThreadNeighbors(10, 0.2)
+			if cmd == nil {
+				t.Fatal("neighbor command missing")
+			}
+			updated, _ := model.Update(cmd())
+			model = updated.(clusterBrowserModel)
+			neighbors := model.neighborCache[targetID]
+			if len(neighbors) != 1 || neighbors[0].Thread.ID != neighborID {
+				t.Fatalf("neighbors=%+v status=%q; want open neighbor %d", neighbors, model.status, neighborID)
+			}
+		})
 	}
 }
 

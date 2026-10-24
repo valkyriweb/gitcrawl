@@ -56,6 +56,8 @@ func queryExact(ctx context.Context, items []Item, query []float64, limit int, e
 	if err := validateExactQuery(query); err != nil {
 		return nil, err
 	}
+	preparedQuery := Prepare(query)
+	scratch := make([]float64, len(query))
 	scored := make([]crawlvector.Scored[Neighbor], 0, len(items))
 	for _, item := range items {
 		if err := ctx.Err(); err != nil {
@@ -64,7 +66,10 @@ func queryExact(ctx context.Context, items []Item, query []float64, limit int, e
 		if item.ThreadID == excludeThreadID {
 			continue
 		}
-		score := Cosine(query, item.Vector)
+		if len(item.Vector) != len(query) {
+			continue
+		}
+		score := preparedQuery.Cosine(prepareInto(scratch, item.Vector))
 		if math.IsNaN(score) || math.IsInf(score, 0) || score <= 0 {
 			continue
 		}
@@ -87,6 +92,9 @@ func queryExact(ctx context.Context, items []Item, query []float64, limit int, e
 func queryTurboVec(ctx context.Context, items []Item, query []float64, opts QueryOptions) ([]Neighbor, error) {
 	if opts.Limit <= 0 {
 		opts.Limit = 20
+	}
+	if err := validateExactQuery(query); err != nil {
+		return nil, err
 	}
 	candidateCount := 0
 	for _, item := range items {
@@ -160,14 +168,6 @@ func validateExactQuery(query []float64) error {
 	if maxAbs == 0 {
 		return errors.New("query vector is zero")
 	}
-	var magnitude float64
-	for _, value := range query {
-		scaled := value / maxAbs
-		magnitude += scaled * scaled
-	}
-	if magnitude == 0 {
-		return errors.New("query vector is zero")
-	}
 	return nil
 }
 
@@ -212,9 +212,6 @@ func Cosine(left, right []float64) float64 {
 		dot += leftValue * rightValue
 		leftMag += leftValue * leftValue
 		rightMag += rightValue * rightValue
-	}
-	if leftMag == 0 || rightMag == 0 {
-		return 0
 	}
 	score := dot / (math.Sqrt(leftMag) * math.Sqrt(rightMag))
 	if score > 1 {

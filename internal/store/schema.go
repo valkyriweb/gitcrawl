@@ -26,6 +26,7 @@ create table if not exists threads (
   body text,
   author_login text,
   author_type text,
+  author_association text,
   html_url text not null,
   labels_json text not null,
   assignees_json text not null,
@@ -40,6 +41,14 @@ create table if not exists threads (
   close_reason_local text,
   first_pulled_at text,
   last_pulled_at text,
+  observation_sequence integer not null default 0
+    check (
+      typeof(observation_sequence) = 'integer'
+      and observation_sequence >= -9223372036854775807
+    ),
+  evidence_observation_sequence integer not null default 0
+    check (typeof(evidence_observation_sequence) = 'integer' and evidence_observation_sequence >= 0),
+  evidence_source_updated_at text not null default '',
   updated_at text not null,
   unique(repo_id, kind, number)
 );
@@ -57,7 +66,28 @@ create table if not exists comments (
   raw_json_blob_id integer references blobs(id) on delete set null,
   created_at_gh text,
   updated_at_gh text,
+  deleted_at text,
+  deletion_reason text,
+  check (
+    (deleted_at is null and deletion_reason is null)
+    or (deleted_at is not null and deletion_reason is not null and trim(deletion_reason) <> '')
+  ),
   unique(thread_id, comment_type, github_id)
+);
+
+create table if not exists comment_revisions (
+  id integer primary key,
+  comment_id integer not null references comments(id) on delete cascade,
+  author_login text,
+  author_type text,
+  body text not null,
+  is_bot integer not null default 0,
+  raw_json text not null,
+  created_at_gh text,
+  updated_at_gh text,
+  deleted_at text,
+  deletion_reason text,
+  recorded_at text not null
 );
 
 create table if not exists blobs (
@@ -72,6 +102,46 @@ create table if not exists blobs (
   created_at text not null
 );
 
+create table if not exists thread_observation_sequence (
+  id integer primary key check (id = 1),
+  value integer not null check (typeof(value) = 'integer' and value >= 0),
+  last_started_at text not null
+);
+
+create table if not exists thread_child_observation_reservations (
+  thread_id integer not null references threads(id) on delete cascade,
+  family text not null check (family in (
+    'comments',
+    'pull_request_details',
+    'pull_request_files',
+    'pull_request_commits',
+    'pull_request_checks',
+    'pull_request_review_threads'
+  )),
+  source_updated_at text not null default '',
+  observation_sequence integer not null
+    check (typeof(observation_sequence) = 'integer' and observation_sequence > 0),
+  primary key(thread_id, family)
+);
+
+create table if not exists thread_child_observation_memberships (
+  thread_id integer not null references threads(id) on delete cascade,
+  family text not null,
+  observation_sequence integer not null
+    check (typeof(observation_sequence) = 'integer' and observation_sequence > 0),
+  member_ids_json text not null,
+  primary key(thread_id, family)
+);
+
+create table if not exists workflow_run_observation_reservations (
+  repo_id integer not null references repositories(id) on delete cascade,
+  head_sha text not null check (trim(head_sha) <> ''),
+  source_updated_at text not null default '',
+  observation_sequence integer not null
+    check (typeof(observation_sequence) = 'integer' and observation_sequence > 0),
+  primary key(repo_id, head_sha)
+);
+
 create table if not exists thread_revisions (
   id integer primary key,
   thread_id integer not null references threads(id) on delete cascade,
@@ -81,8 +151,9 @@ create table if not exists thread_revisions (
   body_hash text not null,
   labels_hash text not null,
   raw_json_blob_id integer references blobs(id) on delete set null,
-  created_at text not null,
-  unique(thread_id, content_hash)
+  observation_sequence integer not null default 0
+    check (typeof(observation_sequence) = 'integer' and observation_sequence >= 0),
+  created_at text not null
 );
 
 create table if not exists thread_code_snapshots (
@@ -142,6 +213,12 @@ create table if not exists pull_request_details (
 
 create table if not exists pull_request_files (
   thread_id integer not null references threads(id) on delete cascade,
+  -- GitHub can return multiple file entries with the same filename for one PR,
+  -- for example a removed file and an added file at the same path. Store the
+  -- fetched file list as a replaceable snapshot instead of keying by path.
+  -- See https://github.com/openclaw/gitcrawl/issues/77 for the duplicate-path
+  -- bug and why position is snapshot-local rather than a durable file identity.
+  position integer not null default 0,
   path text not null,
   status text,
   additions integer not null default 0,
@@ -151,7 +228,7 @@ create table if not exists pull_request_files (
   patch text,
   raw_json text not null,
   fetched_at text not null,
-  primary key(thread_id, path)
+  primary key(thread_id, position)
 );
 
 create table if not exists pull_request_commits (
@@ -164,6 +241,12 @@ create table if not exists pull_request_commits (
   html_url text,
   raw_json text not null,
   fetched_at text not null,
+  deleted_at text,
+  deletion_reason text,
+  check (
+    (deleted_at is null and deletion_reason is null)
+    or (deleted_at is not null and deletion_reason is not null and trim(deletion_reason) <> '')
+  ),
   primary key(thread_id, sha)
 );
 
@@ -202,7 +285,42 @@ create table if not exists pull_request_review_threads (
   comments_json text not null,
   raw_json text not null,
   fetched_at text not null,
+  deleted_at text,
+  deletion_reason text,
+  check (
+    (deleted_at is null and deletion_reason is null)
+    or (deleted_at is not null and deletion_reason is not null and trim(deletion_reason) <> '')
+  ),
   primary key(thread_id, review_thread_id)
+);
+
+create table if not exists pull_request_review_thread_revisions (
+  id integer primary key,
+  thread_id integer not null,
+  review_thread_id text not null,
+  path text,
+  line integer not null default 0,
+  start_line integer not null default 0,
+  is_resolved integer not null default 0,
+  is_outdated integer not null default 0,
+  viewer_can_resolve integer not null default 0,
+  viewer_can_unresolve integer not null default 0,
+  viewer_can_reply integer not null default 0,
+  first_author_login text,
+  first_author_type text,
+  first_comment_body text,
+  first_comment_url text,
+  first_comment_created_at text,
+  first_comment_updated_at text,
+  comments_json text not null,
+  raw_json text not null,
+  fetched_at text not null,
+  deleted_at text,
+  deletion_reason text,
+  recorded_at text not null,
+  foreign key(thread_id, review_thread_id)
+    references pull_request_review_threads(thread_id, review_thread_id)
+    on delete cascade
 );
 
 create table if not exists pull_request_review_thread_syncs (
@@ -395,6 +513,21 @@ create table if not exists sync_runs (
   error_text text
 );
 
+create table if not exists sync_attempt_failures (
+  id integer primary key,
+  repo_id integer not null references repositories(id) on delete cascade,
+  thread_id integer references threads(id) on delete set null,
+  number integer not null,
+  operation text not null,
+  error_class text not null,
+  error_message text not null,
+  first_seen_at text not null,
+  last_seen_at text not null,
+  retry_count integer not null default 0,
+  resolved_at text,
+  unique(repo_id, number, operation, error_class)
+);
+
 create table if not exists summary_runs (
   id integer primary key,
   repo_id integer references repositories(id) on delete cascade,
@@ -544,13 +677,17 @@ create table if not exists cluster_closures (
 create index if not exists idx_threads_repo_number on threads(repo_id, number);
 create index if not exists idx_threads_repo_state_closed on threads(repo_id, state, closed_at_local);
 create index if not exists idx_threads_repo_updated on threads(repo_id, updated_at);
+create index if not exists idx_threads_repo_embed_order on threads(repo_id, coalesce(updated_at_gh, updated_at) desc, number desc, id desc);
 create index if not exists idx_comments_thread_type on comments(thread_id, comment_type);
+create index if not exists idx_comment_revisions_comment on comment_revisions(comment_id, id);
 create index if not exists idx_thread_revisions_thread_created on thread_revisions(thread_id, created_at);
 create index if not exists idx_thread_changed_files_path on thread_changed_files(path);
 create index if not exists idx_pull_request_details_repo_number on pull_request_details(repo_id, number);
 create index if not exists idx_pull_request_files_path on pull_request_files(path);
+create index if not exists idx_pull_request_files_thread_path on pull_request_files(thread_id, path);
 create index if not exists idx_pull_request_checks_thread_status on pull_request_checks(thread_id, status, conclusion);
 create index if not exists idx_pull_request_review_threads_thread_resolved on pull_request_review_threads(thread_id, is_resolved);
+create index if not exists idx_pull_request_review_thread_revisions_thread on pull_request_review_thread_revisions(thread_id, review_thread_id, id);
 create index if not exists idx_pull_request_review_thread_syncs_fetched on pull_request_review_thread_syncs(fetched_at);
 create index if not exists idx_github_workflow_runs_repo_branch on github_workflow_runs(repo_id, head_branch, run_id);
 create index if not exists idx_github_workflow_runs_repo_sha on github_workflow_runs(repo_id, head_sha, run_id);
@@ -559,6 +696,8 @@ create index if not exists idx_code_documents_repo_path on code_documents(repo_i
 create index if not exists idx_thread_fingerprints_hash on thread_fingerprints(fingerprint_hash);
 create index if not exists idx_thread_vectors_basis_model on thread_vectors(basis, model);
 create index if not exists idx_sync_runs_repo_status_id on sync_runs(repo_id, status, id);
+create index if not exists idx_sync_attempt_failures_repo_unresolved on sync_attempt_failures(repo_id, resolved_at, last_seen_at);
+create index if not exists idx_sync_attempt_failures_thread on sync_attempt_failures(thread_id, resolved_at);
 create index if not exists idx_cluster_runs_repo_status_id on cluster_runs(repo_id, status, id);
 create index if not exists idx_similarity_edges_repo_score on similarity_edges(repo_id, score);
 create index if not exists idx_cluster_groups_repo_status on cluster_groups(repo_id, status);

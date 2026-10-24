@@ -20,6 +20,7 @@ These work on every command.
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--config <path>` | `$GITCRAWL_CONFIG` or default | Override config path |
+| `--github-token-command <path>` | _(off)_ | Absolute executable for managed GitHub credentials; Unix only |
 | `--format text\|json\|log` | `text` | Output format |
 | `--json` | _(off)_ | Shorthand for `--format json` |
 | `--no-color` | _(off)_ | Suppress ANSI color |
@@ -30,22 +31,50 @@ These work on every command.
 
 | Command | Purpose | Detailed docs |
 | --- | --- | --- |
-| `gitcrawl init [--db --portable-store --portable-db --store-dir --json]` | Create config, database, runtime directories; optionally clone a portable store | [Installation](/installation/), [Portable stores](/portable-stores/) |
-| `gitcrawl doctor [--json]` | Health check for config, database, credentials, model selection, repo/thread counts | [Configuration](/configuration/#gitcrawl-doctor) |
+| `gitcrawl init [--db --runtime-dir --portable-store --portable-db --store-dir --json]` | Create config, local database, and runtime directories; isolate all local paths under one root or clone a portable store | [Configuration](/configuration/#path-selection-edge-cases), [Portable stores](/portable-stores/) |
+| `gitcrawl doctor [--json] [--locks]` | Health check for config, database, credentials, model selection, repo/thread counts, and optional SQLite lock diagnostics | [Configuration](/configuration/#gitcrawl-doctor) |
 | `gitcrawl metadata [--json]` | Print the crawlkit command/control manifest for launchers and automation | — |
 | `gitcrawl status [--json]` | Print read-only archive status, database inventory, and control state | — |
 | `gitcrawl configure [--summary-model --embed-model --embedding-basis --json]` | Update model fields in `config.toml` | [Configuration](/configuration/#gitcrawl-configure) |
 | `gitcrawl version` | Print version | — |
 
+## Repository metrics
+
+| Command | Purpose | Docs |
+| --- | --- | --- |
+| `gitcrawl metrics collect --config metrics.json [--json]` | Observe stars, forks, actual watchers, open PRs/issues, optional daily clones, and stable releases in a separate database | [Repository metrics](/metrics/) |
+| `gitcrawl metrics import --config metrics.json [--json]` | Atomically import scoped NDJSON history from stdin, preserving NULLs and IDs | [Repository metrics](/metrics/#storage-imports-and-failures) |
+| `gitcrawl metrics status --config metrics.json [--json]` | Inspect the metrics database without writes or network calls | [Repository metrics](/metrics/) |
+
+For `metrics`, `--config` selects an independent JSON config; it never selects or
+initializes the normal thread archive. No embedding or model calls are made.
+
 ## Sync
 
 | Command | Purpose | Docs |
 | --- | --- | --- |
-| `gitcrawl sync owner/repo [--state --since --numbers <refs> --limit --include-comments --include-pr-details --with pr-details --json]` | Sync issues and PRs from GitHub into local SQLite | [Sync](/sync/) |
-| `gitcrawl refresh owner/repo [--no-sync --no-embed --no-cluster ...]` | Wrapper that runs sync → embed → cluster | [Refresh and embed](/refresh-and-embed/) |
+| `gitcrawl sync owner/repo [--state --since --numbers <refs> --limit --include-comments --include-pr-details --with pr-details --graphql-history --force --progress-file <absolute-path> --json]` | Sync issues and PRs from GitHub into local SQLite | [Sync](/sync/) |
+| `gitcrawl analytics owner/repo [--apply --enrich --watch --once --json]` | Audit/repair source publication dates, enrich stable identities, and maintain GraphQL updates | [Analytics source preparation](/analytics-source/) |
+| `gitcrawl sync-failures owner/repo [--include-resolved --limit N --json]` | List failed issue, comment, and PR hydration attempts and optional resolved history | [Sync](/sync/#hydration-depth) |
+| `gitcrawl coverage [owner/repo \| --repos owner/a,owner/b] [--min-missing-pr-details N --json]` | Report archive, PR-detail, and enrichment coverage/freshness | — |
+| `gitcrawl fill-pr-details owner/repo [--limit --order --batch-size --reserve-rate-limit --include-comments --json-progress --json]` | Hydrate locally missing pull request detail rows in bounded batches | — |
+| `gitcrawl capture owner/repo [--schema gitcrawl.capture.v1 --since RFC3339 --output path --json]` | Export a deterministic code-free conversation snapshot | [Conversation capture](/capture/) |
+| `gitcrawl refresh owner/repo [--with pr-details --no-sync --no-embed --no-cluster --strict-vectors ...]` | Wrapper that runs sync → embed → cluster | [Refresh and embed](/refresh-and-embed/) |
 | `gitcrawl embed owner/repo [--number <ref> --limit --force --include-closed --json]` | Generate OpenAI embeddings for thread documents | [Refresh and embed](/refresh-and-embed/#embed) |
 | `gitcrawl runs owner/repo [--kind sync\|embedding\|cluster --limit --json]` | List recorded run history | [Refresh and embed](/refresh-and-embed/#runs) |
 | `gitcrawl code index owner/repo [--path --max-file-bytes --max-total-bytes --max-files --json]` | Index tracked text files from a local Git checkout | [Code indexing](/code-index/) |
+
+`fill-pr-details --reserve-rate-limit` defaults to a floor of 1500 remaining
+requests. Before every costful GitHub request, Gitcrawl reads `/rate_limit` and
+stops when the latest shared-token snapshot shows that dispatching the next
+request would cross that floor. The live probe observes other processes and
+tools that share the token. This is best-effort because an unrelated consumer
+can spend quota between the probe and request; the 1500 default provides
+concurrency headroom. Pass `--reserve-rate-limit N` to choose another floor.
+An incomplete fill, including a quota stop, exits nonzero while returning the
+counts already committed. See [partial failures](/sync/#partial-failures).
+
+For an end-to-end first-run sequence that combines `status --json`, `doctor --json`, `sync --numbers`, bounded `--sync-if-stale` search, `gitcrawl runs`, and Octopool live reads, see the [maintainer archive workflow](/maintainer-archive/).
 
 ## Inspect
 
@@ -54,7 +83,7 @@ These work on every command.
 | `gitcrawl threads owner/repo [--include-closed --numbers --limit --json]` | List threads from local cache | — |
 | `gitcrawl search owner/repo --query <text> [--scope threads\|code\|all --mode keyword\|semantic\|hybrid --limit --json]` | Local thread/source search (direct mode) | [Search](/search/) |
 | `gitcrawl search issues\|prs <query> -R owner/repo [--state --json --limit --sync-if-stale]` | Local search (`gh search` shape) | [Search](/search/#gh-search-compatibility-mode) |
-| `gitcrawl neighbors owner/repo --number <ref> [--limit --threshold --json]` | Vector-similar threads to a specific issue/PR | [Clustering](/clustering/#find-similar-threads-neighbors) |
+| `gitcrawl neighbors owner/repo --number <ref> [--limit --threshold --include-closed --open-at --created-after --merged-after --json]` | Vector-similar threads to a specific issue/PR | [Clustering](/clustering/#find-similar-threads-neighbors) |
 
 ## Thread References
 
@@ -66,19 +95,27 @@ Commands that accept a thread number also accept thread references:
 - scoped references: `owner/repo#123`
 - full GitHub issue or pull request URLs
 
-This applies to `sync --numbers`, `threads --numbers`, `embed --number`,
+This applies to `sync --numbers`, `threads --numbers`, `summarize --number`, `embed --number`,
 `neighbors --number`, all governance `--number` flags, and TUI jump input.
+
+## Summaries and embeddings
+
+| Command | Purpose |
+| --- | --- |
+| `gitcrawl summarize owner/repo [--number --limit --force --include-closed --json]` | Generate compact key summaries for current thread revisions |
+| `gitcrawl embed owner/repo [--number --limit --force --include-closed --json]` | Generate thread vectors using the configured embedding basis |
 
 ## Cluster
 
 | Command | Purpose | Docs |
 | --- | --- | --- |
-| `gitcrawl cluster owner/repo [--threshold --min-size --max-cluster-size --k --cross-kind-threshold --limit --model --basis --include-closed --json]` | Build durable clusters from vectors | [Clustering](/clustering/#generate-clusters) |
+| `gitcrawl cluster owner/repo [--threshold --min-size --max-cluster-size --k --cross-kind-threshold --limit --model --basis --include-closed --strict-vectors --json]` | Build durable clusters from vectors | [Clustering](/clustering/#generate-clusters) |
 | `gitcrawl clusters owner/repo [--sort size\|recent\|oldest --min-size --limit --hide-closed --json]` | Latest-run cluster summary, merged with closed durable rows | [Clustering](/clustering/#list-clusters) |
 | `gitcrawl clusters-report owner/repo [--sort size\|recent\|oldest --min-size --limit --member-limit --body-chars --hide-closed --json]` | Markdown or JSON report for top display clusters | [Clustering](/clustering/#cluster-report) |
 | `gitcrawl durable-clusters owner/repo [--include-closed --sort --min-size --limit --json]` | Strict durable-cluster audit view | [Clustering](/clustering/#list-clusters) |
 | `gitcrawl cluster-detail owner/repo --id <n> [--source auto\|run\|durable --member-limit --body-chars --hide-closed --json]` | Cluster + members detail | [Clustering](/clustering/#inspect-a-cluster) |
 | `gitcrawl cluster-explain owner/repo --id <n> [...]` | Alias for `cluster-detail` | [Clustering](/clustering/#inspect-a-cluster) |
+| `gitcrawl cluster-candidates owner/repo [--generation N --generations --limit N --members --rollback --json]` | Run-scoped computed candidate generations | [Clustering](/clustering/#computed-candidate-generations) |
 
 ## Governance
 
@@ -115,12 +152,14 @@ octopool gh api repos/openclaw/openclaw/pulls/123
 
 | Command | Purpose | Docs |
 | --- | --- | --- |
-| `gitcrawl portable prune [--body-chars --no-vacuum --json]` | Build a compact portable v2 backup and (optionally) `VACUUM` for publishing | [Portable stores](/portable-stores/#publishing-gitcrawl-portable-prune) |
+| `gitcrawl portable refresh --expected-remote URL [--store-dir PATH --portable-db PATH --branch main --git PATH --timeout 2m --min-free-bytes N --max-growth-bytes N --json]` | Validate and fast-forward a clean configured subscriber without regenerating config or invoking repair | [Portable stores](/portable-stores/#routine-subscriber-refresh) |
+| `gitcrawl portable prune [--body-chars --no-vacuum --include-sync-failures --no-publish --json]` | Build a compact portable v2 backup and (optionally) `VACUUM` for publishing | [Portable stores](/portable-stores/#publishing-gitcrawl-portable-prune) |
+| `gitcrawl portable export --profile current-state-v1 --output-dir PATH [--repository owner/repo --body-chars --database-name --public-path --max-bytes --json]` | Create a validated, optionally repository-scoped database-and-manifest generation without changing or publishing the active database | [Portable stores](/portable-stores/#derived-generations-gitcrawl-portable-export) |
 
 ## Not yet implemented
 
 These appear in `SPEC.md` but currently return a "not implemented" error. They are reserved for future versions:
 
-`summarize`, `key-summaries`, `merge-clusters`, `split-cluster`, `export-sync`, `import-sync`, `validate-sync`, `portable-size`, `sync-status`, `optimize`, `completion`
+`key-summaries`, `merge-clusters`, `split-cluster`, `export-sync`, `import-sync`, `validate-sync`, `portable-size`, `sync-status`, `optimize`, `completion`
 
 If you need any of these to land sooner, [open an issue](https://github.com/openclaw/gitcrawl/issues).
