@@ -3,15 +3,14 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 	"unicode/utf8"
 )
 
 type ClusterSummary struct {
+	ClusterIdentityContext
 	ID                     int64  `json:"id"`
 	Source                 string `json:"source,omitempty"`
 	StableSlug             string `json:"stable_slug"`
@@ -55,40 +54,16 @@ type ClusterMemberDetail struct {
 	ScoreToRepresentative *float64          `json:"score_to_representative,omitempty"`
 	BodySnippet           string            `json:"body_snippet,omitempty"`
 	Summaries             map[string]string `json:"summaries,omitempty"`
+	LastSeenRunID         *string           `json:"last_seen_run_id"`
+	GenerationStatus      string            `json:"generation_status"`
+	RetentionReason       *string           `json:"retention_reason"`
+	RetentionAsOfRunID    *string           `json:"retention_as_of_run_id"`
 }
 
 type ClusterDetail struct {
+	ClusterReadContext
 	Cluster ClusterSummary        `json:"cluster"`
 	Members []ClusterMemberDetail `json:"members"`
-}
-
-type ClusterMemberOverride struct {
-	ClusterID int64  `json:"cluster_id"`
-	ThreadID  int64  `json:"thread_id"`
-	Number    int    `json:"number"`
-	Action    string `json:"action"`
-	Reason    string `json:"reason,omitempty"`
-}
-
-type DurableClusterInput struct {
-	StableKey              string
-	StableSlug             string
-	ClusterType            string
-	RepresentativeThreadID int64
-	Title                  string
-	Members                []DurableClusterMemberInput
-}
-
-type DurableClusterMemberInput struct {
-	ThreadID              int64
-	Role                  string
-	ScoreToRepresentative *float64
-}
-
-type SaveDurableClustersResult struct {
-	RunID        int64 `json:"run_id"`
-	ClusterCount int   `json:"cluster_count"`
-	MemberCount  int   `json:"member_count"`
 }
 
 func (s *Store) ListClusterSummaries(ctx context.Context, options ClusterSummaryOptions) ([]ClusterSummary, error) {
@@ -96,6 +71,13 @@ func (s *Store) ListClusterSummaries(ctx context.Context, options ClusterSummary
 }
 
 func (s *Store) ListDisplayClusterSummaries(ctx context.Context, options ClusterSummaryOptions) ([]ClusterSummary, error) {
+	read, err := s.ClusterReadSelection(ctx, options.RepoID, "")
+	if err != nil {
+		return nil, err
+	}
+	if read.Selection.Source == ClusterSourceDurable {
+		return s.listDurableClusterSummaries(ctx, options)
+	}
 	raw, err := s.ListRunClusterSummaries(ctx, options)
 	if err != nil {
 		return nil, err
@@ -154,7 +136,7 @@ func (s *Store) ListRunClusterSummaries(ctx context.Context, options ClusterSumm
 		having = memberCountExpr + ` >= ? and c.close_reason_local is null and sum(case when t.closed_at_local is not null or t.state <> 'open' then 1 else 0 end) < c.member_count`
 	}
 	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.q().QueryContext(ctx, `
 		select c.id, c.representative_thread_id,
 			rt.number, rt.kind, rt.title,
 			`+memberCountExpr+` as member_count,
@@ -232,7 +214,7 @@ func (s *Store) listDurableClusterSummaries(ctx context.Context, options Cluster
 		memberThreadJoin += ` and ` + durableVisibleMemberPredicate("cg", "cm", "mt")
 	}
 
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.q().QueryContext(ctx, `
 		select cg.id, cg.stable_slug, cg.status, cg.title, cg.representative_thread_id,
 			rt.number, rt.kind, rt.title,
 			count(mt.id) as member_count,
@@ -281,7 +263,7 @@ func (s *Store) listClosedDurableClusterSummaries(ctx context.Context, options C
 	if minSize <= 0 {
 		minSize = 1
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.q().QueryContext(ctx, `
 		select cg.id, cg.stable_slug, cg.status, cg.title, cg.representative_thread_id,
 			rt.number, rt.kind, rt.title,
 			count(cm.thread_id) as member_count,
@@ -450,6 +432,11 @@ func idSetOverlapRatio(left, right map[int64]bool) float64 {
 }
 
 func (s *Store) ClusterDetail(ctx context.Context, options ClusterDetailOptions) (ClusterDetail, error) {
+	if s.queries == nil {
+		var result ClusterDetail
+		err := s.WithTx(ctx, func(tx *Store) error { var e error; result, e = tx.ClusterDetail(ctx, options); return e })
+		return result, err
+	}
 	source, err := normalizeClusterDetailSource(options.Source)
 	if err != nil {
 		return ClusterDetail{}, err
@@ -458,6 +445,13 @@ func (s *Store) ClusterDetail(ctx context.Context, options ClusterDetailOptions)
 	case ClusterSourceRun:
 		return s.RunClusterDetail(ctx, options)
 	case ClusterSourceDurable:
+		return s.DurableClusterDetail(ctx, options)
+	}
+	read, err := s.ClusterReadSelection(ctx, options.RepoID, "")
+	if err != nil {
+		return ClusterDetail{}, err
+	}
+	if read.Selection.Source == ClusterSourceDurable {
 		return s.DurableClusterDetail(ctx, options)
 	}
 	detail, err := s.RunClusterDetail(ctx, options)
@@ -498,7 +492,7 @@ func (s *Store) DurableClusterDetail(ctx context.Context, options ClusterDetailO
 		where += ` and cm.state = 'active' and ` + durableVisibleMemberPredicate("cg", "cm", "t")
 	}
 	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.q().QueryContext(ctx, `
 		select cm.role, cm.state, cm.score_to_representative,
 			`+s.threadSelectColumns(ctx, "t")+`
 		from cluster_memberships cm
@@ -537,7 +531,45 @@ func (s *Store) DurableClusterDetail(ctx context.Context, options ClusterDetailO
 			members[index].Summaries = summaryMap
 		}
 	}
-	return ClusterDetail{Cluster: summary, Members: members}, nil
+	read, err := s.ClusterReadSelection(ctx, options.RepoID, ClusterSourceDurable)
+	if err != nil {
+		return ClusterDetail{}, err
+	}
+	markers, err := s.q().QueryContext(ctx, "SELECT thread_id,last_seen_run_id FROM cluster_memberships WHERE cluster_id=?", options.ClusterID)
+	if err != nil {
+		return ClusterDetail{}, err
+	}
+	byID := map[int64]*int64{}
+	for markers.Next() {
+		var id int64
+		var run sql.NullInt64
+		if err = markers.Scan(&id, &run); err != nil {
+			markers.Close()
+			return ClusterDetail{}, err
+		}
+		if run.Valid {
+			v := run.Int64
+			byID[id] = &v
+		}
+	}
+	err = markers.Err()
+	markers.Close()
+	if err != nil {
+		return ClusterDetail{}, err
+	}
+	summary.ClusterIdentityContext = clusterIdentityContext(summary.ID, read)
+	for i := range members {
+		run := byID[members[i].Thread.ID]
+		members[i].LastSeenRunID, members[i].GenerationStatus, err = clusterMemberGeneration(run, read)
+		if err != nil {
+			return ClusterDetail{}, err
+		}
+		members[i].RetentionReason, members[i].RetentionAsOfRunID, err = clusterMemberRetention(members[i].LastSeenRunID, summary.ClusterIdentityContext, members[i].GenerationStatus)
+		if err != nil {
+			return ClusterDetail{}, err
+		}
+	}
+	return ClusterDetail{ClusterReadContext: read, Cluster: summary, Members: members}, nil
 }
 
 func (s *Store) RunClusterDetail(ctx context.Context, options ClusterDetailOptions) (ClusterDetail, error) {
@@ -555,7 +587,7 @@ func (s *Store) RunClusterDetail(ctx context.Context, options ClusterDetailOptio
 		where += ` and t.state = 'open' and t.closed_at_local is null`
 	}
 	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.q().QueryContext(ctx, `
 		select case when t.id = c.representative_thread_id then 'representative' else 'member' end as role,
 			'active' as state,
 			cm.score_to_representative,
@@ -598,7 +630,15 @@ func (s *Store) RunClusterDetail(ctx context.Context, options ClusterDetailOptio
 			members[index].Summaries = summaryMap
 		}
 	}
-	return ClusterDetail{Cluster: summary, Members: members}, nil
+	read, err := s.ClusterReadSelection(ctx, options.RepoID, ClusterSourceRun)
+	if err != nil {
+		return ClusterDetail{}, err
+	}
+	summary.ClusterIdentityContext = ClusterIdentityContext{IdentityQuarantineStatus: "not_recorded"}
+	for i := range members {
+		members[i].GenerationStatus = "legacy_unknown"
+	}
+	return ClusterDetail{ClusterReadContext: read, Cluster: summary, Members: members}, nil
 }
 
 func (s *Store) ClusterIDForThreadNumber(ctx context.Context, repoID int64, number int, includeClosed bool) (int64, error) {
@@ -607,7 +647,7 @@ func (s *Store) ClusterIDForThreadNumber(ctx context.Context, repoID int64, numb
 	if !includeClosed {
 		where += ` and cm.state = 'active' and cg.status = 'active' and cg.closed_at is null and ` + durableVisibleMemberPredicate("cg", "cm", "t")
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.q().QueryRowContext(ctx, `
 		select cg.id
 		from threads t
 		join cluster_memberships cm on cm.thread_id = t.id
@@ -630,618 +670,6 @@ func (s *Store) ClusterIDForThreadNumber(ctx context.Context, repoID int64, numb
 	return clusterID, nil
 }
 
-func (s *Store) CloseClusterLocally(ctx context.Context, repoID, clusterID int64, reason string) error {
-	if repoID <= 0 {
-		return fmt.Errorf("repo id must be positive")
-	}
-	if clusterID <= 0 {
-		return fmt.Errorf("cluster id must be positive")
-	}
-	reason = strings.TrimSpace(reason)
-	if reason == "" {
-		reason = "local close"
-	}
-	now := time.Now().UTC().Format(timeLayout)
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin close cluster: %w", err)
-	}
-	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `
-		update cluster_groups
-		set status = 'closed', closed_at = ?, updated_at = ?
-		where repo_id = ? and id = ?
-	`, now, now, repoID, clusterID)
-	if err != nil {
-		return fmt.Errorf("close cluster locally: %w", err)
-	}
-	if affected, err := result.RowsAffected(); err == nil && affected == 0 {
-		return fmt.Errorf("cluster %d was not found", clusterID)
-	}
-	if _, err := tx.ExecContext(ctx, `
-		insert into cluster_closures(cluster_id, reason, actor_kind, created_at, updated_at)
-		values(?, ?, 'local', ?, ?)
-		on conflict(cluster_id) do update set
-			reason = excluded.reason,
-			actor_kind = excluded.actor_kind,
-			updated_at = excluded.updated_at
-	`, clusterID, reason, now, now); err != nil {
-		return fmt.Errorf("record cluster closure: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit close cluster: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) ReopenClusterLocally(ctx context.Context, repoID, clusterID int64) error {
-	if repoID <= 0 {
-		return fmt.Errorf("repo id must be positive")
-	}
-	if clusterID <= 0 {
-		return fmt.Errorf("cluster id must be positive")
-	}
-	now := time.Now().UTC().Format(timeLayout)
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin reopen cluster: %w", err)
-	}
-	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `
-		update cluster_groups
-		set status = 'active', closed_at = null, updated_at = ?
-		where repo_id = ? and id = ?
-	`, now, repoID, clusterID)
-	if err != nil {
-		return fmt.Errorf("reopen cluster locally: %w", err)
-	}
-	if affected, err := result.RowsAffected(); err == nil && affected == 0 {
-		return fmt.Errorf("cluster %d was not found", clusterID)
-	}
-	if _, err := tx.ExecContext(ctx, `delete from cluster_closures where cluster_id = ?`, clusterID); err != nil {
-		return fmt.Errorf("clear cluster closure: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit reopen cluster: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) SaveDurableClusters(ctx context.Context, repoID int64, inputs []DurableClusterInput) (SaveDurableClustersResult, error) {
-	return s.saveDurableClusters(ctx, repoID, inputs, false)
-}
-
-func (s *Store) SaveCompleteDurableClusters(ctx context.Context, repoID int64, inputs []DurableClusterInput) (SaveDurableClustersResult, error) {
-	return s.saveDurableClusters(ctx, repoID, inputs, true)
-}
-
-func (s *Store) saveDurableClusters(ctx context.Context, repoID int64, inputs []DurableClusterInput, retireMissing bool) (SaveDurableClustersResult, error) {
-	if repoID <= 0 {
-		return SaveDurableClustersResult{}, fmt.Errorf("repo id must be positive")
-	}
-	now := time.Now().UTC().Format(timeLayout)
-	result := SaveDurableClustersResult{ClusterCount: len(inputs)}
-	err := s.WithTx(ctx, func(tx *Store) error {
-		runID, err := tx.insertClusterRun(ctx, repoID, now)
-		if err != nil {
-			return err
-		}
-		result.RunID = runID
-		seenClusterIDs := make([]int64, 0, len(inputs))
-		for _, input := range inputs {
-			if len(input.Members) == 0 {
-				return fmt.Errorf("durable cluster %q has no members", strings.TrimSpace(input.StableKey))
-			}
-			clusterID, err := tx.upsertDurableCluster(ctx, repoID, runID, input, now)
-			if err != nil {
-				return err
-			}
-			seenClusterIDs = append(seenClusterIDs, clusterID)
-			memberIDs := make([]int64, 0, len(input.Members))
-			for _, member := range input.Members {
-				if member.ThreadID <= 0 {
-					return fmt.Errorf("cluster %q has invalid member thread id", input.StableKey)
-				}
-				role := strings.TrimSpace(member.Role)
-				if role == "" {
-					role = "member"
-				}
-				if _, err := tx.q().ExecContext(ctx, `
-					insert into cluster_memberships(
-						cluster_id, thread_id, role, state, score_to_representative,
-						first_seen_run_id, last_seen_run_id, added_by, added_reason_json, created_at, updated_at
-					)
-					values(?, ?, ?, 'active', ?, ?, ?, 'cluster', '{}', ?, ?)
-					on conflict(cluster_id, thread_id) do update set
-						role = excluded.role,
-						state = 'active',
-						score_to_representative = excluded.score_to_representative,
-						last_seen_run_id = excluded.last_seen_run_id,
-						removed_by = null,
-						removed_reason_json = null,
-						removed_at = null,
-						updated_at = excluded.updated_at
-				`, clusterID, member.ThreadID, role, nullableFloat(member.ScoreToRepresentative), runID, runID, now, now); err != nil {
-					return fmt.Errorf("upsert durable cluster member: %w", err)
-				}
-				memberIDs = append(memberIDs, member.ThreadID)
-				result.MemberCount++
-			}
-			if err := tx.markMissingClusterMembersRemoved(ctx, clusterID, memberIDs, now); err != nil {
-				return err
-			}
-			if err := tx.applyClusterOverrides(ctx, repoID, clusterID, now); err != nil {
-				return err
-			}
-		}
-		if retireMissing {
-			if err := tx.markMissingDurableClustersRetired(ctx, repoID, runID, seenClusterIDs, now); err != nil {
-				return err
-			}
-		}
-		if len(inputs) > 0 {
-			if _, err := tx.q().ExecContext(ctx, `
-					delete from cluster_groups
-				where repo_id = ?
-				  and cluster_type = 'similarity'
-			`, repoID); err != nil {
-				return fmt.Errorf("delete legacy similarity clusters: %w", err)
-			}
-			for _, clusterID := range seenClusterIDs {
-				if err := tx.ensureActiveClusterRepresentative(ctx, repoID, clusterID, now); err != nil {
-					return err
-				}
-			}
-		}
-		if _, err := tx.q().ExecContext(ctx, `
-			update cluster_runs
-			set finished_at = ?, stats_json = ?
-			where id = ?
-		`, now, fmt.Sprintf(`{"cluster_count":%d,"member_count":%d}`, result.ClusterCount, result.MemberCount), runID); err != nil {
-			return fmt.Errorf("finish cluster run: %w", err)
-		}
-		return nil
-	})
-	if err != nil {
-		return SaveDurableClustersResult{}, err
-	}
-	return result, nil
-}
-
-func (s *Store) ExcludeClusterMemberLocally(ctx context.Context, repoID, clusterID int64, number int, reason string) (ClusterMemberOverride, error) {
-	if repoID <= 0 {
-		return ClusterMemberOverride{}, fmt.Errorf("repo id must be positive")
-	}
-	if clusterID <= 0 {
-		return ClusterMemberOverride{}, fmt.Errorf("cluster id must be positive")
-	}
-	if number <= 0 {
-		return ClusterMemberOverride{}, fmt.Errorf("thread number must be positive")
-	}
-	reason = strings.TrimSpace(reason)
-	if reason == "" {
-		reason = "local exclude"
-	}
-	var result ClusterMemberOverride
-	err := s.WithTx(ctx, func(tx *Store) error {
-		threadID, err := tx.clusterMemberThreadID(ctx, repoID, clusterID, number, false)
-		if err != nil {
-			return err
-		}
-		now := time.Now().UTC().Format(timeLayout)
-		reasonJSON, err := json.Marshal(map[string]string{"reason": reason})
-		if err != nil {
-			return fmt.Errorf("encode override reason: %w", err)
-		}
-		if _, err := tx.q().ExecContext(ctx, `
-			update cluster_memberships
-			set state = 'excluded', removed_by = 'local', removed_reason_json = ?, removed_at = ?, updated_at = ?
-			where cluster_id = ? and thread_id = ?
-		`, string(reasonJSON), now, now, clusterID, threadID); err != nil {
-			return fmt.Errorf("exclude cluster member: %w", err)
-		}
-		if _, err := tx.q().ExecContext(ctx, `delete from cluster_overrides where cluster_id = ? and thread_id = ? and action in ('include', 'canonical')`, clusterID, threadID); err != nil {
-			return fmt.Errorf("clear stale member overrides: %w", err)
-		}
-		if err := tx.upsertClusterOverride(ctx, repoID, clusterID, threadID, "exclude", reason, now); err != nil {
-			return err
-		}
-		if err := tx.ensureActiveClusterRepresentative(ctx, repoID, clusterID, now); err != nil {
-			return err
-		}
-		result = ClusterMemberOverride{ClusterID: clusterID, ThreadID: threadID, Number: number, Action: "exclude", Reason: reason}
-		return nil
-	})
-	if err != nil {
-		return ClusterMemberOverride{}, err
-	}
-	return result, nil
-}
-
-func (s *Store) IncludeClusterMemberLocally(ctx context.Context, repoID, clusterID int64, number int, reason string) (ClusterMemberOverride, error) {
-	if repoID <= 0 {
-		return ClusterMemberOverride{}, fmt.Errorf("repo id must be positive")
-	}
-	if clusterID <= 0 {
-		return ClusterMemberOverride{}, fmt.Errorf("cluster id must be positive")
-	}
-	if number <= 0 {
-		return ClusterMemberOverride{}, fmt.Errorf("thread number must be positive")
-	}
-	reason = strings.TrimSpace(reason)
-	if reason == "" {
-		reason = "local include"
-	}
-	var result ClusterMemberOverride
-	err := s.WithTx(ctx, func(tx *Store) error {
-		threadID, err := tx.clusterMemberThreadID(ctx, repoID, clusterID, number, false)
-		if err != nil {
-			return err
-		}
-		now := time.Now().UTC().Format(timeLayout)
-		update, err := tx.q().ExecContext(ctx, `
-			update cluster_memberships
-			set state = 'active', removed_by = null, removed_reason_json = null, removed_at = null, updated_at = ?
-			where cluster_id = ? and thread_id = ?
-		`, now, clusterID, threadID)
-		if err != nil {
-			return fmt.Errorf("include cluster member: %w", err)
-		}
-		if affected, err := update.RowsAffected(); err == nil && affected == 0 {
-			return fmt.Errorf("thread #%d is not in cluster %d", number, clusterID)
-		}
-		if _, err := tx.q().ExecContext(ctx, `delete from cluster_overrides where cluster_id = ? and thread_id = ? and action = 'exclude'`, clusterID, threadID); err != nil {
-			return fmt.Errorf("clear exclude override: %w", err)
-		}
-		if err := tx.upsertClusterOverride(ctx, repoID, clusterID, threadID, "include", reason, now); err != nil {
-			return err
-		}
-		if err := tx.ensureActiveClusterRepresentative(ctx, repoID, clusterID, now); err != nil {
-			return err
-		}
-		result = ClusterMemberOverride{ClusterID: clusterID, ThreadID: threadID, Number: number, Action: "include", Reason: reason}
-		return nil
-	})
-	if err != nil {
-		return ClusterMemberOverride{}, err
-	}
-	return result, nil
-}
-
-func (s *Store) SetClusterCanonicalLocally(ctx context.Context, repoID, clusterID int64, number int, reason string) (ClusterMemberOverride, error) {
-	if repoID <= 0 {
-		return ClusterMemberOverride{}, fmt.Errorf("repo id must be positive")
-	}
-	if clusterID <= 0 {
-		return ClusterMemberOverride{}, fmt.Errorf("cluster id must be positive")
-	}
-	if number <= 0 {
-		return ClusterMemberOverride{}, fmt.Errorf("thread number must be positive")
-	}
-	reason = strings.TrimSpace(reason)
-	if reason == "" {
-		reason = "local canonical"
-	}
-	var result ClusterMemberOverride
-	err := s.WithTx(ctx, func(tx *Store) error {
-		threadID, err := tx.clusterMemberThreadID(ctx, repoID, clusterID, number, true)
-		if err != nil {
-			return err
-		}
-		now := time.Now().UTC().Format(timeLayout)
-		if _, err := tx.q().ExecContext(ctx, `
-			update cluster_memberships
-			set role = case when thread_id = ? then 'canonical' else 'member' end,
-				updated_at = ?
-			where cluster_id = ? and state = 'active'
-		`, threadID, now, clusterID); err != nil {
-			return fmt.Errorf("set canonical member roles: %w", err)
-		}
-		update, err := tx.q().ExecContext(ctx, `
-			update cluster_groups
-			set representative_thread_id = ?, updated_at = ?
-			where repo_id = ? and id = ?
-		`, threadID, now, repoID, clusterID)
-		if err != nil {
-			return fmt.Errorf("set cluster canonical: %w", err)
-		}
-		if affected, err := update.RowsAffected(); err == nil && affected == 0 {
-			return fmt.Errorf("cluster %d was not found", clusterID)
-		}
-		if _, err := tx.q().ExecContext(ctx, `delete from cluster_overrides where cluster_id = ? and action = 'canonical'`, clusterID); err != nil {
-			return fmt.Errorf("clear canonical overrides: %w", err)
-		}
-		if _, err := tx.q().ExecContext(ctx, `delete from cluster_overrides where cluster_id = ? and thread_id = ? and action = 'exclude'`, clusterID, threadID); err != nil {
-			return fmt.Errorf("clear exclude override: %w", err)
-		}
-		if err := tx.upsertClusterOverride(ctx, repoID, clusterID, threadID, "canonical", reason, now); err != nil {
-			return err
-		}
-		result = ClusterMemberOverride{ClusterID: clusterID, ThreadID: threadID, Number: number, Action: "canonical", Reason: reason}
-		return nil
-	})
-	if err != nil {
-		return ClusterMemberOverride{}, err
-	}
-	return result, nil
-}
-
-func (s *Store) clusterMemberThreadID(ctx context.Context, repoID, clusterID int64, number int, requireActive bool) (int64, error) {
-	where := `cg.repo_id = ? and cg.id = ? and t.repo_id = ? and t.number = ?`
-	if requireActive {
-		where += ` and cm.state = 'active'`
-	}
-	row := s.q().QueryRowContext(ctx, `
-		select t.id
-		from cluster_groups cg
-		join cluster_memberships cm on cm.cluster_id = cg.id
-		join threads t on t.id = cm.thread_id
-		where `+where+`
-		limit 1
-	`, repoID, clusterID, repoID, number)
-	var threadID int64
-	if err := row.Scan(&threadID); err != nil {
-		if err == sql.ErrNoRows {
-			if requireActive {
-				return 0, fmt.Errorf("active thread #%d is not in cluster %d", number, clusterID)
-			}
-			return 0, fmt.Errorf("thread #%d is not in cluster %d", number, clusterID)
-		}
-		return 0, fmt.Errorf("find cluster member: %w", err)
-	}
-	return threadID, nil
-}
-
-func (s *Store) insertClusterRun(ctx context.Context, repoID int64, now string) (int64, error) {
-	var runID int64
-	if err := s.q().QueryRowContext(ctx, `
-		insert into cluster_runs(repo_id, scope, status, started_at)
-		values(?, 'durable', 'success', ?)
-		returning id
-	`, repoID, now).Scan(&runID); err != nil {
-		return 0, fmt.Errorf("insert cluster run: %w", err)
-	}
-	return runID, nil
-}
-
-func (s *Store) upsertDurableCluster(ctx context.Context, repoID, runID int64, input DurableClusterInput, now string) (int64, error) {
-	stableKey := strings.TrimSpace(input.StableKey)
-	if stableKey == "" {
-		return 0, fmt.Errorf("durable cluster stable key is required")
-	}
-	stableSlug := strings.TrimSpace(input.StableSlug)
-	if stableSlug == "" {
-		stableSlug = stableKey
-	}
-	clusterType := strings.TrimSpace(input.ClusterType)
-	if clusterType == "" {
-		clusterType = "duplicate_candidate"
-	}
-	var clusterID int64
-	if err := s.q().QueryRowContext(ctx, `
-		insert into cluster_groups(
-			repo_id, stable_key, stable_slug, status, cluster_type, representative_thread_id, title, created_at, updated_at
-		)
-		values(?, ?, ?, 'active', ?, ?, ?, ?, ?)
-			on conflict(repo_id, stable_key) do update set
-				status = case
-					when exists(select 1 from cluster_closures where cluster_id = cluster_groups.id and actor_kind = 'local') then cluster_groups.status
-					else 'active'
-				end,
-				stable_slug = excluded.stable_slug,
-				cluster_type = excluded.cluster_type,
-				representative_thread_id = case
-					when exists(select 1 from cluster_closures where cluster_id = cluster_groups.id and actor_kind = 'local') then cluster_groups.representative_thread_id
-					else excluded.representative_thread_id
-				end,
-				title = excluded.title,
-				closed_at = case
-					when exists(select 1 from cluster_closures where cluster_id = cluster_groups.id and actor_kind = 'local') then cluster_groups.closed_at
-					else null
-				end,
-				updated_at = excluded.updated_at
-			returning id
-		`, repoID, stableKey, stableSlug, clusterType, nullInt(input.RepresentativeThreadID), nullString(input.Title), now, now).Scan(&clusterID); err != nil {
-		return 0, fmt.Errorf("upsert durable cluster: %w", err)
-	}
-	if _, err := s.q().ExecContext(ctx, `
-		insert into cluster_events(cluster_id, run_id, event_type, actor_kind, payload_json, created_at)
-		values(?, ?, 'seen', 'cluster', '{}', ?)
-	`, clusterID, runID, now); err != nil {
-		return 0, fmt.Errorf("record durable cluster event: %w", err)
-	}
-	return clusterID, nil
-}
-
-func (s *Store) markMissingDurableClustersRetired(ctx context.Context, repoID, runID int64, seenClusterIDs []int64, now string) error {
-	where := `repo_id = ? and status = 'active' and closed_at is null`
-	args := []any{now, now, repoID}
-	if len(seenClusterIDs) > 0 {
-		placeholders := make([]string, 0, len(seenClusterIDs))
-		for _, id := range seenClusterIDs {
-			placeholders = append(placeholders, "?")
-			args = append(args, id)
-		}
-		where += ` and id not in (` + strings.Join(placeholders, ",") + `)`
-	}
-	rows, err := s.q().QueryContext(ctx, `
-		update cluster_groups
-		set status = 'closed',
-			closed_at = ?,
-			updated_at = ?
-		where `+where+`
-		returning id
-	`, args...)
-	if err != nil {
-		return fmt.Errorf("retire missing durable clusters: %w", err)
-	}
-	defer rows.Close()
-
-	var retired []int64
-	for rows.Next() {
-		var clusterID int64
-		if err := rows.Scan(&clusterID); err != nil {
-			return fmt.Errorf("scan retired durable cluster: %w", err)
-		}
-		retired = append(retired, clusterID)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate retired durable clusters: %w", err)
-	}
-	for _, clusterID := range retired {
-		if _, err := s.q().ExecContext(ctx, `
-			insert into cluster_events(cluster_id, run_id, event_type, actor_kind, payload_json, created_at)
-			values(?, ?, 'retired', 'cluster', '{"reason":"not seen in latest cluster run"}', ?)
-		`, clusterID, runID, now); err != nil {
-			return fmt.Errorf("record retired durable cluster event: %w", err)
-		}
-	}
-	return nil
-}
-
-func (s *Store) markMissingClusterMembersRemoved(ctx context.Context, clusterID int64, memberIDs []int64, now string) error {
-	if len(memberIDs) == 0 {
-		return nil
-	}
-	placeholders := make([]string, 0, len(memberIDs))
-	args := []any{`{"reason":"not seen in latest cluster run"}`, now, now, clusterID}
-	for _, id := range memberIDs {
-		placeholders = append(placeholders, "?")
-		args = append(args, id)
-	}
-	if _, err := s.q().ExecContext(ctx, `
-		update cluster_memberships
-		set state = 'removed',
-			removed_by = 'cluster',
-			removed_reason_json = ?,
-			removed_at = ?,
-			updated_at = ?
-		where cluster_id = ?
-			and thread_id not in (`+strings.Join(placeholders, ",")+`)
-			and state = 'active'
-	`, args...); err != nil {
-		return fmt.Errorf("mark missing cluster members removed: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) upsertClusterOverride(ctx context.Context, repoID, clusterID, threadID int64, action, reason, now string) error {
-	if _, err := s.q().ExecContext(ctx, `
-		insert into cluster_overrides(repo_id, cluster_id, thread_id, action, reason, created_at)
-		values(?, ?, ?, ?, ?, ?)
-		on conflict(cluster_id, thread_id, action) do update set
-			reason = excluded.reason,
-			created_at = excluded.created_at
-	`, repoID, clusterID, threadID, action, reason, now); err != nil {
-		return fmt.Errorf("record cluster override: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) applyClusterOverrides(ctx context.Context, repoID, clusterID int64, now string) error {
-	if _, err := s.q().ExecContext(ctx, `
-		update cluster_memberships
-		set state = 'excluded',
-			removed_by = 'local',
-			removed_reason_json = coalesce(removed_reason_json, '{"reason":"local override"}'),
-			removed_at = coalesce(removed_at, ?),
-			updated_at = ?
-		where cluster_id = ?
-			and thread_id in (select thread_id from cluster_overrides where repo_id = ? and cluster_id = ? and action = 'exclude')
-	`, now, now, clusterID, repoID, clusterID); err != nil {
-		return fmt.Errorf("apply exclude overrides: %w", err)
-	}
-	if _, err := s.q().ExecContext(ctx, `
-		update cluster_memberships
-		set state = 'active',
-			removed_by = null,
-			removed_reason_json = null,
-			removed_at = null,
-			updated_at = ?
-		where cluster_id = ?
-			and thread_id in (select thread_id from cluster_overrides where repo_id = ? and cluster_id = ? and action = 'include')
-	`, now, clusterID, repoID, clusterID); err != nil {
-		return fmt.Errorf("apply include overrides: %w", err)
-	}
-	var canonicalThreadID sql.NullInt64
-	err := s.q().QueryRowContext(ctx, `
-		select thread_id
-		from cluster_overrides
-		where repo_id = ? and cluster_id = ? and action = 'canonical'
-		order by created_at desc, id desc
-		limit 1
-	`, repoID, clusterID).Scan(&canonicalThreadID)
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("find canonical override: %w", err)
-	}
-	if canonicalThreadID.Valid {
-		if _, err := s.q().ExecContext(ctx, `
-			update cluster_memberships
-			set role = case when thread_id = ? then 'canonical' else 'member' end,
-				updated_at = ?
-			where cluster_id = ? and state = 'active'
-		`, canonicalThreadID.Int64, now, clusterID); err != nil {
-			return fmt.Errorf("apply canonical override role: %w", err)
-		}
-		if _, err := s.q().ExecContext(ctx, `
-			update cluster_groups
-			set representative_thread_id = null, updated_at = ?
-			where repo_id = ? and id = ?
-				and status = 'active'
-				and closed_at is null
-		`, now, repoID, clusterID); err != nil {
-			return fmt.Errorf("apply canonical override representative: %w", err)
-		}
-	}
-	return s.ensureActiveClusterRepresentative(ctx, repoID, clusterID, now)
-}
-
-func (s *Store) ensureActiveClusterRepresentative(ctx context.Context, repoID, clusterID int64, now string) error {
-	visible := durableVisibleMemberPredicate("cluster_groups", "cm", "t")
-	if _, err := s.q().ExecContext(ctx, `
-		update cluster_groups
-		set representative_thread_id = (
-				select cm.thread_id
-				from cluster_memberships cm
-				join threads t on t.id = cm.thread_id
-				where cm.cluster_id = cluster_groups.id and cm.state = 'active'
-					and `+visible+`
-				order by case cm.role when 'canonical' then 0 when 'representative' then 1 else 2 end,
-					coalesce(cm.score_to_representative, 0) desc,
-					t.number asc
-				limit 1
-			),
-			updated_at = ?
-		where repo_id = ? and id = ?
-			and status = 'active'
-			and closed_at is null
-			and (
-				representative_thread_id is null
-				or representative_thread_id not in (
-					select cm.thread_id
-					from cluster_memberships cm
-					join threads t on t.id = cm.thread_id
-					where cm.cluster_id = ? and cm.state = 'active'
-						and `+visible+`
-				)
-			)
-	`, now, repoID, clusterID, clusterID); err != nil {
-		return fmt.Errorf("refresh cluster representative: %w", err)
-	}
-	return nil
-}
-
-func nullInt(value int64) sql.NullInt64 {
-	return sql.NullInt64{Int64: value, Valid: value != 0}
-}
-
-func nullableFloat(value *float64) sql.NullFloat64 {
-	if value == nil {
-		return sql.NullFloat64{}
-	}
-	return sql.NullFloat64{Float64: *value, Valid: true}
-}
-
 func (s *Store) clusterSummaryByID(ctx context.Context, repoID, clusterID int64, includeClosed bool) (ClusterSummary, error) {
 	where := `cg.repo_id = ? and cg.id = ?`
 	args := []any{repoID, clusterID}
@@ -1256,7 +684,7 @@ func (s *Store) clusterSummaryByID(ctx context.Context, repoID, clusterID int64,
 		left join threads mt on mt.id = cm.thread_id
 			and (` + durableVisibleMemberPredicate("cg", "cm", "mt") + `)`
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.q().QueryRowContext(ctx, `
 		select cg.id, cg.stable_slug, cg.status, cg.title, cg.representative_thread_id,
 			rt.number, rt.kind, rt.title,
 			`+memberCountExpr+` as member_count,
@@ -1299,7 +727,7 @@ func (s *Store) latestRawClusterRunID(ctx context.Context, repoID int64) (int64,
 	if !s.hasTable(ctx, "cluster_runs") || !s.hasTable(ctx, "clusters") {
 		return 0, false, nil
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.q().QueryRowContext(ctx, `
 		select cr.id
 		from cluster_runs cr
 		where cr.repo_id = ?
@@ -1338,7 +766,7 @@ func (s *Store) runClusterSummaryByID(ctx context.Context, repoID, clusterID int
 		updatedAtExpr = `coalesce(max(case when t.state = 'open' and t.closed_at_local is null then coalesce(t.updated_at_gh, t.updated_at) end), c.created_at)`
 		having = memberCountExpr + ` > 0 and c.close_reason_local is null`
 	}
-	row := s.db.QueryRowContext(ctx, `
+	row := s.q().QueryRowContext(ctx, `
 		select c.id, c.representative_thread_id,
 			rt.number, rt.kind, rt.title,
 			`+memberCountExpr+` as member_count,
@@ -1384,11 +812,11 @@ func scanClusterMemberDetail(row interface {
 }, bodyChars int) (ClusterMemberDetail, error) {
 	var member ClusterMemberDetail
 	var score sql.NullFloat64
-	var body, authorLogin, authorType, rawJSON, createdAt, updatedAtGH, closedAt, mergedAt, firstPulled, lastPulled, closedLocal, closeReason sql.NullString
+	var body, authorLogin, authorType, authorAssociation, rawJSON, createdAt, updatedAtGH, closedAt, mergedAt, firstPulled, lastPulled, closedLocal, closeReason sql.NullString
 	var isDraft int
 	if err := row.Scan(&member.Role, &member.State, &score,
 		&member.Thread.ID, &member.Thread.RepoID, &member.Thread.GitHubID, &member.Thread.Number, &member.Thread.Kind, &member.Thread.State, &member.Thread.Title,
-		&body, &authorLogin, &authorType, &member.Thread.HTMLURL, &member.Thread.LabelsJSON, &member.Thread.AssigneesJSON, &rawJSON,
+		&body, &authorLogin, &authorType, &authorAssociation, &member.Thread.HTMLURL, &member.Thread.LabelsJSON, &member.Thread.AssigneesJSON, &rawJSON,
 		&member.Thread.ContentHash, &isDraft, &createdAt, &updatedAtGH, &closedAt, &mergedAt, &firstPulled, &lastPulled, &member.Thread.UpdatedAt,
 		&closedLocal, &closeReason); err != nil {
 		return ClusterMemberDetail{}, fmt.Errorf("scan cluster member: %w", err)
@@ -1400,6 +828,7 @@ func scanClusterMemberDetail(row interface {
 	member.Thread.Body = ""
 	member.Thread.AuthorLogin = authorLogin.String
 	member.Thread.AuthorType = authorType.String
+	member.Thread.AuthorAssociation = authorAssociation.String
 	member.Thread.CreatedAtGitHub = createdAt.String
 	member.Thread.UpdatedAtGitHub = updatedAtGH.String
 	member.Thread.ClosedAtGitHub = closedAt.String
@@ -1426,7 +855,7 @@ func (s *Store) summariesByThreadIDs(ctx context.Context, threadIDs []int64) (ma
 	}
 	out := make(map[int64]map[string]string)
 	if s.hasTable(ctx, "document_summaries") {
-		rows, err := s.db.QueryContext(ctx, `
+		rows, err := s.q().QueryContext(ctx, `
 			select thread_id, summary_kind, summary_text
 			from document_summaries
 			where thread_id in (`+strings.Join(placeholders, ",")+`)
@@ -1440,11 +869,22 @@ func (s *Store) summariesByThreadIDs(ctx context.Context, threadIDs []int64) (ma
 		}
 	}
 	if s.hasTable(ctx, "thread_key_summaries") && s.hasTable(ctx, "thread_revisions") {
-		rows, err := s.db.QueryContext(ctx, `
+		revisionOrder := s.latestThreadRevisionConsumerOrder(ctx, "latest", "t")
+		revisionFresh := s.threadRevisionFreshnessPredicate(ctx, "tr", "t")
+		rows, err := s.q().QueryContext(ctx, `
 			select tr.thread_id, tks.summary_kind, tks.key_text
 			from thread_key_summaries tks
 			join thread_revisions tr on tr.id = tks.thread_revision_id
+			join threads t on t.id = tr.thread_id
 			where tr.thread_id in (`+strings.Join(placeholders, ",")+`)
+				and tr.id = (
+					select latest.id
+						from thread_revisions latest
+						where latest.thread_id = tr.thread_id
+						order by `+revisionOrder+`
+					limit 1
+				)
+				and `+revisionFresh+`
 			order by tr.thread_id, tks.summary_kind, tks.created_at desc
 		`, args...)
 		if err != nil {

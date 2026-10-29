@@ -72,6 +72,34 @@ func TestSQLiteBusyRetryDoesNotRetryOtherErrors(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlyImmutableRejectsWritesAndMissingDatabase(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	if _, err := OpenReadOnlyImmutable(ctx, dbPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing immutable database error = %v", err)
+	}
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+	repoID, _ := seedVectorThreads(t, ctx, st)
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	readOnly, err := OpenReadOnlyImmutable(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open immutable store: %v", err)
+	}
+	defer readOnly.Close()
+	if count, err := readOnly.CountThreadVectorScope(ctx, ThreadVectorQuery{RepoID: repoID}); err != nil || count != 2 {
+		t.Fatalf("immutable vector scope = %d, err=%v, want 2", count, err)
+	}
+	if _, err := readOnly.DB().ExecContext(ctx, "delete from threads"); err == nil {
+		t.Fatal("immutable store accepted a write")
+	}
+}
+
 func TestOpenMigratesSchema(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
@@ -86,6 +114,1541 @@ func TestOpenMigratesSchema(t *testing.T) {
 	}
 	if version != schemaVersion {
 		t.Fatalf("schema version: got %d want %d", version, schemaVersion)
+	}
+}
+
+func TestOpenMigratesLegacyThreadKeySummaryKinds(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, Repository{
+		Owner:     "openclaw",
+		Name:      "gitcrawl",
+		FullName:  "openclaw/gitcrawl",
+		RawJSON:   "{}",
+		UpdatedAt: "2026-07-12T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repository: %v", err)
+	}
+	thread := Thread{
+		RepoID:          repoID,
+		GitHubID:        "101",
+		Number:          101,
+		Kind:            "issue",
+		State:           "open",
+		Title:           "reuse legacy summary",
+		HTMLURL:         "https://github.com/openclaw/gitcrawl/issues/101",
+		LabelsJSON:      "[]",
+		AssigneesJSON:   "[]",
+		RawJSON:         "{}",
+		ContentHash:     "thread",
+		UpdatedAtGitHub: "2026-07-12T00:00:00Z",
+		UpdatedAt:       "2026-07-12T00:00:00Z",
+	}
+	thread.ID, err = st.UpsertThread(ctx, thread)
+	if err != nil {
+		t.Fatalf("thread: %v", err)
+	}
+	enrichment, err := st.UpsertThreadRevisionAndFingerprint(
+		ctx,
+		ThreadEvidence{Thread: thread},
+		"2026-07-12T00:00:00Z",
+	)
+	if err != nil {
+		t.Fatalf("enrichment: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+		insert into thread_key_summaries(
+			thread_revision_id, summary_kind, prompt_version, provider, model,
+			input_hash, output_hash, key_text, created_at
+		)
+		values
+			(?, 'llm_key_3line', 'llm-key-summary-v1', 'openai', 'gpt-5-mini',
+				'legacy-input-v1', 'legacy-output-v1', 'legacy summary v1', '2026-07-12T00:01:00Z'),
+			(?, 'llm_key_3line', 'llm-key-summary-v2', 'openai', 'gpt-5-mini',
+				'legacy-input-v2', 'legacy-output-v2', 'legacy summary v2', '2026-07-12T00:02:00Z'),
+			(?, 'llm_key_summary', 'llm-key-summary-v2', 'openai', 'gpt-5-mini',
+				'canonical-input-v2', 'canonical-output-v2', 'canonical summary v2', '2026-07-12T00:03:00Z');
+		pragma user_version = 10;
+	`, enrichment.RevisionID, enrichment.RevisionID, enrichment.RevisionID); err != nil {
+		_ = st.Close()
+		t.Fatalf("seed legacy summaries: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer st.Close()
+
+	var version int
+	if err := st.DB().QueryRowContext(ctx, `pragma user_version`).Scan(&version); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, schemaVersion)
+	}
+	for _, test := range []struct {
+		promptVersion string
+		inputHash     string
+		outputHash    string
+		keyText       string
+		createdAt     string
+	}{
+		{
+			promptVersion: "llm-key-summary-v1",
+			inputHash:     "legacy-input-v1",
+			outputHash:    "legacy-output-v1",
+			keyText:       "legacy summary v1",
+			createdAt:     "2026-07-12T00:01:00Z",
+		},
+		{
+			promptVersion: "llm-key-summary-v2",
+			inputHash:     "canonical-input-v2",
+			outputHash:    "canonical-output-v2",
+			keyText:       "canonical summary v2",
+			createdAt:     "2026-07-12T00:03:00Z",
+		},
+	} {
+		var inputHash, outputHash, keyText, createdAt string
+		if err := st.DB().QueryRowContext(ctx, `
+			select input_hash, output_hash, key_text, created_at
+			from thread_key_summaries
+			where thread_revision_id = ?
+				and summary_kind = ?
+				and prompt_version = ?
+				and provider = 'openai'
+				and model = 'gpt-5-mini'
+		`, enrichment.RevisionID, SummaryKindLLMKey, test.promptVersion).Scan(
+			&inputHash,
+			&outputHash,
+			&keyText,
+			&createdAt,
+		); err != nil {
+			t.Fatalf("read canonical %s summary: %v", test.promptVersion, err)
+		}
+		if inputHash != test.inputHash || outputHash != test.outputHash ||
+			keyText != test.keyText || createdAt != test.createdAt {
+			t.Fatalf(
+				"canonical %s summary = %q/%q/%q/%q, want %q/%q/%q/%q",
+				test.promptVersion,
+				inputHash,
+				outputHash,
+				keyText,
+				createdAt,
+				test.inputHash,
+				test.outputHash,
+				test.keyText,
+				test.createdAt,
+			)
+		}
+	}
+	var legacyCount int
+	if err := st.DB().QueryRowContext(ctx, `
+		select count(*)
+		from thread_key_summaries
+		where thread_revision_id = ? and summary_kind = 'llm_key_3line'
+	`, enrichment.RevisionID).Scan(&legacyCount); err != nil {
+		t.Fatalf("count preserved legacy summaries: %v", err)
+	}
+	if legacyCount != 2 {
+		t.Fatalf("legacy summaries = %d, want 2", legacyCount)
+	}
+}
+
+func TestOpenMigratesAuthorAssociationFromVersionFour(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+		insert into repositories(id, owner, name, full_name, raw_json, updated_at)
+		values(1, 'openclaw', 'gitcrawl', 'openclaw/gitcrawl', '{}', '2026-07-12T00:00:00Z');
+		insert into threads(
+			id, repo_id, github_id, number, kind, state, title, html_url,
+			labels_json, assignees_json, raw_json, content_hash, updated_at
+		) values(
+			1, 1, '101', 101, 'issue', 'open', 'migration fixture',
+			'https://github.com/openclaw/gitcrawl/issues/101',
+			'[]', '[]', '{}', 'hash', '2026-07-12T00:00:00Z'
+		);
+	`); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw store: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		alter table threads drop column author_association;
+		pragma user_version = 4;
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("downgrade schema fixture: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer st.Close()
+	if !st.hasColumn(ctx, "threads", "author_association") {
+		t.Fatal("author_association column was not restored")
+	}
+	var version int
+	var title string
+	if err := st.DB().QueryRowContext(ctx, `pragma user_version`).Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("schema version: got %d want %d", version, schemaVersion)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select title from threads where id = 1`).Scan(&title); err != nil {
+		t.Fatalf("read preserved thread: %v", err)
+	}
+	if title != "migration fixture" {
+		t.Fatalf("thread title = %q, want migration fixture", title)
+	}
+}
+
+func TestOpenMigratesV071PortableVersionFourThreadRevisionHistory(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, Repository{
+		Owner:     "openclaw",
+		Name:      "gitcrawl",
+		FullName:  "openclaw/gitcrawl",
+		RawJSON:   "{}",
+		UpdatedAt: "2026-07-12T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repository: %v", err)
+	}
+	threadID, err := st.UpsertThread(ctx, Thread{
+		RepoID:        repoID,
+		GitHubID:      "101",
+		Number:        101,
+		Kind:          "issue",
+		State:         "open",
+		Title:         "revision migration",
+		HTMLURL:       "https://github.com/openclaw/gitcrawl/issues/101",
+		LabelsJSON:    "[]",
+		AssigneesJSON: "[]",
+		RawJSON:       "{}",
+		ContentHash:   "thread",
+		UpdatedAt:     "2026-07-12T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("thread: %v", err)
+	}
+	result, err := st.UpsertThreadRevisionAndFingerprint(ctx, ThreadEvidence{Thread: Thread{
+		ID:            threadID,
+		RepoID:        repoID,
+		Number:        101,
+		Kind:          "issue",
+		State:         "open",
+		Title:         "revision migration",
+		LabelsJSON:    "[]",
+		AssigneesJSON: "[]",
+		UpdatedAt:     "2026-07-12T00:00:00Z",
+	}}, "2026-07-12T00:01:00Z")
+	if err != nil {
+		t.Fatalf("thread enrichment: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw store: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `pragma foreign_keys = off`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("disable foreign keys: %v", err)
+	}
+	tx, err := raw.BeginTx(ctx, nil)
+	if err != nil {
+		_ = raw.Close()
+		t.Fatalf("begin legacy schema fixture: %v", err)
+	}
+	migratedThreadID := threadID + 1000
+	if _, err := tx.ExecContext(
+		ctx,
+		`update thread_revisions set thread_id = ? where thread_id = ?`,
+		migratedThreadID,
+		threadID,
+	); err != nil {
+		_ = tx.Rollback()
+		_ = raw.Close()
+		t.Fatalf("move legacy revision to high thread id: %v", err)
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`update threads set id = ? where id = ?`,
+		migratedThreadID,
+		threadID,
+	); err != nil {
+		_ = tx.Rollback()
+		_ = raw.Close()
+		t.Fatalf("move legacy thread above revision id: %v", err)
+	}
+	for _, stmt := range []string{
+		`create table thread_revisions_legacy (
+			id integer primary key,
+			thread_id integer not null references threads(id) on delete cascade,
+			source_updated_at text,
+			content_hash text not null,
+			title_hash text not null,
+			body_hash text not null,
+			labels_hash text not null,
+			created_at text not null,
+			unique(thread_id, content_hash)
+		)`,
+		`insert into thread_revisions_legacy(
+			id, thread_id, source_updated_at, content_hash, title_hash, body_hash,
+			labels_hash, created_at
+		)
+		select id, thread_id, source_updated_at, content_hash, title_hash, body_hash,
+			labels_hash, created_at
+		from thread_revisions`,
+		`drop table thread_revisions`,
+		`alter table thread_revisions_legacy rename to thread_revisions`,
+		`alter table threads drop column evidence_observation_sequence`,
+		`alter table threads drop column observation_sequence`,
+		`drop table thread_observation_sequence`,
+		`drop table thread_child_observation_reservations`,
+		`pragma user_version = 4`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			_ = tx.Rollback()
+			_ = raw.Close()
+			t.Fatalf("build legacy schema fixture: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		_ = raw.Close()
+		t.Fatalf("commit legacy schema fixture: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer st.Close()
+	if st.threadRevisionsHaveUniqueContentHash(ctx) {
+		t.Fatal("legacy thread revision uniqueness was not removed")
+	}
+	if !st.hasColumn(ctx, "thread_revisions", "raw_json_blob_id") {
+		t.Fatal("portable-pruned raw_json_blob_id column was not restored")
+	}
+	if !st.hasColumn(ctx, "thread_revisions", "observation_sequence") {
+		t.Fatal("thread revision observation sequence column was not restored")
+	}
+	if !st.hasColumn(ctx, "threads", "observation_sequence") {
+		t.Fatal("thread observation sequence column was not restored")
+	}
+	if !st.hasColumn(ctx, "threads", "evidence_observation_sequence") {
+		t.Fatal("thread evidence observation sequence column was not restored")
+	}
+	if !st.hasTable(ctx, "thread_observation_sequence") {
+		t.Fatal("thread observation sequence table was not restored")
+	}
+	if !st.hasTable(ctx, "thread_child_observation_reservations") {
+		t.Fatal("thread child observation reservation table was not restored")
+	}
+	var version, fingerprints int
+	var observationSequence, threadObservationSequence, evidenceObservationSequence, childReservations int64
+	if err := st.DB().QueryRowContext(ctx, `pragma user_version`).Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("schema version: got %d want %d", version, schemaVersion)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select count(*) from thread_fingerprints where thread_revision_id = ?`, result.RevisionID).Scan(&fingerprints); err != nil {
+		t.Fatalf("read preserved fingerprint: %v", err)
+	}
+	if fingerprints != 1 {
+		t.Fatalf("preserved fingerprints = %d, want 1", fingerprints)
+	}
+	if err := st.DB().QueryRowContext(ctx, `
+		select observation_sequence
+		from thread_revisions
+		where id = ?
+	`, result.RevisionID).Scan(&observationSequence); err != nil {
+		t.Fatalf("read migrated observation sequence: %v", err)
+	}
+	if observationSequence != 0 {
+		t.Fatalf("migrated observation sequence = %d, want legacy marker 0", observationSequence)
+	}
+	if err := st.DB().QueryRowContext(ctx, `
+		select observation_sequence, evidence_observation_sequence
+		from threads
+		where id = ?
+	`, migratedThreadID).Scan(&threadObservationSequence, &evidenceObservationSequence); err != nil {
+		t.Fatalf("read migrated thread observation sequence: %v", err)
+	}
+	if threadObservationSequence != 0 || evidenceObservationSequence != 0 {
+		t.Fatalf(
+			"migrated thread sequences = parent %d, evidence %d; want legacy markers",
+			threadObservationSequence,
+			evidenceObservationSequence,
+		)
+	}
+	if err := st.DB().QueryRowContext(ctx, `
+		select count(*)
+		from thread_child_observation_reservations
+		where thread_id = ?
+	`, migratedThreadID).Scan(&childReservations); err != nil {
+		t.Fatalf("read migrated child reservations: %v", err)
+	}
+	if childReservations != 0 {
+		t.Fatalf("v0.7.1 child reservations = %d, want legacy marker absence", childReservations)
+	}
+	coverage, err := st.ArchiveCoverage(ctx, ArchiveCoverageOptions{})
+	if err != nil {
+		t.Fatalf("archive coverage after migration: %v", err)
+	}
+	if len(coverage.Rows) != 1 ||
+		coverage.Rows[0].Enrichment.Revisions.Fresh != 1 ||
+		coverage.Rows[0].Enrichment.Fingerprints.Fresh != 1 {
+		t.Fatalf("migrated enrichment freshness = %+v", coverage.Rows)
+	}
+	nextObservationSequence, err := st.NextThreadObservationSequence(
+		ctx,
+		"2026-07-12T00:03:00Z",
+	)
+	if err != nil {
+		t.Fatalf("next observation sequence: %v", err)
+	}
+	if nextObservationSequence <= observationSequence {
+		t.Fatalf(
+			"next observation sequence = %d, want > %d",
+			nextObservationSequence,
+			observationSequence,
+		)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+		insert into thread_revisions(
+			thread_id, source_updated_at, content_hash, title_hash, body_hash, labels_hash, created_at
+		)
+		select thread_id, source_updated_at, content_hash, title_hash, body_hash, labels_hash, '2026-07-12T00:02:00Z'
+		from thread_revisions
+		where id = ?
+	`, result.RevisionID); err != nil {
+		t.Fatalf("insert repeated content hash after migration: %v", err)
+	}
+	rows, err := st.DB().QueryContext(ctx, `pragma foreign_key_check`)
+	if err != nil {
+		t.Fatalf("foreign key check: %v", err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("migration left a foreign key violation")
+	}
+}
+
+func TestOpenMigrationPreservesClocklessStaleRevision(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, Repository{
+		Owner:     "openclaw",
+		Name:      "gitcrawl",
+		FullName:  "openclaw/gitcrawl",
+		RawJSON:   "{}",
+		UpdatedAt: "2026-07-12T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repository: %v", err)
+	}
+	thread := Thread{
+		RepoID:        repoID,
+		GitHubID:      "101",
+		Number:        101,
+		Kind:          "issue",
+		State:         "open",
+		Title:         "clockless migration",
+		HTMLURL:       "https://github.com/openclaw/gitcrawl/issues/101",
+		LabelsJSON:    "[]",
+		AssigneesJSON: "[]",
+		RawJSON:       "{}",
+		ContentHash:   "clockless",
+		UpdatedAt:     "2026-07-12T00:00:00Z",
+	}
+	thread.ID, err = st.UpsertThread(ctx, thread)
+	if err != nil {
+		t.Fatalf("thread: %v", err)
+	}
+	enrichment, err := st.UpsertThreadRevisionAndFingerprint(
+		ctx,
+		ThreadEvidence{Thread: thread},
+		"2026-07-12T00:01:00Z",
+	)
+	if err != nil {
+		t.Fatalf("thread enrichment: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `
+		update threads
+		set updated_at = '2026-07-12T00:02:00Z'
+		where id = ?
+	`, thread.ID); err != nil {
+		t.Fatalf("advance thread after revision: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw store: %v", err)
+	}
+	for _, stmt := range []string{
+		`create table thread_revisions_legacy (
+			id integer primary key,
+			thread_id integer not null references threads(id) on delete cascade,
+			source_updated_at text,
+			content_hash text not null,
+			title_hash text not null,
+			body_hash text not null,
+			labels_hash text not null,
+			created_at text not null,
+			unique(thread_id, content_hash)
+		)`,
+		`insert into thread_revisions_legacy(
+			id, thread_id, source_updated_at, content_hash, title_hash, body_hash,
+			labels_hash, created_at
+		)
+		select id, thread_id, source_updated_at, content_hash, title_hash, body_hash,
+			labels_hash, created_at
+		from thread_revisions`,
+		`drop table thread_revisions`,
+		`alter table thread_revisions_legacy rename to thread_revisions`,
+		`alter table threads drop column evidence_observation_sequence`,
+		`alter table threads drop column observation_sequence`,
+		`drop table thread_observation_sequence`,
+		`drop table thread_child_observation_reservations`,
+		`pragma user_version = 4`,
+	} {
+		if _, err := raw.ExecContext(ctx, stmt); err != nil {
+			_ = raw.Close()
+			t.Fatalf("build stale legacy fixture: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer st.Close()
+	var revisionSequence, threadSequence, evidenceSequence int64
+	if err := st.DB().QueryRowContext(ctx, `
+		select observation_sequence
+		from thread_revisions
+		where id = ?
+	`, enrichment.RevisionID).Scan(&revisionSequence); err != nil {
+		t.Fatalf("read migrated revision sequence: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `
+		select observation_sequence, evidence_observation_sequence
+		from threads
+		where id = ?
+	`, thread.ID).Scan(&threadSequence, &evidenceSequence); err != nil {
+		t.Fatalf("read migrated thread sequence: %v", err)
+	}
+	if revisionSequence != 0 || threadSequence != 0 || evidenceSequence != 0 {
+		t.Fatalf(
+			"migrated stale sequences = revision %d, thread %d, evidence %d; want legacy markers",
+			revisionSequence,
+			threadSequence,
+			evidenceSequence,
+		)
+	}
+	coverage, err := st.ArchiveCoverage(ctx, ArchiveCoverageOptions{})
+	if err != nil {
+		t.Fatalf("archive coverage after migration: %v", err)
+	}
+	if len(coverage.Rows) != 1 ||
+		coverage.Rows[0].Enrichment.Revisions.Stale != 1 ||
+		coverage.Rows[0].Enrichment.Fingerprints.Stale != 1 {
+		t.Fatalf("migrated stale enrichment coverage = %+v", coverage.Rows)
+	}
+}
+
+func TestMigrationReconcilesThreadObservationSequenceOnce(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, Repository{
+		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl",
+		RawJSON: "{}", UpdatedAt: "2026-07-12T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repository: %v", err)
+	}
+	thread := Thread{
+		RepoID: repoID, GitHubID: "sequence-floor", Number: 102, Kind: "issue", State: "open",
+		Title: "sequence floor", Body: "reconcile once during migration",
+		HTMLURL:         "https://github.com/openclaw/gitcrawl/issues/102",
+		LabelsJSON:      "[]",
+		AssigneesJSON:   "[]",
+		RawJSON:         "{}",
+		ContentHash:     "sequence-floor",
+		UpdatedAtGitHub: "2026-07-12T00:00:00Z",
+		UpdatedAt:       "2026-07-12T00:00:00Z",
+	}
+	upsert, err := st.UpsertThreadObservation(
+		ctx,
+		thread,
+		UpsertThreadOptions{ObservationSequence: 19},
+	)
+	if err != nil {
+		t.Fatalf("thread observation: %v", err)
+	}
+	thread.ID = upsert.ID
+	if _, err := st.UpsertThreadRevisionAndFingerprint(ctx, ThreadEvidence{
+		Thread:              thread,
+		ObservationSequence: 17,
+	}, "2026-07-12T00:01:00Z"); err != nil {
+		t.Fatalf("thread revision: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw store: %v", err)
+	}
+	if _, err := raw.ExecContext(
+		ctx,
+		`update threads set observation_sequence = -19 where id = ?`,
+		thread.ID,
+	); err != nil {
+		_ = raw.Close()
+		t.Fatalf("prepare negative thread sequence: %v", err)
+	}
+	for _, statement := range []string{
+		`update thread_observation_sequence set value = 1 where id = 1`,
+		`pragma user_version = 7`,
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			_ = raw.Close()
+			t.Fatalf("prepare sequence migration with %q: %v", statement, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer st.Close()
+	var floor int64
+	if err := st.DB().QueryRowContext(ctx, `
+		select value
+		from thread_observation_sequence
+		where id = 1
+	`).Scan(&floor); err != nil {
+		t.Fatalf("read reconciled sequence floor: %v", err)
+	}
+	if floor != 19 {
+		t.Fatalf("sequence floor = %d, want 19", floor)
+	}
+	next, err := st.NextThreadObservationSequence(ctx, "2026-07-12T00:02:00Z")
+	if err != nil {
+		t.Fatalf("next observation sequence: %v", err)
+	}
+	if next != 20 {
+		t.Fatalf("next observation sequence = %d, want 20", next)
+	}
+}
+
+func TestMigrationBackfillsThreadEvidenceObservationSequence(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, Repository{
+		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl",
+		RawJSON: "{}", UpdatedAt: "2026-07-12T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repository: %v", err)
+	}
+	thread := Thread{
+		RepoID: repoID, GitHubID: "evidence-migration", Number: 103, Kind: "issue", State: "open",
+		Title: "evidence migration", Body: "backfill durable reservation",
+		HTMLURL:         "https://github.com/openclaw/gitcrawl/issues/103",
+		LabelsJSON:      "[]",
+		AssigneesJSON:   "[]",
+		RawJSON:         "{}",
+		ContentHash:     "evidence-migration",
+		UpdatedAtGitHub: "2026-07-12T00:00:00Z",
+		UpdatedAt:       "2026-07-12T00:00:00Z",
+	}
+	upsert, err := st.UpsertThreadObservation(ctx, thread, UpsertThreadOptions{
+		IncompleteEvidence:  true,
+		ObservationSequence: 9,
+	})
+	if err != nil {
+		t.Fatalf("thread observation: %v", err)
+	}
+	thread.ID = upsert.ID
+	if _, err := st.UpsertThreadRevisionAndFingerprint(ctx, ThreadEvidence{
+		Thread:              thread,
+		ObservationSequence: 7,
+	}, "2026-07-12T00:01:00Z"); err != nil {
+		t.Fatalf("thread revision: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw store: %v", err)
+	}
+	for _, statement := range []string{
+		`alter table threads drop column evidence_observation_sequence`,
+		`pragma user_version = 8`,
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			_ = raw.Close()
+			t.Fatalf("prepare evidence migration with %q: %v", statement, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer st.Close()
+	var version int
+	var evidenceSource string
+	var parentSequence, evidenceSequence, childSequence int64
+	if err := st.DB().QueryRowContext(ctx, `pragma user_version`).Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `
+		select observation_sequence, evidence_source_updated_at,
+			evidence_observation_sequence
+		from threads
+		where id = ?
+	`, thread.ID).Scan(&parentSequence, &evidenceSource, &evidenceSequence); err != nil {
+		t.Fatalf("read migrated evidence sequence: %v", err)
+	}
+	if version != schemaVersion || parentSequence != -9 ||
+		evidenceSource != "2026-07-12T00:00:00Z" || evidenceSequence != 7 {
+		t.Fatalf(
+			"migrated evidence state = version %d, parent %d, evidence %s/%d",
+			version,
+			parentSequence,
+			evidenceSource,
+			evidenceSequence,
+		)
+	}
+	if err := st.DB().QueryRowContext(ctx, `
+		select observation_sequence
+		from thread_child_observation_reservations
+		where thread_id = ? and family = 'comments'
+	`, thread.ID).Scan(&childSequence); err != nil {
+		t.Fatalf("read migrated comment reservation: %v", err)
+	}
+	if childSequence != 7 {
+		t.Fatalf("migrated comment reservation = %d, want 7", childSequence)
+	}
+}
+
+func TestMigrationPreservesParentEvidenceClockForImmediateChildRefresh(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, Repository{
+		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl",
+		RawJSON: "{}", UpdatedAt: "2026-07-12T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repository: %v", err)
+	}
+	thread := Thread{
+		RepoID: repoID, GitHubID: "evidence-clock-migration", Number: 105,
+		Kind: "issue", State: "open", Title: "stable parent",
+		Body:            "refresh child evidence without changing the parent",
+		HTMLURL:         "https://github.com/openclaw/gitcrawl/issues/105",
+		LabelsJSON:      "[]",
+		AssigneesJSON:   "[]",
+		RawJSON:         "{}",
+		ContentHash:     "stable-parent",
+		UpdatedAtGitHub: "2026-07-12T00:00:00Z",
+		UpdatedAt:       "2026-07-12T00:00:00Z",
+	}
+	upsert, err := st.UpsertThreadObservation(ctx, thread, UpsertThreadOptions{
+		ObservationSequence: 7,
+	})
+	if err != nil || !upsert.EvidenceApplied {
+		t.Fatalf("thread observation = %+v, %v", upsert, err)
+	}
+	thread.ID = upsert.ID
+	comment := Comment{
+		ThreadID: thread.ID, GitHubID: "child-1", CommentType: "issue_comment",
+		Body: "later child", RawJSON: `{"body":"later child"}`,
+		CreatedAtGitHub: "2026-07-12T00:05:00Z",
+		UpdatedAtGitHub: "2026-07-12T00:05:00Z",
+	}
+	if _, err := st.UpsertComment(ctx, comment); err != nil {
+		t.Fatalf("comment: %v", err)
+	}
+	if _, err := st.UpsertThreadRevisionAndFingerprint(ctx, ThreadEvidence{
+		Thread:              thread,
+		ObservationSequence: 7,
+		Comments:            []Comment{comment},
+	}, "2026-07-12T00:05:01Z"); err != nil {
+		t.Fatalf("thread revision: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw store: %v", err)
+	}
+	for _, statement := range []string{
+		`alter table threads drop column evidence_observation_sequence`,
+		`pragma user_version = 8`,
+	} {
+		if _, err := raw.ExecContext(ctx, statement); err != nil {
+			_ = raw.Close()
+			t.Fatalf("prepare evidence clock migration with %q: %v", statement, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer st.Close()
+	var source string
+	var sequence int64
+	if err := st.DB().QueryRowContext(ctx, `
+		select evidence_source_updated_at, evidence_observation_sequence
+		from threads
+		where id = ?
+	`, thread.ID).Scan(&source, &sequence); err != nil {
+		t.Fatalf("read migrated evidence fence: %v", err)
+	}
+	if source != thread.UpdatedAtGitHub || sequence != 7 {
+		t.Fatalf(
+			"migrated evidence fence = %s/%d, want parent source %s/7",
+			source,
+			sequence,
+			thread.UpdatedAtGitHub,
+		)
+	}
+
+	refreshed, err := st.UpsertThreadObservation(ctx, thread, UpsertThreadOptions{
+		ObservationSequence: 8,
+	})
+	if err != nil || !refreshed.EvidenceApplied {
+		t.Fatalf("unchanged-parent refresh after migration = %+v, %v", refreshed, err)
+	}
+	reserved, err := st.ReserveThreadChildObservation(
+		ctx,
+		thread.ID,
+		ThreadChildComments,
+		thread.UpdatedAtGitHub,
+		8,
+	)
+	if err != nil || !reserved {
+		t.Fatalf("reserve refreshed child evidence = %t, %v", reserved, err)
+	}
+}
+
+func TestMigrationBackfillsActualThreadEvidenceTuple(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, Repository{
+		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl",
+		RawJSON: "{}", UpdatedAt: "2026-07-12T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repository: %v", err)
+	}
+	thread := Thread{
+		RepoID: repoID, GitHubID: "evidence-tuple", Number: 104, Kind: "issue", State: "open",
+		Title: "evidence tuple", Body: "preserve one actual revision order",
+		HTMLURL:         "https://github.com/openclaw/gitcrawl/issues/104",
+		LabelsJSON:      "[]",
+		AssigneesJSON:   "[]",
+		RawJSON:         `{"version":1}`,
+		ContentHash:     "version-1",
+		UpdatedAtGitHub: "2026-07-12T00:01:00Z",
+		UpdatedAt:       "2026-07-12T00:01:00Z",
+	}
+	old, err := st.UpsertThreadObservation(ctx, thread, UpsertThreadOptions{
+		ObservationSequence: 2,
+	})
+	if err != nil {
+		t.Fatalf("old thread observation: %v", err)
+	}
+	thread.ID = old.ID
+	if _, err := st.UpsertThreadRevisionAndFingerprint(ctx, ThreadEvidence{
+		Thread: thread, ObservationSequence: 2,
+	}, "2026-07-12T00:01:01Z"); err != nil {
+		t.Fatalf("old revision: %v", err)
+	}
+	thread.UpdatedAtGitHub = "2026-07-12T00:02:00Z"
+	thread.UpdatedAt = "2026-07-12T00:02:00Z"
+	thread.RawJSON = `{"version":2}`
+	thread.ContentHash = "version-2"
+	current, err := st.UpsertThreadObservation(ctx, thread, UpsertThreadOptions{
+		ObservationSequence: 1,
+	})
+	if err != nil || !current.EvidenceApplied {
+		t.Fatalf("newer-source thread observation = %+v, %v", current, err)
+	}
+	if _, err := st.UpsertThreadRevisionAndFingerprint(ctx, ThreadEvidence{
+		Thread: thread, ObservationSequence: 1,
+	}, "2026-07-12T00:02:01Z"); err != nil {
+		t.Fatalf("newer-source revision: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw store: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		update threads
+		set evidence_source_updated_at = '2026-07-12T00:02:00Z',
+			evidence_observation_sequence = 2
+		where id = ?
+	`, thread.ID); err != nil {
+		_ = raw.Close()
+		t.Fatalf("fabricate evidence tuple: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer st.Close()
+	var source string
+	var sequence, matchingRevisions int64
+	if err := st.DB().QueryRowContext(ctx, `
+		select evidence_source_updated_at, evidence_observation_sequence
+		from threads
+		where id = ?
+	`, thread.ID).Scan(&source, &sequence); err != nil {
+		t.Fatalf("read repaired evidence tuple: %v", err)
+	}
+	if source != "2026-07-12T00:02:00Z" || sequence != 1 {
+		t.Fatalf("repaired evidence tuple = %s/%d, want newer source at sequence 1", source, sequence)
+	}
+	if err := st.DB().QueryRowContext(ctx, `
+		select count(*)
+		from thread_revisions
+		where thread_id = ? and source_updated_at = ? and observation_sequence = ?
+	`, thread.ID, source, sequence).Scan(&matchingRevisions); err != nil {
+		t.Fatalf("match repaired evidence tuple: %v", err)
+	}
+	if matchingRevisions != 1 {
+		t.Fatalf("repaired evidence tuple matched %d revisions, want exactly one", matchingRevisions)
+	}
+}
+
+func TestMigrationBackfillsV9CompleteEvidenceFamilies(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, Repository{
+		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl",
+		RawJSON: "{}", UpdatedAt: "2026-07-12T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repository: %v", err)
+	}
+	upsert, err := st.UpsertThreadObservation(ctx, Thread{
+		RepoID: repoID, GitHubID: "104", Number: 104, Kind: "pull_request", State: "open",
+		Title: "v9 evidence", HTMLURL: "https://github.com/openclaw/gitcrawl/pull/104",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: "{}", ContentHash: "v9-evidence",
+		UpdatedAtGitHub: "2026-07-12T00:00:00Z",
+		UpdatedAt:       "2026-07-12T00:00:00Z",
+	}, UpsertThreadOptions{ObservationSequence: 7})
+	if err != nil || !upsert.EvidenceApplied {
+		t.Fatalf("thread observation = %+v, %v", upsert, err)
+	}
+	if err := st.UpsertPullRequestCacheFamilies(
+		ctx,
+		PullRequestDetail{
+			ThreadID: upsert.ID, RepoID: repoID, Number: 104, HeadSHA: "v9-head",
+			RawJSON: "{}", FetchedAt: "2026-07-12T00:00:00Z", UpdatedAt: "2026-07-12T00:00:00Z",
+		},
+		nil,
+		nil,
+		nil,
+		nil,
+		PullRequestHydrationFamilies{Details: true},
+	); err != nil {
+		t.Fatalf("pull request detail: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw store: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		drop table thread_child_observation_reservations;
+		drop table workflow_run_observation_reservations;
+		pragma user_version = 9;
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("prepare v9 migration: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer st.Close()
+	var count, minimum, maximum, workflowSequence int64
+	if err := st.DB().QueryRowContext(ctx, `
+		select count(*), min(observation_sequence), max(observation_sequence)
+		from thread_child_observation_reservations
+		where thread_id = ?
+	`, upsert.ID).Scan(&count, &minimum, &maximum); err != nil {
+		t.Fatalf("read migrated reservations: %v", err)
+	}
+	if count != 6 || minimum != 7 || maximum != 7 {
+		t.Fatalf(
+			"migrated reservations = count %d, min %d, max %d; want six families at 7",
+			count,
+			minimum,
+			maximum,
+		)
+	}
+	if err := st.DB().QueryRowContext(ctx, `
+		select observation_sequence
+		from workflow_run_observation_reservations
+		where repo_id = ? and head_sha = 'v9-head'
+	`, repoID).Scan(&workflowSequence); err != nil {
+		t.Fatalf("read migrated workflow reservation: %v", err)
+	}
+	if workflowSequence != 7 {
+		t.Fatalf("migrated workflow reservation = %d, want 7", workflowSequence)
+	}
+}
+
+func TestMigrationBackfillsLegacyV10WorkflowRunReservation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, Repository{
+		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl",
+		RawJSON: "{}", UpdatedAt: "2026-07-12T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repository: %v", err)
+	}
+	upsert, err := st.UpsertThreadObservation(ctx, Thread{
+		RepoID: repoID, GitHubID: "105", Number: 105, Kind: "pull_request", State: "open",
+		Title: "v10 workflow fence", HTMLURL: "https://github.com/openclaw/gitcrawl/pull/105",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: "{}", ContentHash: "v10-workflow",
+		UpdatedAtGitHub: "2026-07-12T00:00:00Z",
+		UpdatedAt:       "2026-07-12T00:00:00Z",
+	}, UpsertThreadOptions{ObservationSequence: 7})
+	if err != nil {
+		t.Fatalf("thread observation: %v", err)
+	}
+	if err := st.UpsertPullRequestCacheFamilies(
+		ctx,
+		PullRequestDetail{
+			ThreadID: upsert.ID, RepoID: repoID, Number: 105, HeadSHA: "shared-v10-head",
+			RawJSON: "{}", FetchedAt: "2026-07-12T00:00:00Z", UpdatedAt: "2026-07-12T00:00:00Z",
+		},
+		nil,
+		nil,
+		nil,
+		nil,
+		PullRequestHydrationFamilies{Details: true},
+	); err != nil {
+		t.Fatalf("pull request detail: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw store: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		drop table thread_child_observation_reservations;
+		create table thread_child_observation_reservations (
+			thread_id integer not null references threads(id) on delete cascade,
+			family text not null check (family in (
+				'comments',
+				'pull_request_details',
+				'pull_request_files',
+				'pull_request_commits',
+				'pull_request_checks',
+				'workflow_runs',
+				'pull_request_review_threads'
+			)),
+			observation_sequence integer not null check (observation_sequence > 0),
+			primary key(thread_id, family)
+		);
+		insert into thread_child_observation_reservations(
+			thread_id, family, observation_sequence
+		)
+		values
+			(?, 'workflow_runs', 10),
+			(?, 'pull_request_files', 10);
+		drop table workflow_run_observation_reservations;
+		pragma user_version = 10;
+	`, upsert.ID, upsert.ID); err != nil {
+		_ = raw.Close()
+		t.Fatalf("prepare legacy v10 migration: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	defer st.Close()
+	var workflowSequence int64
+	if err := st.DB().QueryRowContext(ctx, `
+		select observation_sequence
+		from workflow_run_observation_reservations
+		where repo_id = ? and head_sha = 'shared-v10-head'
+	`, repoID).Scan(&workflowSequence); err != nil {
+		t.Fatalf("read migrated workflow reservation: %v", err)
+	}
+	if workflowSequence != 10 {
+		t.Fatalf("migrated workflow reservation = %d, want legacy high-water mark 10", workflowSequence)
+	}
+	var childSource string
+	var childSequence int64
+	if err := st.DB().QueryRowContext(ctx, `
+		select source_updated_at, observation_sequence
+		from thread_child_observation_reservations
+		where thread_id = ? and family = 'pull_request_files'
+	`, upsert.ID).Scan(&childSource, &childSequence); err != nil {
+		t.Fatalf("read migrated child reservation: %v", err)
+	}
+	if childSource != "" || childSequence != 10 {
+		t.Fatalf(
+			"migrated child reservation = %q/%d, want unknown source at 10",
+			childSource,
+			childSequence,
+		)
+	}
+	if applied, err := st.ReserveThreadChildObservation(
+		ctx,
+		upsert.ID,
+		ThreadChildPullRequestFiles,
+		"2026-07-12T00:01:00Z",
+		9,
+	); err != nil || applied {
+		t.Fatalf("lower migrated child observation = %t, %v", applied, err)
+	}
+	if applied, err := st.ReserveThreadChildObservation(
+		ctx,
+		upsert.ID,
+		ThreadChildPullRequestFiles,
+		"2026-07-12T00:01:00Z",
+		11,
+	); err != nil || !applied {
+		t.Fatalf("newer migrated child observation = %t, %v", applied, err)
+	}
+	var legacyReservations int64
+	if err := st.DB().QueryRowContext(ctx, `
+		select count(*)
+		from thread_child_observation_reservations
+		where family = 'workflow_runs'
+	`).Scan(&legacyReservations); err != nil {
+		t.Fatalf("read legacy workflow reservations: %v", err)
+	}
+	if legacyReservations != 0 {
+		t.Fatalf("legacy workflow reservations = %d, want migrated rows removed", legacyReservations)
+	}
+}
+
+func TestInspectSchemaReportsCurrentStoreWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db before: %v", err)
+	}
+
+	diag := InspectSchema(ctx, dbPath)
+	if diag.State != "current" || !diag.Current || diag.PendingMigration || diag.Newer {
+		t.Fatalf("schema diag = %#v, want current", diag)
+	}
+	if diag.CurrentVersion != schemaVersion || diag.SupportedVersion != schemaVersion {
+		t.Fatalf("schema versions = current %d supported %d, want %d", diag.CurrentVersion, diag.SupportedVersion, schemaVersion)
+	}
+	if diag.PRDetails.State != "supported" || !diag.PRDetails.DuplicatePathFilesSupported {
+		t.Fatalf("pr detail diag = %#v, want supported", diag.PRDetails)
+	}
+	if !diag.ChildReservations || !diag.WorkflowRunReservations {
+		t.Fatalf("reservation diagnostics = %#v, want supported", diag)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db after: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("schema diagnostics mutated current database bytes")
+	}
+}
+
+func TestInspectSchemaReportsPortableStoreCurrentWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := st.PrunePortablePayloads(ctx, PortablePruneOptions{
+		BodyChars: 256,
+		Vacuum:    false,
+	}); err != nil {
+		_ = st.Close()
+		t.Fatalf("prune portable store: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db before: %v", err)
+	}
+
+	runtimeDiag := InspectSchema(ctx, dbPath)
+	if runtimeDiag.State != "pending_migration" || runtimeDiag.Current || !runtimeDiag.PendingMigration {
+		t.Fatalf("runtime schema diag = %#v, want pending migration", runtimeDiag)
+	}
+	if runtimeDiag.Portable {
+		t.Fatalf("runtime schema diag = %#v, want no source-role normalization", runtimeDiag)
+	}
+
+	diag := InspectPortableSourceSchema(ctx, dbPath)
+	if diag.State != "current" || !diag.Current || diag.PendingMigration || diag.Legacy || diag.Newer {
+		t.Fatalf("schema diag = %#v, want current portable store", diag)
+	}
+	if !diag.Portable || diag.PortableFormat != portableSchemaFormat {
+		t.Fatalf("portable schema diag = %#v, want %q", diag, portableSchemaFormat)
+	}
+	if diag.CurrentVersion != portableSchemaVersion || diag.SupportedVersion != schemaVersion {
+		t.Fatalf(
+			"schema versions = current %d supported %d, want portable %d runtime %d",
+			diag.CurrentVersion,
+			diag.SupportedVersion,
+			portableSchemaVersion,
+			schemaVersion,
+		)
+	}
+	if len(diag.PendingMigrations) != 0 || len(diag.NextSteps) != 0 {
+		t.Fatalf("portable schema guidance = pending %#v next %#v, want none", diag.PendingMigrations, diag.NextSteps)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db after: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("schema diagnostics mutated portable database bytes")
+	}
+}
+
+func TestInspectSchemaReportsMissingStore(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "missing.db")
+
+	diag := InspectSchema(ctx, dbPath)
+	if diag.State != "missing" || diag.Exists || diag.SupportedVersion != schemaVersion {
+		t.Fatalf("schema diag = %#v, want missing", diag)
+	}
+	if len(diag.NextSteps) == 0 {
+		t.Fatalf("missing db next steps are empty: %#v", diag)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("schema diagnostics created missing db: %v", err)
+	}
+}
+
+func TestInspectSchemaReportsEmptyPath(t *testing.T) {
+	diag := InspectSchema(context.Background(), "")
+	if diag.State != "missing" || diag.Exists || len(diag.NextSteps) == 0 {
+		t.Fatalf("schema diag = %#v, want missing path guidance", diag)
+	}
+}
+
+func TestInspectSchemaReportsEmptyDatabaseMigration(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "empty.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open empty db: %v", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		t.Fatalf("ping empty db: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close empty db: %v", err)
+	}
+
+	diag := InspectSchema(ctx, dbPath)
+	if diag.State != "pending_migration" || diag.CurrentVersion != 0 || !containsString(diag.PendingMigrations, fmt.Sprintf("schema_version_0_to_%d", schemaVersion)) {
+		t.Fatalf("schema diag = %#v, want empty database migration", diag)
+	}
+}
+
+func TestInspectSchemaReportsInvalidDatabasePath(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "database-directory")
+	if err := os.Mkdir(dbPath, 0o755); err != nil {
+		t.Fatalf("create database directory: %v", err)
+	}
+
+	diag := InspectSchema(context.Background(), dbPath)
+	if diag.State != "error" || !diag.Exists || diag.Error == "" || len(diag.NextSteps) == 0 {
+		t.Fatalf("schema diag = %#v, want invalid database path error", diag)
+	}
+}
+
+func TestInspectSchemaReportsCurrentVersionCompatibilityDriftWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open seed db: %v", err)
+	}
+	_, err = db.ExecContext(ctx, fmt.Sprintf(`
+		create table repositories (id integer primary key);
+		create table threads (id integer primary key);
+		create table thread_vectors (
+			thread_id integer primary key,
+			basis text,
+			model text
+		);
+		create table pull_request_details (thread_id integer primary key);
+		pragma user_version = %d;
+	`, schemaVersion))
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("seed compatibility drift: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close seed db: %v", err)
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db before: %v", err)
+	}
+
+	diag := InspectSchema(ctx, dbPath)
+	if diag.State != "pending_migration" || !diag.PendingMigration || !diag.Legacy || diag.Current || diag.Newer {
+		t.Fatalf("schema diag = %#v, want current-version compatibility drift", diag)
+	}
+	if diag.CurrentVersion != schemaVersion || diag.PRDetails.State != "partial" {
+		t.Fatalf("schema version/details = %d/%#v, want %d/partial", diag.CurrentVersion, diag.PRDetails, schemaVersion)
+	}
+	for _, want := range []string{
+		"repositories_raw_json_column",
+		"threads_body_column",
+		"threads_raw_json_column",
+		"threads_author_association_column",
+		"threads_observation_sequence",
+		"threads_evidence_observation_sequence",
+		"thread_child_observation_reservations_table",
+		"workflow_run_observation_reservations_table",
+		"thread_vectors_composite_key",
+		"pull_request_files_table",
+	} {
+		if !containsString(diag.PendingMigrations, want) {
+			t.Fatalf("pending migrations = %#v, missing %q", diag.PendingMigrations, want)
+		}
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db after: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("schema diagnostics mutated compatibility-drift database bytes")
+	}
+}
+
+func TestInspectSchemaReportsNewerStoreWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `pragma user_version = 99`); err != nil {
+		_ = st.Close()
+		t.Fatalf("set newer schema: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db before: %v", err)
+	}
+
+	diag := InspectSchema(ctx, dbPath)
+	if diag.State != "newer" || !diag.Newer || diag.PendingMigration {
+		t.Fatalf("schema diag = %#v, want newer", diag)
+	}
+	if diag.CurrentVersion != 99 || diag.SupportedVersion != schemaVersion {
+		t.Fatalf("schema versions = current %d supported %d", diag.CurrentVersion, diag.SupportedVersion)
+	}
+	if len(diag.NextSteps) == 0 {
+		t.Fatalf("newer db next steps are empty: %#v", diag)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db after: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("schema diagnostics mutated newer database bytes")
+	}
+}
+
+func TestInspectSchemaReportsLegacyPendingMigrationWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	seedLegacyPullRequestFilesSchema(t, ctx, dbPath)
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db before: %v", err)
+	}
+
+	diag := InspectSchema(ctx, dbPath)
+	if diag.State != "pending_migration" || !diag.PendingMigration || !diag.Legacy || diag.Newer {
+		t.Fatalf("schema diag = %#v, want pending migration", diag)
+	}
+	if diag.CurrentVersion != 3 || diag.SupportedVersion != schemaVersion {
+		t.Fatalf("schema versions = current %d supported %d", diag.CurrentVersion, diag.SupportedVersion)
+	}
+	if diag.PRDetails.State != "legacy" || diag.PRDetails.FilesPositionKey || diag.PRDetails.DuplicatePathFilesSupported {
+		t.Fatalf("pr detail diag = %#v, want legacy", diag.PRDetails)
+	}
+	if !containsString(diag.PendingMigrations, fmt.Sprintf("schema_version_3_to_%d", schemaVersion)) ||
+		!containsString(diag.PendingMigrations, "pull_request_files_position_key") ||
+		!containsString(diag.PendingMigrations, "thread_child_observation_reservations_table") ||
+		!containsString(diag.PendingMigrations, "workflow_run_observation_reservations_table") {
+		t.Fatalf("pending migrations = %#v", diag.PendingMigrations)
+	}
+	if len(diag.NextSteps) == 0 {
+		t.Fatalf("pending db next steps are empty: %#v", diag)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db after: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("schema diagnostics mutated legacy database bytes")
+	}
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer raw.Close()
+	var version int
+	if err := raw.QueryRowContext(ctx, `pragma user_version`).Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if version != 3 {
+		t.Fatalf("user_version = %d, want 3", version)
 	}
 }
 
@@ -151,6 +1714,53 @@ func TestOpenReadOnlyDoesNotMutateStore(t *testing.T) {
 	if !bytes.Equal(after, before) {
 		t.Fatal("readonly open mutated database bytes")
 	}
+}
+
+func seedLegacyPullRequestFilesSchema(t *testing.T, ctx context.Context, dbPath string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer db.Close()
+	_, err = db.ExecContext(ctx, `
+		drop index if exists idx_pull_request_files_path;
+		drop index if exists idx_pull_request_files_thread_path;
+		alter table pull_request_files rename to pull_request_files_current;
+		create table pull_request_files (
+			thread_id integer not null references threads(id) on delete cascade,
+			path text not null,
+			status text,
+			additions integer not null default 0,
+			deletions integer not null default 0,
+			changes integer not null default 0,
+			previous_path text,
+			patch text,
+			raw_json text not null,
+			fetched_at text not null,
+			primary key(thread_id, path)
+		);
+		insert into pull_request_files(thread_id, path, status, additions, deletions, changes, previous_path, patch, raw_json, fetched_at)
+			select thread_id, path, status, additions, deletions, changes, previous_path, patch, raw_json, fetched_at
+			from pull_request_files_current;
+		drop table pull_request_files_current;
+		create index if not exists idx_pull_request_files_path on pull_request_files(path);
+		drop table thread_child_observation_reservations;
+		drop table workflow_run_observation_reservations;
+		pragma user_version = 3;
+	`)
+	if err != nil {
+		t.Fatalf("seed legacy pull_request_files table: %v", err)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestOpenReadOnlySupportsCanonicalPortableStore(t *testing.T) {
@@ -250,8 +1860,8 @@ func TestOpenReadOnlySupportsCanonicalPortableStore(t *testing.T) {
 	if status.RepositoryCount != 1 || status.ThreadCount != 1 || status.OpenThreadCount != 1 || status.ClusterCount != 1 {
 		t.Fatalf("unexpected portable status: %#v", status)
 	}
-	if status.LastSyncAt.IsZero() {
-		t.Fatalf("portable last sync was not read from repo_sync_state: %#v", status)
+	if !status.LastSyncAt.IsZero() {
+		t.Fatalf("scan checkpoint reported as successful sync: %#v", status)
 	}
 	repo, err := st.RepositoryByFullName(ctx, "openclaw/openclaw")
 	if err != nil {
@@ -279,7 +1889,7 @@ func TestOpenReadOnlySupportsCanonicalPortableStore(t *testing.T) {
 	}
 }
 
-func TestStatusPrefersPortableExportedAt(t *testing.T) {
+func TestStatusSeparatesPortableExportFromSync(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "portable.sync.db")
 	db, err := sql.Open("sqlite", dbPath)
@@ -371,8 +1981,11 @@ func TestStatusPrefersPortableExportedAt(t *testing.T) {
 		t.Fatalf("portable status: %v", err)
 	}
 	want := "2026-04-30T01:11:27.830908426Z"
-	if got := status.LastSyncAt.Format(time.RFC3339Nano); got != want {
-		t.Fatalf("last sync = %q, want portable exported_at %q", got, want)
+	if got := status.LastExportAt.Format(time.RFC3339Nano); got != want {
+		t.Fatalf("last export = %q, want portable exported_at %q", got, want)
+	}
+	if !status.LastSyncAt.IsZero() {
+		t.Fatalf("export reported as successful sync: %+v", status)
 	}
 }
 
@@ -421,8 +2034,8 @@ func TestOpenMigratesPortableStoreColumns(t *testing.T) {
 		);
 		insert into repositories(id, owner, name, full_name, updated_at)
 		values(1, 'openclaw', 'openclaw', 'openclaw/openclaw', '2026-04-26T00:00:00Z');
-		insert into threads(id, repo_id, github_id, number, kind, state, title, body_excerpt, html_url, labels_json, assignees_json, content_hash, updated_at)
-		values(1, 1, '1', 42, 'issue', 'open', 'portable issue', 'portable body', 'https://github.com/openclaw/openclaw/issues/42', '[]', '[]', 'hash', '2026-04-26T00:00:00Z');
+		insert into threads(id, repo_id, github_id, number, kind, state, title, body_excerpt, body_length, html_url, labels_json, assignees_json, content_hash, updated_at)
+		values(1, 1, '1', 42, 'issue', 'open', 'portable issue', 'portable body', 26, 'https://github.com/openclaw/openclaw/issues/42', '[]', '[]', 'hash', '2026-04-26T00:00:00Z');
 	`)
 	if err != nil {
 		t.Fatalf("seed portable db: %v", err)
@@ -435,19 +2048,50 @@ func TestOpenMigratesPortableStoreColumns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer st.Close()
-
 	repo, err := st.RepositoryByFullName(ctx, "openclaw/openclaw")
 	if err != nil {
+		_ = st.Close()
 		t.Fatalf("repository: %v", err)
 	}
 	threads, err := st.ListThreadsFiltered(ctx, ThreadListOptions{RepoID: repo.ID, Numbers: []int{42}})
 	if err != nil {
+		_ = st.Close()
 		t.Fatalf("threads: %v", err)
 	}
 	if len(threads) != 1 || threads[0].Body != "portable body" {
+		_ = st.Close()
 		t.Fatalf("unexpected portable thread: %#v", threads)
 	}
+	assertPortableBodyMetadata := func(st *Store) {
+		t.Helper()
+		var body, excerpt string
+		var bodyLength int
+		if err := st.DB().QueryRowContext(ctx, `
+			select body, body_excerpt, body_length
+			from threads
+			where id = 1
+		`).Scan(&body, &excerpt, &bodyLength); err != nil {
+			t.Fatalf("read portable truncation metadata: %v", err)
+		}
+		if body != "portable body" || excerpt != "portable body" || bodyLength != 26 {
+			t.Fatalf(
+				"portable truncation metadata = body %q excerpt %q length %d",
+				body,
+				excerpt,
+				bodyLength,
+			)
+		}
+	}
+	assertPortableBodyMetadata(st)
+	if err := st.Close(); err != nil {
+		t.Fatalf("close migrated portable store: %v", err)
+	}
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen migrated portable store: %v", err)
+	}
+	defer st.Close()
+	assertPortableBodyMetadata(st)
 }
 
 func TestDocumentsFTSWorks(t *testing.T) {
@@ -517,8 +2161,8 @@ func TestPrunePortablePayloads(t *testing.T) {
 	_, err = st.DB().ExecContext(ctx, `
 		insert into repositories(id, owner, name, full_name, raw_json, updated_at)
 		values(1, 'openclaw', 'gitcrawl', 'openclaw/gitcrawl', '{"id":1}', '2026-04-26T00:00:00Z');
-		insert into threads(id, repo_id, github_id, number, kind, state, title, body, html_url, labels_json, assignees_json, raw_json, content_hash, updated_at)
-		values(1, 1, '1', 1, 'pull_request', 'open', 'download stalls', 'abcdefghijklmnopqrstuvwxyz', 'https://github.com/openclaw/gitcrawl/pull/1', '[]', '[]', '{"body":"abcdefghijklmnopqrstuvwxyz"}', 'hash', '2026-04-26T00:00:00Z');
+		insert into threads(id, repo_id, github_id, number, kind, state, title, body, author_association, html_url, labels_json, assignees_json, raw_json, content_hash, updated_at)
+		values(1, 1, '1', 1, 'pull_request', 'open', 'download stalls', 'abcdefghijklmnopqrstuvwxyz', 'MEMBER', 'https://github.com/openclaw/gitcrawl/pull/1', '[{"name":"bug","color":"d73a4a","url":"https://api.github.com/labels/bug"}]', '[{"login":"alice","avatar_url":"https://avatars.githubusercontent.com/u/1"}]', '{"body":"abcdefghijklmnopqrstuvwxyz"}', 'hash', '2026-04-26T00:00:00Z');
 		insert into comments(id, thread_id, github_id, comment_type, author_login, author_type, body, is_bot, raw_json, created_at_gh, updated_at_gh)
 		values(1, 1, 'c1', 'issue_comment', 'alice', 'User', 'comment abcdefghijklmnopqrstuvwxyz', 0, '{"body":"comment abcdefghijklmnopqrstuvwxyz"}', '2026-04-26T00:00:00Z', '2026-04-26T00:00:00Z');
 		insert into pull_request_details(thread_id, repo_id, number, base_sha, head_sha, additions, deletions, changed_files, raw_json, fetched_at, updated_at)
@@ -546,11 +2190,11 @@ func TestPrunePortablePayloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
-	if stats.DocumentsDeleted != 1 || stats.FingerprintsPruned != 1 || stats.CommentsPruned != 1 || stats.RawJSONPruned == 0 {
+	if stats.DocumentsDeleted != 1 || stats.FingerprintsPruned != 1 || stats.CommentsPruned != 1 || stats.RawJSONPruned == 0 || stats.ThreadLabelsCompacted != 1 || stats.ThreadAssigneesCompacted != 1 {
 		t.Fatalf("unexpected stats: %#v", stats)
 	}
 
-	var bodyExcerpt, titleTokens, linkedRefs, buckets, features string
+	var bodyExcerpt, labelsJSON, assigneesJSON, titleTokens, linkedRefs, buckets, features string
 	if st.hasColumn(ctx, "repositories", "raw_json") {
 		t.Fatal("repositories.raw_json was not dropped")
 	}
@@ -562,6 +2206,12 @@ func TestPrunePortablePayloads(t *testing.T) {
 	}
 	if err := st.DB().QueryRowContext(ctx, `select body_excerpt from threads where id = 1`).Scan(&bodyExcerpt); err != nil {
 		t.Fatalf("thread body excerpt: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select labels_json, assignees_json from threads where id = 1`).Scan(&labelsJSON, &assigneesJSON); err != nil {
+		t.Fatalf("thread metadata: %v", err)
+	}
+	if labelsJSON != `["bug"]` || assigneesJSON != `["alice"]` {
+		t.Fatalf("thread metadata not compacted: labels=%q assignees=%q", labelsJSON, assigneesJSON)
 	}
 	var bodyLength int
 	if err := st.DB().QueryRowContext(ctx, `select body_length from threads where id = 1`).Scan(&bodyLength); err != nil {
@@ -606,17 +2256,174 @@ func TestPrunePortablePayloads(t *testing.T) {
 	if prDetailCount != 1 || prFileCount != 1 || prCommitCount != 1 || prCheckCount != 1 || runCount != 1 {
 		t.Fatalf("pr/run rows not retained: detail=%d files=%d commits=%d checks=%d runs=%d", prDetailCount, prFileCount, prCommitCount, prCheckCount, runCount)
 	}
-	var portableSchema, capabilities string
+	var prFilePath, prFileStatus string
+	var prFileAdditions, prFileDeletions, prFileChanges int
+	var prFilePatch sql.NullString
+	if err := st.DB().QueryRowContext(ctx, `
+		select path, status, additions, deletions, changes, patch
+		from pull_request_files
+		where thread_id = 1
+	`).Scan(&prFilePath, &prFileStatus, &prFileAdditions, &prFileDeletions, &prFileChanges, &prFilePatch); err != nil {
+		t.Fatalf("portable pull request file: %v", err)
+	}
+	if prFilePath != "README.md" || prFileStatus != "modified" || prFileAdditions != 10 || prFileDeletions != 2 || prFileChanges != 12 || prFilePatch.Valid {
+		t.Fatalf("portable pull request file metadata=%q/%q/%d/%d/%d patch=%#v", prFilePath, prFileStatus, prFileAdditions, prFileDeletions, prFileChanges, prFilePatch)
+	}
+	var portableSchema, capabilities, excluded, authorProfile, authorAssociation string
 	if err := st.DB().QueryRowContext(ctx, `select value from portable_metadata where key = 'schema'`).Scan(&portableSchema); err != nil {
 		t.Fatalf("portable schema metadata: %v", err)
 	}
 	if err := st.DB().QueryRowContext(ctx, `select value from portable_metadata where key = 'capabilities'`).Scan(&capabilities); err != nil {
 		t.Fatalf("portable capabilities metadata: %v", err)
 	}
-	if portableSchema != "gitcrawl-portable-sync-v2" || !strings.Contains(capabilities, "comment_excerpts") || !strings.Contains(capabilities, "workflow_runs") {
-		t.Fatalf("portable metadata schema=%q capabilities=%q", portableSchema, capabilities)
+	if err := st.DB().QueryRowContext(ctx, `select value from portable_metadata where key = 'excluded'`).Scan(&excluded); err != nil {
+		t.Fatalf("portable excluded metadata: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select value from portable_metadata where key = 'thread_author_profile'`).Scan(&authorProfile); err != nil {
+		t.Fatalf("portable author profile metadata: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `select author_association from threads where id = 1`).Scan(&authorAssociation); err != nil {
+		t.Fatalf("portable author association: %v", err)
+	}
+	if portableSchema != "gitcrawl-portable-sync-v2" ||
+		!strings.Contains(capabilities, "comment_excerpts") ||
+		!strings.Contains(capabilities, "workflow_runs") ||
+		!strings.Contains(capabilities, "author_association") ||
+		!strings.Contains(capabilities, "thread_revisions") ||
+		!strings.Contains(excluded, "pull_request_file_patches") ||
+		authorProfile != "login,type,association" ||
+		authorAssociation != "MEMBER" {
+		t.Fatalf("portable metadata schema=%q capabilities=%q excluded=%q author_profile=%q association=%q", portableSchema, capabilities, excluded, authorProfile, authorAssociation)
 	}
 	if bodyExcerpt != "abcdefgh" || titleTokens != "[]" || linkedRefs != "[]" || buckets != "[]" || features != "{}" {
 		t.Fatalf("payloads not pruned: bodyExcerpt=%q titleTokens=%q linkedRefs=%q buckets=%q features=%q", bodyExcerpt, titleTokens, linkedRefs, buckets, features)
+	}
+}
+
+func TestHydrationRefreshesPortableBodyMetadata(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	st, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	repoID, err := st.UpsertRepository(ctx, Repository{
+		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl",
+		RawJSON: "{}", UpdatedAt: "2026-07-29T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repo: %v", err)
+	}
+	threadID, err := st.UpsertThread(ctx, Thread{
+		RepoID: repoID, GitHubID: "1", Number: 1, Kind: "issue", State: "open",
+		Title: "full cloud archive", Body: "old",
+		HTMLURL:    "https://github.com/openclaw/gitcrawl/issues/1",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: `{"body":"old"}`,
+		ContentHash: "original", UpdatedAtGitHub: "2026-07-29T00:00:00Z",
+		UpdatedAt: "2026-07-29T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("thread: %v", err)
+	}
+	if _, err := st.UpsertComment(ctx, Comment{
+		ThreadID: threadID, GitHubID: "c1", CommentType: "issue_comment",
+		Body: "old", RawJSON: "{}",
+		CreatedAtGitHub: "2026-07-29T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("comment: %v", err)
+	}
+	if _, err := st.PrunePortablePayloads(ctx, PortablePruneOptions{BodyChars: 8}); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close portable store: %v", err)
+	}
+
+	st, err = Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen portable store: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := st.UpsertThread(ctx, Thread{
+		RepoID: repoID, GitHubID: "1", Number: 1, Kind: "issue", State: "open",
+		Title: "full cloud archive", Body: "new body is longer",
+		HTMLURL:    "https://github.com/openclaw/gitcrawl/issues/1",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: `{"body":"new body is longer"}`,
+		ContentHash: "hydrated", UpdatedAtGitHub: "2026-07-29T01:00:00Z",
+		UpdatedAt: "2026-07-29T01:00:00Z",
+	}); err != nil {
+		t.Fatalf("hydrate thread: %v", err)
+	}
+	if _, err := st.UpsertComment(ctx, Comment{
+		ThreadID: threadID, GitHubID: "c1", CommentType: "issue_comment",
+		Body: "new comment is longer", RawJSON: "{}", CreatedAtGitHub: "2026-07-29T00:00:00Z",
+		UpdatedAtGitHub: "2026-07-29T01:00:00Z",
+	}); err != nil {
+		t.Fatalf("hydrate comment: %v", err)
+	}
+	insertedThreadID, err := st.UpsertThread(ctx, Thread{
+		RepoID: repoID, GitHubID: "2", Number: 2, Kind: "issue", State: "open",
+		Title: "new cloud row", Body: "inserted body is longer",
+		HTMLURL:    "https://github.com/openclaw/gitcrawl/issues/2",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: `{"body":"inserted body is longer"}`,
+		ContentHash: "inserted", UpdatedAtGitHub: "2026-07-29T01:00:00Z",
+		UpdatedAt: "2026-07-29T01:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("insert hydrated thread: %v", err)
+	}
+	if _, err := st.UpsertComment(ctx, Comment{
+		ThreadID: insertedThreadID, GitHubID: "c2", CommentType: "issue_comment",
+		Body: "inserted comment is longer", RawJSON: "{}",
+		CreatedAtGitHub: "2026-07-29T01:00:00Z",
+	}); err != nil {
+		t.Fatalf("insert hydrated comment: %v", err)
+	}
+
+	var threadBody, threadExcerpt string
+	var threadBodyLength int
+	if err := st.DB().QueryRowContext(ctx, `
+		select body, body_excerpt, body_length from threads where id = ?
+	`, threadID).Scan(&threadBody, &threadExcerpt, &threadBodyLength); err != nil {
+		t.Fatalf("read hydrated thread: %v", err)
+	}
+	if threadBody != "new body is longer" ||
+		threadExcerpt != "new body" ||
+		threadBodyLength != len("new body is longer") {
+		t.Fatalf("hydrated thread metadata = body %q excerpt %q length %d", threadBody, threadExcerpt, threadBodyLength)
+	}
+
+	var commentBody, commentExcerpt string
+	var commentBodyLength int
+	if err := st.DB().QueryRowContext(ctx, `
+		select body, body_excerpt, body_length from comments where github_id = 'c1'
+	`).Scan(&commentBody, &commentExcerpt, &commentBodyLength); err != nil {
+		t.Fatalf("read hydrated comment: %v", err)
+	}
+	if commentBody != "new comment is longer" ||
+		commentExcerpt != "new comm" ||
+		commentBodyLength != len("new comment is longer") {
+		t.Fatalf("hydrated comment metadata = body %q excerpt %q length %d", commentBody, commentExcerpt, commentBodyLength)
+	}
+
+	var insertedThreadExcerpt, insertedCommentExcerpt string
+	if err := st.DB().QueryRowContext(ctx, `
+		select body_excerpt from threads where id = ?
+	`, insertedThreadID).Scan(&insertedThreadExcerpt); err != nil {
+		t.Fatalf("read inserted thread excerpt: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx, `
+		select body_excerpt from comments where github_id = 'c2'
+	`).Scan(&insertedCommentExcerpt); err != nil {
+		t.Fatalf("read inserted comment excerpt: %v", err)
+	}
+	if insertedThreadExcerpt != "inserted" || insertedCommentExcerpt != "inserted" {
+		t.Fatalf(
+			"inserted excerpts = thread %q comment %q",
+			insertedThreadExcerpt,
+			insertedCommentExcerpt,
+		)
 	}
 }

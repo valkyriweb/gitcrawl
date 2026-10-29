@@ -89,30 +89,12 @@ func (q *Queries) DeletePullRequestChecks(ctx context.Context, threadID int64) e
 	return err
 }
 
-const deletePullRequestCommits = `-- name: DeletePullRequestCommits :exec
-delete from pull_request_commits where thread_id = ?1
-`
-
-func (q *Queries) DeletePullRequestCommits(ctx context.Context, threadID int64) error {
-	_, err := q.db.ExecContext(ctx, deletePullRequestCommits, threadID)
-	return err
-}
-
 const deletePullRequestFiles = `-- name: DeletePullRequestFiles :exec
 delete from pull_request_files where thread_id = ?1
 `
 
 func (q *Queries) DeletePullRequestFiles(ctx context.Context, threadID int64) error {
 	_, err := q.db.ExecContext(ctx, deletePullRequestFiles, threadID)
-	return err
-}
-
-const deletePullRequestReviewThreads = `-- name: DeletePullRequestReviewThreads :exec
-delete from pull_request_review_threads where thread_id = ?1
-`
-
-func (q *Queries) DeletePullRequestReviewThreads(ctx context.Context, threadID int64) error {
-	_, err := q.db.ExecContext(ctx, deletePullRequestReviewThreads, threadID)
 	return err
 }
 
@@ -150,45 +132,14 @@ func (q *Queries) InsertPullRequestCheck(ctx context.Context, arg InsertPullRequ
 	return err
 }
 
-const insertPullRequestCommit = `-- name: InsertPullRequestCommit :exec
-insert into pull_request_commits(thread_id, sha, message, author_login, author_name, committed_at, html_url, raw_json, fetched_at)
-values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-`
-
-type InsertPullRequestCommitParams struct {
-	ThreadID    int64          `json:"thread_id"`
-	Sha         string         `json:"sha"`
-	Message     sql.NullString `json:"message"`
-	AuthorLogin sql.NullString `json:"author_login"`
-	AuthorName  sql.NullString `json:"author_name"`
-	CommittedAt sql.NullString `json:"committed_at"`
-	HtmlUrl     sql.NullString `json:"html_url"`
-	RawJson     string         `json:"raw_json"`
-	FetchedAt   string         `json:"fetched_at"`
-}
-
-func (q *Queries) InsertPullRequestCommit(ctx context.Context, arg InsertPullRequestCommitParams) error {
-	_, err := q.db.ExecContext(ctx, insertPullRequestCommit,
-		arg.ThreadID,
-		arg.Sha,
-		arg.Message,
-		arg.AuthorLogin,
-		arg.AuthorName,
-		arg.CommittedAt,
-		arg.HtmlUrl,
-		arg.RawJson,
-		arg.FetchedAt,
-	)
-	return err
-}
-
 const insertPullRequestFile = `-- name: InsertPullRequestFile :exec
-insert into pull_request_files(thread_id, path, status, additions, deletions, changes, previous_path, patch, raw_json, fetched_at)
-values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+insert into pull_request_files(thread_id, position, path, status, additions, deletions, changes, previous_path, patch, raw_json, fetched_at)
+values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
 `
 
 type InsertPullRequestFileParams struct {
 	ThreadID     int64          `json:"thread_id"`
+	Position     int64          `json:"position"`
 	Path         string         `json:"path"`
 	Status       sql.NullString `json:"status"`
 	Additions    int64          `json:"additions"`
@@ -203,6 +154,7 @@ type InsertPullRequestFileParams struct {
 func (q *Queries) InsertPullRequestFile(ctx context.Context, arg InsertPullRequestFileParams) error {
 	_, err := q.db.ExecContext(ctx, insertPullRequestFile,
 		arg.ThreadID,
+		arg.Position,
 		arg.Path,
 		arg.Status,
 		arg.Additions,
@@ -299,24 +251,27 @@ func (q *Queries) ListClusterRuns(ctx context.Context, arg ListClusterRunsParams
 }
 
 const listComments = `-- name: ListComments :many
-select id, thread_id, github_id, comment_type, author_login, author_type, body, is_bot, raw_json, created_at_gh, updated_at_gh
+select id, thread_id, github_id, comment_type, author_login, author_type, body, is_bot, raw_json, created_at_gh, updated_at_gh, deleted_at, deletion_reason
 from comments
 where thread_id = ?1
+  and deleted_at is null
 order by created_at_gh, id
 `
 
 type ListCommentsRow struct {
-	ID          int64          `json:"id"`
-	ThreadID    int64          `json:"thread_id"`
-	GithubID    string         `json:"github_id"`
-	CommentType string         `json:"comment_type"`
-	AuthorLogin sql.NullString `json:"author_login"`
-	AuthorType  sql.NullString `json:"author_type"`
-	Body        string         `json:"body"`
-	IsBot       int64          `json:"is_bot"`
-	RawJson     string         `json:"raw_json"`
-	CreatedAtGh sql.NullString `json:"created_at_gh"`
-	UpdatedAtGh sql.NullString `json:"updated_at_gh"`
+	ID             int64          `json:"id"`
+	ThreadID       int64          `json:"thread_id"`
+	GithubID       string         `json:"github_id"`
+	CommentType    string         `json:"comment_type"`
+	AuthorLogin    sql.NullString `json:"author_login"`
+	AuthorType     sql.NullString `json:"author_type"`
+	Body           string         `json:"body"`
+	IsBot          int64          `json:"is_bot"`
+	RawJson        string         `json:"raw_json"`
+	CreatedAtGh    sql.NullString `json:"created_at_gh"`
+	UpdatedAtGh    sql.NullString `json:"updated_at_gh"`
+	DeletedAt      sql.NullString `json:"deleted_at"`
+	DeletionReason sql.NullString `json:"deletion_reason"`
 }
 
 func (q *Queries) ListComments(ctx context.Context, threadID int64) ([]ListCommentsRow, error) {
@@ -340,6 +295,8 @@ func (q *Queries) ListComments(ctx context.Context, threadID int64) ([]ListComme
 			&i.RawJson,
 			&i.CreatedAtGh,
 			&i.UpdatedAtGh,
+			&i.DeletedAt,
+			&i.DeletionReason,
 		); err != nil {
 			return nil, err
 		}
@@ -385,90 +342,6 @@ func (q *Queries) ListEmbeddingRuns(ctx context.Context, arg ListEmbeddingRunsPa
 			&i.FinishedAt,
 			&i.StatsJson,
 			&i.ErrorText,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listEmbeddingTasks = `-- name: ListEmbeddingTasks :many
-select t.id, t.number, t.kind, t.title, coalesce(d.body, t.body, '') as body, coalesce(d.raw_text, t.body, '') as raw_text,
-  coalesce(d.dedupe_text, t.title || ' ' || coalesce(t.body, '')) as dedupe_text,
-  cast(coalesce((
-    select tks.key_text
-    from thread_key_summaries tks
-    join thread_revisions tr on tr.id = tks.thread_revision_id
-    where tr.thread_id = t.id
-      and tks.summary_kind in ('llm_key_summary', 'llm_key_3line')
-    order by tks.created_at desc, tr.created_at desc, tks.id desc
-    limit 1
-  ), '') as text) as key_summary,
-  coalesce(tv.content_hash, '') as existing_hash
-from threads t
-left join documents d on d.thread_id = t.id
-left join thread_vectors tv on tv.thread_id = t.id and tv.basis = ?1 and tv.model = ?2
-where t.repo_id = ?3
-  and (?4 != 0 or (t.state = 'open' and t.closed_at_local is null))
-  and (?5 is null or t.number = ?5)
-order by coalesce(t.updated_at_gh, t.updated_at) desc, t.number desc
-limit case when ?6 <= 0 then -1 else ?6 end
-`
-
-type ListEmbeddingTasksParams struct {
-	Basis         string      `json:"basis"`
-	Model         string      `json:"model"`
-	RepoID        int64       `json:"repo_id"`
-	IncludeClosed interface{} `json:"include_closed"`
-	Number        interface{} `json:"number"`
-	RowLimit      interface{} `json:"row_limit"`
-}
-
-type ListEmbeddingTasksRow struct {
-	ID           int64  `json:"id"`
-	Number       int64  `json:"number"`
-	Kind         string `json:"kind"`
-	Title        string `json:"title"`
-	Body         string `json:"body"`
-	RawText      string `json:"raw_text"`
-	DedupeText   string `json:"dedupe_text"`
-	KeySummary   string `json:"key_summary"`
-	ExistingHash string `json:"existing_hash"`
-}
-
-func (q *Queries) ListEmbeddingTasks(ctx context.Context, arg ListEmbeddingTasksParams) ([]ListEmbeddingTasksRow, error) {
-	rows, err := q.db.QueryContext(ctx, listEmbeddingTasks,
-		arg.Basis,
-		arg.Model,
-		arg.RepoID,
-		arg.IncludeClosed,
-		arg.Number,
-		arg.RowLimit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []ListEmbeddingTasksRow
-	for rows.Next() {
-		var i ListEmbeddingTasksRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.Number,
-			&i.Kind,
-			&i.Title,
-			&i.Body,
-			&i.RawText,
-			&i.DedupeText,
-			&i.KeySummary,
-			&i.ExistingHash,
 		); err != nil {
 			return nil, err
 		}
@@ -611,7 +484,7 @@ func (q *Queries) ListSyncRuns(ctx context.Context, arg ListSyncRunsParams) ([]S
 }
 
 const listThreadsCurrentSchema = `-- name: ListThreadsCurrentSchema :many
-select id, repo_id, github_id, number, kind, state, title, body, author_login, author_type, html_url,
+select id, repo_id, github_id, number, kind, state, title, body, author_login, author_type, author_association, html_url,
   labels_json, assignees_json, coalesce(raw_json, '') as raw_json, content_hash, is_draft, created_at_gh, updated_at_gh,
   closed_at_gh, merged_at_gh, first_pulled_at, last_pulled_at, updated_at, closed_at_local, close_reason_local
 from threads
@@ -628,31 +501,32 @@ type ListThreadsCurrentSchemaParams struct {
 }
 
 type ListThreadsCurrentSchemaRow struct {
-	ID               int64          `json:"id"`
-	RepoID           int64          `json:"repo_id"`
-	GithubID         string         `json:"github_id"`
-	Number           int64          `json:"number"`
-	Kind             string         `json:"kind"`
-	State            string         `json:"state"`
-	Title            string         `json:"title"`
-	Body             sql.NullString `json:"body"`
-	AuthorLogin      sql.NullString `json:"author_login"`
-	AuthorType       sql.NullString `json:"author_type"`
-	HtmlUrl          string         `json:"html_url"`
-	LabelsJson       string         `json:"labels_json"`
-	AssigneesJson    string         `json:"assignees_json"`
-	RawJson          string         `json:"raw_json"`
-	ContentHash      string         `json:"content_hash"`
-	IsDraft          int64          `json:"is_draft"`
-	CreatedAtGh      sql.NullString `json:"created_at_gh"`
-	UpdatedAtGh      sql.NullString `json:"updated_at_gh"`
-	ClosedAtGh       sql.NullString `json:"closed_at_gh"`
-	MergedAtGh       sql.NullString `json:"merged_at_gh"`
-	FirstPulledAt    sql.NullString `json:"first_pulled_at"`
-	LastPulledAt     sql.NullString `json:"last_pulled_at"`
-	UpdatedAt        string         `json:"updated_at"`
-	ClosedAtLocal    sql.NullString `json:"closed_at_local"`
-	CloseReasonLocal sql.NullString `json:"close_reason_local"`
+	ID                int64          `json:"id"`
+	RepoID            int64          `json:"repo_id"`
+	GithubID          string         `json:"github_id"`
+	Number            int64          `json:"number"`
+	Kind              string         `json:"kind"`
+	State             string         `json:"state"`
+	Title             string         `json:"title"`
+	Body              sql.NullString `json:"body"`
+	AuthorLogin       sql.NullString `json:"author_login"`
+	AuthorType        sql.NullString `json:"author_type"`
+	AuthorAssociation sql.NullString `json:"author_association"`
+	HtmlUrl           string         `json:"html_url"`
+	LabelsJson        string         `json:"labels_json"`
+	AssigneesJson     string         `json:"assignees_json"`
+	RawJson           string         `json:"raw_json"`
+	ContentHash       string         `json:"content_hash"`
+	IsDraft           int64          `json:"is_draft"`
+	CreatedAtGh       sql.NullString `json:"created_at_gh"`
+	UpdatedAtGh       sql.NullString `json:"updated_at_gh"`
+	ClosedAtGh        sql.NullString `json:"closed_at_gh"`
+	MergedAtGh        sql.NullString `json:"merged_at_gh"`
+	FirstPulledAt     sql.NullString `json:"first_pulled_at"`
+	LastPulledAt      sql.NullString `json:"last_pulled_at"`
+	UpdatedAt         string         `json:"updated_at"`
+	ClosedAtLocal     sql.NullString `json:"closed_at_local"`
+	CloseReasonLocal  sql.NullString `json:"close_reason_local"`
 }
 
 func (q *Queries) ListThreadsCurrentSchema(ctx context.Context, arg ListThreadsCurrentSchemaParams) ([]ListThreadsCurrentSchemaRow, error) {
@@ -675,6 +549,7 @@ func (q *Queries) ListThreadsCurrentSchema(ctx context.Context, arg ListThreadsC
 			&i.Body,
 			&i.AuthorLogin,
 			&i.AuthorType,
+			&i.AuthorAssociation,
 			&i.HtmlUrl,
 			&i.LabelsJson,
 			&i.AssigneesJson,
@@ -772,12 +647,12 @@ set github_id = ?1,
   body = ?4,
   author_login = ?5,
   author_type = ?6,
-  html_url = ?7,
-  labels_json = ?8,
-  assignees_json = ?9,
-  raw_json = ?10,
-  content_hash = ?11,
-  is_draft = ?12,
+  author_association = ?7,
+  html_url = ?8,
+  labels_json = ?9,
+  assignees_json = ?10,
+  raw_json = ?11,
+  content_hash = ?12,
   created_at_gh = ?13,
   updated_at_gh = ?14,
   closed_at_gh = ?15,
@@ -792,27 +667,27 @@ where repo_id = ?19
 `
 
 type MarkOpenThreadClosedFromGitHubParams struct {
-	GithubID      string         `json:"github_id"`
-	State         string         `json:"state"`
-	Title         string         `json:"title"`
-	Body          sql.NullString `json:"body"`
-	AuthorLogin   sql.NullString `json:"author_login"`
-	AuthorType    sql.NullString `json:"author_type"`
-	HtmlUrl       string         `json:"html_url"`
-	LabelsJson    string         `json:"labels_json"`
-	AssigneesJson string         `json:"assignees_json"`
-	RawJson       string         `json:"raw_json"`
-	ContentHash   string         `json:"content_hash"`
-	IsDraft       int64          `json:"is_draft"`
-	CreatedAtGh   sql.NullString `json:"created_at_gh"`
-	UpdatedAtGh   sql.NullString `json:"updated_at_gh"`
-	ClosedAtGh    sql.NullString `json:"closed_at_gh"`
-	MergedAtGh    sql.NullString `json:"merged_at_gh"`
-	LastPulledAt  sql.NullString `json:"last_pulled_at"`
-	UpdatedAt     string         `json:"updated_at"`
-	RepoID        int64          `json:"repo_id"`
-	Kind          string         `json:"kind"`
-	Number        int64          `json:"number"`
+	GithubID          string         `json:"github_id"`
+	State             string         `json:"state"`
+	Title             string         `json:"title"`
+	Body              sql.NullString `json:"body"`
+	AuthorLogin       sql.NullString `json:"author_login"`
+	AuthorType        sql.NullString `json:"author_type"`
+	AuthorAssociation sql.NullString `json:"author_association"`
+	HtmlUrl           string         `json:"html_url"`
+	LabelsJson        string         `json:"labels_json"`
+	AssigneesJson     string         `json:"assignees_json"`
+	RawJson           string         `json:"raw_json"`
+	ContentHash       string         `json:"content_hash"`
+	CreatedAtGh       sql.NullString `json:"created_at_gh"`
+	UpdatedAtGh       sql.NullString `json:"updated_at_gh"`
+	ClosedAtGh        sql.NullString `json:"closed_at_gh"`
+	MergedAtGh        sql.NullString `json:"merged_at_gh"`
+	LastPulledAt      sql.NullString `json:"last_pulled_at"`
+	UpdatedAt         string         `json:"updated_at"`
+	RepoID            int64          `json:"repo_id"`
+	Kind              string         `json:"kind"`
+	Number            int64          `json:"number"`
 }
 
 func (q *Queries) MarkOpenThreadClosedFromGitHub(ctx context.Context, arg MarkOpenThreadClosedFromGitHubParams) (int64, error) {
@@ -823,12 +698,12 @@ func (q *Queries) MarkOpenThreadClosedFromGitHub(ctx context.Context, arg MarkOp
 		arg.Body,
 		arg.AuthorLogin,
 		arg.AuthorType,
+		arg.AuthorAssociation,
 		arg.HtmlUrl,
 		arg.LabelsJson,
 		arg.AssigneesJson,
 		arg.RawJson,
 		arg.ContentHash,
-		arg.IsDraft,
 		arg.CreatedAtGh,
 		arg.UpdatedAtGh,
 		arg.ClosedAtGh,
@@ -910,9 +785,10 @@ func (q *Queries) PullRequestChecks(ctx context.Context, threadID int64) ([]Pull
 }
 
 const pullRequestCommits = `-- name: PullRequestCommits :many
-select thread_id, sha, message, author_login, author_name, committed_at, html_url, raw_json, fetched_at
+select thread_id, sha, message, author_login, author_name, committed_at, html_url, raw_json, fetched_at, deleted_at, deletion_reason
 from pull_request_commits
 where thread_id = ?1
+  and deleted_at is null
 order by rowid
 `
 
@@ -935,6 +811,8 @@ func (q *Queries) PullRequestCommits(ctx context.Context, threadID int64) ([]Pul
 			&i.HtmlUrl,
 			&i.RawJson,
 			&i.FetchedAt,
+			&i.DeletedAt,
+			&i.DeletionReason,
 		); err != nil {
 			return nil, err
 		}
@@ -983,10 +861,10 @@ func (q *Queries) PullRequestDetail(ctx context.Context, arg PullRequestDetailPa
 }
 
 const pullRequestFiles = `-- name: PullRequestFiles :many
-select thread_id, path, status, additions, deletions, changes, previous_path, patch, raw_json, fetched_at
+select thread_id, position, path, status, additions, deletions, changes, previous_path, patch, raw_json, fetched_at
 from pull_request_files
 where thread_id = ?1
-order by path
+order by path, position
 `
 
 func (q *Queries) PullRequestFiles(ctx context.Context, threadID int64) ([]PullRequestFile, error) {
@@ -1000,6 +878,7 @@ func (q *Queries) PullRequestFiles(ctx context.Context, threadID int64) ([]PullR
 		var i PullRequestFile
 		if err := rows.Scan(
 			&i.ThreadID,
+			&i.Position,
 			&i.Path,
 			&i.Status,
 			&i.Additions,
@@ -1027,9 +906,11 @@ const pullRequestReviewThreads = `-- name: PullRequestReviewThreads :many
 select thread_id, review_thread_id, path, line, start_line, is_resolved, is_outdated,
   viewer_can_resolve, viewer_can_unresolve, viewer_can_reply,
   first_author_login, first_author_type, first_comment_body, first_comment_url,
-  first_comment_created_at, first_comment_updated_at, comments_json, raw_json, fetched_at
+  first_comment_created_at, first_comment_updated_at, comments_json, raw_json, fetched_at,
+  deleted_at, deletion_reason
 from pull_request_review_threads
 where thread_id = ?1
+  and deleted_at is null
 order by is_resolved, path, line, review_thread_id
 `
 
@@ -1062,6 +943,8 @@ func (q *Queries) PullRequestReviewThreads(ctx context.Context, threadID int64) 
 			&i.CommentsJson,
 			&i.RawJson,
 			&i.FetchedAt,
+			&i.DeletedAt,
+			&i.DeletionReason,
 		); err != nil {
 			return nil, err
 		}
@@ -1231,24 +1114,6 @@ func (q *Queries) ReopenThreadLocally(ctx context.Context, arg ReopenThreadLocal
 	return result.RowsAffected()
 }
 
-const repoSyncStateLastSync = `-- name: RepoSyncStateLastSync :one
-select cast(coalesce(
-  max(last_open_close_reconciled_at),
-  max(last_overlapping_open_scan_completed_at),
-  max(last_non_overlapping_scan_completed_at),
-  max(last_full_open_scan_started_at),
-  max(updated_at),
-  ''
-) as text) as last_sync from repo_sync_state
-`
-
-func (q *Queries) RepoSyncStateLastSync(ctx context.Context) (string, error) {
-	row := q.db.QueryRowContext(ctx, repoSyncStateLastSync)
-	var last_sync string
-	err := row.Scan(&last_sync)
-	return last_sync, err
-}
-
 const repositoryByFullName = `-- name: RepositoryByFullName :one
 select id, owner, name, full_name, github_repo_id, coalesce(raw_json, '') as raw_json, updated_at
 from repositories
@@ -1271,8 +1136,8 @@ func (q *Queries) RepositoryByFullName(ctx context.Context, fullName string) (Re
 }
 
 const upsertComment = `-- name: UpsertComment :one
-insert into comments(thread_id, github_id, comment_type, author_login, author_type, body, is_bot, raw_json, created_at_gh, updated_at_gh)
-values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+insert into comments(thread_id, github_id, comment_type, author_login, author_type, body, is_bot, raw_json, created_at_gh, updated_at_gh, deleted_at, deletion_reason)
+values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
 on conflict(thread_id, comment_type, github_id) do update set
   author_login=excluded.author_login,
   author_type=excluded.author_type,
@@ -1280,21 +1145,25 @@ on conflict(thread_id, comment_type, github_id) do update set
   is_bot=excluded.is_bot,
   raw_json=excluded.raw_json,
   created_at_gh=excluded.created_at_gh,
-  updated_at_gh=excluded.updated_at_gh
+  updated_at_gh=excluded.updated_at_gh,
+  deleted_at=excluded.deleted_at,
+  deletion_reason=excluded.deletion_reason
 returning id
 `
 
 type UpsertCommentParams struct {
-	ThreadID    int64          `json:"thread_id"`
-	GithubID    string         `json:"github_id"`
-	CommentType string         `json:"comment_type"`
-	AuthorLogin sql.NullString `json:"author_login"`
-	AuthorType  sql.NullString `json:"author_type"`
-	Body        string         `json:"body"`
-	IsBot       int64          `json:"is_bot"`
-	RawJson     string         `json:"raw_json"`
-	CreatedAtGh sql.NullString `json:"created_at_gh"`
-	UpdatedAtGh sql.NullString `json:"updated_at_gh"`
+	ThreadID       int64          `json:"thread_id"`
+	GithubID       string         `json:"github_id"`
+	CommentType    string         `json:"comment_type"`
+	AuthorLogin    sql.NullString `json:"author_login"`
+	AuthorType     sql.NullString `json:"author_type"`
+	Body           string         `json:"body"`
+	IsBot          int64          `json:"is_bot"`
+	RawJson        string         `json:"raw_json"`
+	CreatedAtGh    sql.NullString `json:"created_at_gh"`
+	UpdatedAtGh    sql.NullString `json:"updated_at_gh"`
+	DeletedAt      sql.NullString `json:"deleted_at"`
+	DeletionReason sql.NullString `json:"deletion_reason"`
 }
 
 func (q *Queries) UpsertComment(ctx context.Context, arg UpsertCommentParams) (int64, error) {
@@ -1309,6 +1178,8 @@ func (q *Queries) UpsertComment(ctx context.Context, arg UpsertCommentParams) (i
 		arg.RawJson,
 		arg.CreatedAtGh,
 		arg.UpdatedAtGh,
+		arg.DeletedAt,
+		arg.DeletionReason,
 	)
 	var id int64
 	err := row.Scan(&id)
@@ -1352,6 +1223,52 @@ func (q *Queries) UpsertDocument(ctx context.Context, arg UpsertDocumentParams) 
 	var id int64
 	err := row.Scan(&id)
 	return id, err
+}
+
+const upsertPullRequestCommit = `-- name: UpsertPullRequestCommit :exec
+insert into pull_request_commits(thread_id, sha, message, author_login, author_name, committed_at, html_url, raw_json, fetched_at, deleted_at, deletion_reason)
+values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+on conflict(thread_id, sha) do update set
+  message=excluded.message,
+  author_login=excluded.author_login,
+  author_name=excluded.author_name,
+  committed_at=excluded.committed_at,
+  html_url=excluded.html_url,
+  raw_json=excluded.raw_json,
+  fetched_at=excluded.fetched_at,
+  deleted_at=excluded.deleted_at,
+  deletion_reason=excluded.deletion_reason
+`
+
+type UpsertPullRequestCommitParams struct {
+	ThreadID       int64          `json:"thread_id"`
+	Sha            string         `json:"sha"`
+	Message        sql.NullString `json:"message"`
+	AuthorLogin    sql.NullString `json:"author_login"`
+	AuthorName     sql.NullString `json:"author_name"`
+	CommittedAt    sql.NullString `json:"committed_at"`
+	HtmlUrl        sql.NullString `json:"html_url"`
+	RawJson        string         `json:"raw_json"`
+	FetchedAt      string         `json:"fetched_at"`
+	DeletedAt      sql.NullString `json:"deleted_at"`
+	DeletionReason sql.NullString `json:"deletion_reason"`
+}
+
+func (q *Queries) UpsertPullRequestCommit(ctx context.Context, arg UpsertPullRequestCommitParams) error {
+	_, err := q.db.ExecContext(ctx, upsertPullRequestCommit,
+		arg.ThreadID,
+		arg.Sha,
+		arg.Message,
+		arg.AuthorLogin,
+		arg.AuthorName,
+		arg.CommittedAt,
+		arg.HtmlUrl,
+		arg.RawJson,
+		arg.FetchedAt,
+		arg.DeletedAt,
+		arg.DeletionReason,
+	)
+	return err
 }
 
 const upsertPullRequestDetail = `-- name: UpsertPullRequestDetail :exec
@@ -1415,13 +1332,15 @@ insert into pull_request_review_threads(
   thread_id, review_thread_id, path, line, start_line, is_resolved, is_outdated,
   viewer_can_resolve, viewer_can_unresolve, viewer_can_reply,
   first_author_login, first_author_type, first_comment_body, first_comment_url,
-  first_comment_created_at, first_comment_updated_at, comments_json, raw_json, fetched_at
+  first_comment_created_at, first_comment_updated_at, comments_json, raw_json, fetched_at,
+  deleted_at, deletion_reason
 )
 values(
   ?1, ?2, ?3, ?4, ?5, ?6, ?7,
   ?8, ?9, ?10,
   ?11, ?12, ?13, ?14,
-  ?15, ?16, ?17, ?18, ?19
+  ?15, ?16, ?17, ?18, ?19,
+  ?20, ?21
 )
 on conflict(thread_id, review_thread_id) do update set
   path=excluded.path,
@@ -1440,7 +1359,9 @@ on conflict(thread_id, review_thread_id) do update set
   first_comment_updated_at=excluded.first_comment_updated_at,
   comments_json=excluded.comments_json,
   raw_json=excluded.raw_json,
-  fetched_at=excluded.fetched_at
+  fetched_at=excluded.fetched_at,
+  deleted_at=excluded.deleted_at,
+  deletion_reason=excluded.deletion_reason
 `
 
 type UpsertPullRequestReviewThreadParams struct {
@@ -1463,6 +1384,8 @@ type UpsertPullRequestReviewThreadParams struct {
 	CommentsJson          string         `json:"comments_json"`
 	RawJson               string         `json:"raw_json"`
 	FetchedAt             string         `json:"fetched_at"`
+	DeletedAt             sql.NullString `json:"deleted_at"`
+	DeletionReason        sql.NullString `json:"deletion_reason"`
 }
 
 func (q *Queries) UpsertPullRequestReviewThread(ctx context.Context, arg UpsertPullRequestReviewThreadParams) error {
@@ -1486,6 +1409,8 @@ func (q *Queries) UpsertPullRequestReviewThread(ctx context.Context, arg UpsertP
 		arg.CommentsJson,
 		arg.RawJson,
 		arg.FetchedAt,
+		arg.DeletedAt,
+		arg.DeletionReason,
 	)
 	return err
 }
@@ -1543,17 +1468,17 @@ func (q *Queries) UpsertRepository(ctx context.Context, arg UpsertRepositoryPara
 
 const upsertThread = `-- name: UpsertThread :one
 insert into threads(
-  repo_id, github_id, number, kind, state, title, body, author_login, author_type, html_url,
+  repo_id, github_id, number, kind, state, title, body, author_login, author_type, author_association, html_url,
   labels_json, assignees_json, raw_json, content_hash, is_draft,
   created_at_gh, updated_at_gh, closed_at_gh, merged_at_gh,
-  first_pulled_at, last_pulled_at, updated_at
+  first_pulled_at, last_pulled_at, observation_sequence, updated_at
 )
 values(
   ?1, ?2, ?3, ?4, ?5, ?6,
-  ?7, ?8, ?9, ?10,
-  ?11, ?12, ?13, ?14, ?15,
-  ?16, ?17, ?18, ?19,
-  ?20, ?21, ?22
+  ?7, ?8, ?9, ?10, ?11,
+  ?12, ?13, ?14, ?15, ?16,
+  ?17, ?18, ?19, ?20,
+  ?21, ?22, ?23, ?24
 )
 on conflict(repo_id, kind, number) do update set
   github_id=excluded.github_id,
@@ -1562,6 +1487,7 @@ on conflict(repo_id, kind, number) do update set
   body=excluded.body,
   author_login=excluded.author_login,
   author_type=excluded.author_type,
+  author_association=excluded.author_association,
   html_url=excluded.html_url,
   labels_json=excluded.labels_json,
   assignees_json=excluded.assignees_json,
@@ -1573,33 +1499,36 @@ on conflict(repo_id, kind, number) do update set
   closed_at_gh=excluded.closed_at_gh,
   merged_at_gh=excluded.merged_at_gh,
   last_pulled_at=excluded.last_pulled_at,
+  observation_sequence=excluded.observation_sequence,
   updated_at=excluded.updated_at
 returning id
 `
 
 type UpsertThreadParams struct {
-	RepoID        int64          `json:"repo_id"`
-	GithubID      string         `json:"github_id"`
-	Number        int64          `json:"number"`
-	Kind          string         `json:"kind"`
-	State         string         `json:"state"`
-	Title         string         `json:"title"`
-	Body          sql.NullString `json:"body"`
-	AuthorLogin   sql.NullString `json:"author_login"`
-	AuthorType    sql.NullString `json:"author_type"`
-	HtmlUrl       string         `json:"html_url"`
-	LabelsJson    string         `json:"labels_json"`
-	AssigneesJson string         `json:"assignees_json"`
-	RawJson       string         `json:"raw_json"`
-	ContentHash   string         `json:"content_hash"`
-	IsDraft       int64          `json:"is_draft"`
-	CreatedAtGh   sql.NullString `json:"created_at_gh"`
-	UpdatedAtGh   sql.NullString `json:"updated_at_gh"`
-	ClosedAtGh    sql.NullString `json:"closed_at_gh"`
-	MergedAtGh    sql.NullString `json:"merged_at_gh"`
-	FirstPulledAt sql.NullString `json:"first_pulled_at"`
-	LastPulledAt  sql.NullString `json:"last_pulled_at"`
-	UpdatedAt     string         `json:"updated_at"`
+	RepoID              int64          `json:"repo_id"`
+	GithubID            string         `json:"github_id"`
+	Number              int64          `json:"number"`
+	Kind                string         `json:"kind"`
+	State               string         `json:"state"`
+	Title               string         `json:"title"`
+	Body                sql.NullString `json:"body"`
+	AuthorLogin         sql.NullString `json:"author_login"`
+	AuthorType          sql.NullString `json:"author_type"`
+	AuthorAssociation   sql.NullString `json:"author_association"`
+	HtmlUrl             string         `json:"html_url"`
+	LabelsJson          string         `json:"labels_json"`
+	AssigneesJson       string         `json:"assignees_json"`
+	RawJson             string         `json:"raw_json"`
+	ContentHash         string         `json:"content_hash"`
+	IsDraft             int64          `json:"is_draft"`
+	CreatedAtGh         sql.NullString `json:"created_at_gh"`
+	UpdatedAtGh         sql.NullString `json:"updated_at_gh"`
+	ClosedAtGh          sql.NullString `json:"closed_at_gh"`
+	MergedAtGh          sql.NullString `json:"merged_at_gh"`
+	FirstPulledAt       sql.NullString `json:"first_pulled_at"`
+	LastPulledAt        sql.NullString `json:"last_pulled_at"`
+	ObservationSequence int64          `json:"observation_sequence"`
+	UpdatedAt           string         `json:"updated_at"`
 }
 
 func (q *Queries) UpsertThread(ctx context.Context, arg UpsertThreadParams) (int64, error) {
@@ -1613,6 +1542,7 @@ func (q *Queries) UpsertThread(ctx context.Context, arg UpsertThreadParams) (int
 		arg.Body,
 		arg.AuthorLogin,
 		arg.AuthorType,
+		arg.AuthorAssociation,
 		arg.HtmlUrl,
 		arg.LabelsJson,
 		arg.AssigneesJson,
@@ -1625,6 +1555,104 @@ func (q *Queries) UpsertThread(ctx context.Context, arg UpsertThreadParams) (int
 		arg.MergedAtGh,
 		arg.FirstPulledAt,
 		arg.LastPulledAt,
+		arg.ObservationSequence,
+		arg.UpdatedAt,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
+const upsertThreadPreservingDraft = `-- name: UpsertThreadPreservingDraft :one
+insert into threads(
+  repo_id, github_id, number, kind, state, title, body, author_login, author_type, author_association, html_url,
+  labels_json, assignees_json, raw_json, content_hash, is_draft,
+  created_at_gh, updated_at_gh, closed_at_gh, merged_at_gh,
+  first_pulled_at, last_pulled_at, observation_sequence, updated_at
+)
+values(
+  ?1, ?2, ?3, ?4, ?5, ?6,
+  ?7, ?8, ?9, ?10, ?11,
+  ?12, ?13, ?14, ?15, ?16,
+  ?17, ?18, ?19, ?20,
+  ?21, ?22, ?23, ?24
+)
+on conflict(repo_id, kind, number) do update set
+  github_id=excluded.github_id,
+  state=excluded.state,
+  title=excluded.title,
+  body=excluded.body,
+  author_login=excluded.author_login,
+  author_type=excluded.author_type,
+  author_association=excluded.author_association,
+  html_url=excluded.html_url,
+  labels_json=excluded.labels_json,
+  assignees_json=excluded.assignees_json,
+  raw_json=excluded.raw_json,
+  content_hash=excluded.content_hash,
+  is_draft=threads.is_draft,
+  created_at_gh=excluded.created_at_gh,
+  updated_at_gh=excluded.updated_at_gh,
+  closed_at_gh=excluded.closed_at_gh,
+  merged_at_gh=excluded.merged_at_gh,
+  last_pulled_at=excluded.last_pulled_at,
+  observation_sequence=excluded.observation_sequence,
+  updated_at=excluded.updated_at
+returning id
+`
+
+type UpsertThreadPreservingDraftParams struct {
+	RepoID              int64          `json:"repo_id"`
+	GithubID            string         `json:"github_id"`
+	Number              int64          `json:"number"`
+	Kind                string         `json:"kind"`
+	State               string         `json:"state"`
+	Title               string         `json:"title"`
+	Body                sql.NullString `json:"body"`
+	AuthorLogin         sql.NullString `json:"author_login"`
+	AuthorType          sql.NullString `json:"author_type"`
+	AuthorAssociation   sql.NullString `json:"author_association"`
+	HtmlUrl             string         `json:"html_url"`
+	LabelsJson          string         `json:"labels_json"`
+	AssigneesJson       string         `json:"assignees_json"`
+	RawJson             string         `json:"raw_json"`
+	ContentHash         string         `json:"content_hash"`
+	IsDraft             int64          `json:"is_draft"`
+	CreatedAtGh         sql.NullString `json:"created_at_gh"`
+	UpdatedAtGh         sql.NullString `json:"updated_at_gh"`
+	ClosedAtGh          sql.NullString `json:"closed_at_gh"`
+	MergedAtGh          sql.NullString `json:"merged_at_gh"`
+	FirstPulledAt       sql.NullString `json:"first_pulled_at"`
+	LastPulledAt        sql.NullString `json:"last_pulled_at"`
+	ObservationSequence int64          `json:"observation_sequence"`
+	UpdatedAt           string         `json:"updated_at"`
+}
+
+func (q *Queries) UpsertThreadPreservingDraft(ctx context.Context, arg UpsertThreadPreservingDraftParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, upsertThreadPreservingDraft,
+		arg.RepoID,
+		arg.GithubID,
+		arg.Number,
+		arg.Kind,
+		arg.State,
+		arg.Title,
+		arg.Body,
+		arg.AuthorLogin,
+		arg.AuthorType,
+		arg.AuthorAssociation,
+		arg.HtmlUrl,
+		arg.LabelsJson,
+		arg.AssigneesJson,
+		arg.RawJson,
+		arg.ContentHash,
+		arg.IsDraft,
+		arg.CreatedAtGh,
+		arg.UpdatedAtGh,
+		arg.ClosedAtGh,
+		arg.MergedAtGh,
+		arg.FirstPulledAt,
+		arg.LastPulledAt,
+		arg.ObservationSequence,
 		arg.UpdatedAt,
 	)
 	var id int64

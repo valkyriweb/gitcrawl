@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	crawlstore "github.com/openclaw/crawlkit/store"
 )
 
 type CodeSnapshot struct {
@@ -114,7 +116,7 @@ func (s *Store) SearchCodeDocuments(ctx context.Context, repoID int64, query str
 		}
 		return nil, fmt.Errorf("latest code snapshot: %w", err)
 	}
-	matchQuery := ftsQuery(query)
+	matchQuery := crawlstore.FTS5TokenQuery(query)
 	if matchQuery == "" {
 		return s.searchCodeDocumentsLike(ctx, snapshot, query, limit)
 	}
@@ -146,7 +148,7 @@ func (s *Store) searchCodeDocumentsLike(ctx context.Context, snapshot CodeSnapsh
 	if needle == "" {
 		return []CodeSearchHit{}, nil
 	}
-	pattern := "%" + escapeLike(needle) + "%"
+	pattern := "%" + crawlstore.EscapeLike(needle) + "%"
 	rows, err := s.q().QueryContext(ctx, `
 		select id, path, language, substr(text_content, 1, 320)
 		from code_documents

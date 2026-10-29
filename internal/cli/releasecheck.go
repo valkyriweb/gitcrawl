@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"strings"
 
 	"github.com/openclaw/crawlkit/releasecheck"
 	"github.com/openclaw/gitcrawl/internal/config"
@@ -33,6 +34,28 @@ func (a *App) maybeNotifyRelease(ctx context.Context, args []string) {
 		JSONOutput:  a.format == FormatJSON,
 		IsTerminal:  releasecheck.StderrIsTerminal(),
 	})
+}
+
+func releaseNotificationAllowed(args []string) bool {
+	// Metrics commands must not touch archive/runtime state or make unrelated
+	// network requests, including during read-only imports and status checks.
+	if len(args) > 0 && args[0] == "metrics" {
+		return false
+	}
+	if len(args) == 0 || args[0] != "fill-pr-details" {
+		return true
+	}
+	for _, arg := range args[1:] {
+		name, ok := flagName(arg)
+		if !ok {
+			continue
+		}
+		name, _, _ = strings.Cut(name, "=")
+		if name == "reserve-rate-limit" {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *App) runCheckUpdate(ctx context.Context, args []string) error {

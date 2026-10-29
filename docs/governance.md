@@ -32,7 +32,7 @@ gitcrawl close-cluster owner/repo --id 42 --reason "all members handled"
 gitcrawl reopen-cluster owner/repo --id 42
 ```
 
-The reason defaults to `CLI manual close` and is stored alongside the override for audit. Locally closed threads and clusters are filtered out by `--hide-closed` across `clusters`, `cluster-detail`, the TUI, and search.
+The reason defaults to `CLI manual close` and is stored alongside the override for audit. Locally closed threads and clusters are filtered out by `--hide-closed` across `clusters`, `cluster-detail`, and the TUI. Search has its own state filters; it does not accept `--hide-closed`.
 
 This **does not** change anything on GitHub. It is purely a local triage signal — useful when you have already commented "duplicate of #X" on the upstream issue and want to clear it from your maintainer view.
 
@@ -77,8 +77,9 @@ The chosen `--number` must already be a member of the cluster. The TUI's right-c
 All governance `--number` flags accept the same thread-reference forms as sync:
 bare numbers, `#123`, `issues/123`, `pull/123`, `owner/repo#123`, and full
 GitHub issue or pull request URLs. The command still applies only to the
-`owner/repo` argument you pass to gitcrawl; URL input is accepted so copied
-GitHub links can be pasted directly.
+`owner/repo` argument you pass to gitcrawl. Qualified references must match that
+repository (case-insensitively); a mismatched link is rejected before any local
+override is written.
 
 ## Reopen and undo
 
@@ -98,7 +99,7 @@ Each call records a fresh override row, so the audit history is preserved.
 `gitcrawl cluster-detail` returns active overrides as part of the JSON payload, and `gitcrawl runs --kind cluster` lists when each clustering run was performed. To inspect raw override history you can query SQLite directly:
 
 ```bash
-sqlite3 ~/.config/gitcrawl/gitcrawl.db \
+sqlite3 "$(gitcrawl doctor --json | jq -r .db_path)" \
   "SELECT cluster_id, thread_number, kind, reason, created_at
    FROM cluster_member_overrides ORDER BY created_at DESC LIMIT 20;"
 ```
@@ -136,3 +137,28 @@ The thread stays open on GitHub; only your local triage view hides it.
 - It does not edit, label, comment on, or close GitHub issues. Use `gh` for that.
 - It does not retrain embeddings or reshape the underlying graph — it overlays decisions on top of the algorithm output.
 - It does not propagate to other gitcrawl installations unless you publish your database via a [portable store](/portable-stores/).
+
+## Permanent owner removal
+
+For a native local archive, preview an exact selection, then apply its `plan_id`:
+
+```sh
+gitcrawl purge-threads owner/repo --numbers 123,456 --json
+gitcrawl purge-threads owner/repo --numbers 123,456 --apply PLAN_ID --json
+```
+
+The read-only plan lists thread identities and affected row counts. Apply rechecks
+its content hash in one transaction, removes selected bodies, history, derived
+records and retry work, and installs permanent collection exclusions. Changed
+plans require a new preview. Shared actor profiles and unrelated threads stay
+intact. Owner exclusions are reported separately from provider deletion or
+successful recovery; core collection coverage remains independent.
+
+Selections must contain 1–100 distinct existing numbers in one unambiguous local
+repository. The analytics collector must be stopped. Portable/cloud archives,
+blob-backed targets, shared cluster state, retained repository workflow snapshots,
+linked workflow reservations, and deletions allowing native integer ID reuse are
+refused. Exclusions follow the explicit `owner/repo` collection namespace; carry
+that policy when changing targets. Portable publication is refused while local
+exclusions exist. This removes logical archive data, not GitHub content, backups,
+or forensic disk remnants. There is no undo or automatic backup.
