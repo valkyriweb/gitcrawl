@@ -233,12 +233,15 @@ if "$ROOT/scripts/verify-release.sh" v0.7.1 "$ARTIFACTS" >/dev/null 2>&1; then
 fi
 
 release_workflow="$ROOT/.github/workflows/release-unified.yml"
-grep -F 'uses: openclaw/release-workflows/.github/workflows/release-go-cli.yml@v1' "$release_workflow" >/dev/null
-grep -F 'checksum-filename: checksums.txt' "$release_workflow" >/dev/null
-grep -F 'archive-files: '\''["CHANGELOG.md","LICENSE","README.md"]'\''' "$release_workflow" >/dev/null
-grep -F 'stable-identifier: org.openclaw.gitcrawl' "$release_workflow" >/dev/null
-grep -F 'darwin-universal: disabled' "$release_workflow" >/dev/null
-grep -F 'require-signed-tag: true' "$release_workflow" >/dev/null
+# The fork drops release-unified.yml (no publishing), so only check it when present.
+if [[ -f "$release_workflow" ]]; then
+  grep -F 'uses: openclaw/release-workflows/.github/workflows/release-go-cli.yml@v1' "$release_workflow" >/dev/null
+  grep -F 'checksum-filename: checksums.txt' "$release_workflow" >/dev/null
+  grep -F 'archive-files: '\''["CHANGELOG.md","LICENSE","README.md"]'\''' "$release_workflow" >/dev/null
+  grep -F 'stable-identifier: org.openclaw.gitcrawl' "$release_workflow" >/dev/null
+  grep -F 'darwin-universal: disabled' "$release_workflow" >/dev/null
+  grep -F 'require-signed-tag: true' "$release_workflow" >/dev/null
+fi
 signers="$ROOT/.github/release-allowed-signers"
 [[ -s "$signers" && ! -L "$signers" ]]
 ssh-keygen -lf <(cut -d ' ' -f 2- "$signers") |
