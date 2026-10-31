@@ -19,6 +19,16 @@ func TestReplaceAndSearchCodeSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("repo: %v", err)
 	}
+	otherRepoID, err := st.UpsertRepository(ctx, Repository{Owner: "openclaw", Name: "other", FullName: "openclaw/other", RawJSON: "{}", UpdatedAt: "2026-06-06T00:00:00Z"})
+	if err != nil {
+		t.Fatalf("other repo: %v", err)
+	}
+	if _, err := st.ReplaceCodeSnapshot(ctx, CodeSnapshot{
+		RepoID: otherRepoID, SourceRoot: "/tmp/other", GitSHA: "def",
+		FileCount: 1, ByteCount: 33, IndexedAt: "2026-06-06T00:00:00Z",
+	}, []CodeDocument{{Path: "other.go", Language: "go", ContentHash: "other", Text: "func RefreshManifest() {} // other", ByteSize: 33, UpdatedAt: "2026-06-06T00:00:00Z"}}); err != nil {
+		t.Fatalf("other snapshot: %v", err)
+	}
 	snapshotID, err := st.ReplaceCodeSnapshot(ctx, CodeSnapshot{
 		RepoID: repoID, SourceRoot: "/tmp/gitcrawl", GitSHA: "abc", WorktreeDirty: true,
 		FileCount: 2, ByteCount: 40, IndexedAt: "2026-06-06T00:00:00Z",
@@ -77,6 +87,13 @@ func TestReplaceAndSearchCodeSnapshot(t *testing.T) {
 	}
 	if len(hits) != 1 || hits[0].Path != "new.go" {
 		t.Fatalf("failed replacement discarded prior snapshot: %#v", hits)
+	}
+	otherHits, err := st.SearchCodeDocuments(ctx, otherRepoID, "RefreshManifest", 10)
+	if err != nil {
+		t.Fatalf("search untouched repository: %v", err)
+	}
+	if len(otherHits) != 1 || otherHits[0].Path != "other.go" || otherHits[0].GitSHA != "def" || otherHits[0].SourceRoot != "/tmp/other" || otherHits[0].WorktreeDirty {
+		t.Fatalf("replacement changed another repository's corpus or provenance: %#v", otherHits)
 	}
 }
 
