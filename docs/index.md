@@ -21,7 +21,7 @@ A local-first GitHub triage tool for maintainers and agents. Sync issues and PRs
 
 `gitcrawl` mirrors a GitHub repository's issues and pull requests into local SQLite, then layers semantic clustering and full-text search on top so a maintainer (or an agent acting on their behalf) can triage threads without burning live search quota.
 
-- **Local SQLite first.** All issues, PRs, comments, reviews, files, commits, checks, and workflow runs land in `~/.config/gitcrawl/gitcrawl.db`. Queries hit the disk, not GitHub.
+- **Local SQLite first.** All issues, PRs, comments, reviews, files, commits, checks, and workflow runs land in the platform default SQLite database. Queries hit the disk, not GitHub.
 - **Octopool for `gh`.** The old `gitcrawl gh` cache moved to Octopool, which owns the shared org-authenticated GitHub relay.
 - **Semantic clustering.** OpenAI embeddings group related reports, with deterministic GitHub reference evidence (`#123`, `pull/123`) preventing weak similarity bridges from forming mega-clusters.
 - **Terminal UI.** `gitcrawl tui` is a keyboard- and mouse-driven cluster browser with bidirectional sort, jump-to-number, neighbors, and member-level governance actions.
@@ -40,7 +40,7 @@ A local-first GitHub triage tool for maintainers and agents. Sync issues and PRs
 Use [`gitcrawl search`](/search/) for local discovery and [Octopool migration](/gh-shim/) for pooled `gh` reads.
 
 ### I want to triage a busy repo
-Read [Sync](/sync/) to bring data local, then [Clustering](/clustering/) and the [TUI](/tui/) for the maintainer workflow.
+Read the [maintainer archive workflow](/maintainer-archive/) for the first-run checklist, then [Sync](/sync/) to bring data local, [Clustering](/clustering/), and the [TUI](/tui/) for the triage loop.
 
 ### I want the full reference
 [Commands](/commands/) lists every flag and JSON field. [Configuration](/configuration/) covers env vars and paths.

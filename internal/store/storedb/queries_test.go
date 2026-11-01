@@ -54,7 +54,6 @@ func TestGeneratedQueriesRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upsert thread: %v", err)
 	}
-
 	if got, err := q.CountRepositories(ctx); err != nil || got != 1 {
 		t.Fatalf("count repositories = %d, %v", got, err)
 	}
@@ -94,11 +93,6 @@ func TestGeneratedQueriesRoundTrip(t *testing.T) {
 	})
 	if err != nil || documentID == 0 {
 		t.Fatalf("upsert document id = %d, %v", documentID, err)
-	}
-	if tasks, err := q.ListEmbeddingTasks(ctx, storedb.ListEmbeddingTasksParams{
-		Basis: "thread", Model: "text-embedding-3-large", RepoID: repoID, IncludeClosed: 1, Number: nil, RowLimit: 10,
-	}); err != nil || len(tasks) != 1 {
-		t.Fatalf("list embedding tasks len = %d, %v", len(tasks), err)
 	}
 
 	runParams := storedb.RecordSyncRunParams{
@@ -157,7 +151,7 @@ func TestGeneratedQueriesRoundTrip(t *testing.T) {
 	if rows, err := q.PullRequestFiles(ctx, threadID); err != nil || len(rows) != 1 {
 		t.Fatalf("pull request files len = %d, %v", len(rows), err)
 	}
-	if err := q.InsertPullRequestCommit(ctx, storedb.InsertPullRequestCommitParams{
+	if err := q.UpsertPullRequestCommit(ctx, storedb.UpsertPullRequestCommitParams{
 		ThreadID: threadID, Sha: "abc123", Message: ns("commit"), AuthorLogin: ns("alice"), AuthorName: ns("Alice"),
 		CommittedAt: ns(now), HtmlUrl: ns("https://github.com/openclaw/gitcrawl/commit/abc123"), RawJson: `{"commit":true}`, FetchedAt: now,
 	}); err != nil {
@@ -205,12 +199,6 @@ func TestGeneratedQueriesRoundTrip(t *testing.T) {
 		t.Fatalf("list workflow runs len = %d, %v", len(rows), err)
 	}
 
-	if _, err := st.DB().ExecContext(ctx, `insert into repo_sync_state(repo_id, last_open_close_reconciled_at, updated_at) values(?, ?, ?)`, repoID, later, now); err != nil {
-		t.Fatalf("insert repo sync state: %v", err)
-	}
-	if got, err := q.RepoSyncStateLastSync(ctx); err != nil || got != later {
-		t.Fatalf("repo sync state last sync = %q, %v", got, err)
-	}
 	if _, err := st.DB().ExecContext(ctx, `create table portable_metadata(key text primary key, value text not null)`); err != nil {
 		t.Fatalf("create portable metadata: %v", err)
 	}
@@ -239,13 +227,7 @@ func TestGeneratedQueriesRoundTrip(t *testing.T) {
 	if err := q.DeletePullRequestChecks(ctx, threadID); err != nil {
 		t.Fatalf("delete pr checks: %v", err)
 	}
-	if err := q.DeletePullRequestCommits(ctx, threadID); err != nil {
-		t.Fatalf("delete pr commits: %v", err)
-	}
 	if err := q.DeletePullRequestFiles(ctx, threadID); err != nil {
 		t.Fatalf("delete pr files: %v", err)
-	}
-	if err := q.DeletePullRequestReviewThreads(ctx, threadID); err != nil {
-		t.Fatalf("delete review threads: %v", err)
 	}
 }

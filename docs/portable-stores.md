@@ -26,39 +26,272 @@ A portable store is just a Git repository whose contents include a SQLite databa
 ```bash
 gitcrawl init \
   --portable-store https://github.com/openclaw/gitcrawl-store.git \
-  --portable-db data/openclaw__openclaw.sync.db \
-  --store-dir ~/.config/gitcrawl/portable
+  --portable-db data/openclaw__openclaw.sync.db
 ```
+
+When `--store-dir` is omitted, gitcrawl clones the store under
+`<config-dir>/stores/<repo-name>`. For the example above, a fresh macOS install
+uses `~/Library/Application Support/gitcrawl/stores/gitcrawl-store`; a Linux
+install using the default config location uses
+`~/.config/gitcrawl/stores/gitcrawl-store`. Pass `--store-dir` when you want a
+fixed checkout path.
 
 `init` will:
 
-1. Clone the portable store to `--store-dir`
-2. Wire `~/.config/gitcrawl/config.toml` to use the database at `--portable-db` inside that checkout
+1. Clone the portable store next to the active config, or to `--store-dir` if provided
+2. Wire the active `config.toml` to use the database at `--portable-db` inside
+   that checkout. With the Linux default config location, that file is
+   `~/.config/gitcrawl/config.toml`.
 3. Create the runtime cache, vector, and log directories in the standard locations
 
 JSON output reports `portable_store_url`, `portable_store_dir`, and `portable_store: cloned|pulled|reset-pulled` so automation can tell what happened.
 
+Large stores may commit a gzip artifact instead of the raw SQLite file. The
+configured `db_path` remains the logical SQLite path, while its sibling
+manifest declares `compression: "gzip"`, a relative `archivePath`, and the
+archive size and SHA-256. Gitcrawl verifies the compressed artifact, inflates
+at most the manifest's declared SQLite size, verifies the existing uncompressed
+size and SHA-256, runs SQLite `quick_check`, and only then atomically replaces
+the runtime mirror. Legacy raw SQLite stores continue to use the same manifest
+without compression fields.
+
+Stores may instead commit a split artifact: `compression: "split"` and an
+ordered `archiveParts` list of `{path, bytes, sha256}` basenames beside the
+manifest (`NAME.part-000`, `NAME.part-001`, ...). The parts are the
+uncompressed SQLite bytes, so `archiveBytes`/`archiveSha256` equal
+`outputBytes`/`sha256`. Gitcrawl checks every part's size and digest, the digest
+of their ordered concatenation and the per-part `maxArchiveBytes`, then
+reassembles and validates the database like any other artifact. Readers older
+than split support refuse the manifest as an unsupported compression and keep
+their last good runtime mirror.
+
+Split exists for Git-hosted stores. Each gzip generation is a new compressed
+blob that cannot delta against its predecessor, so every hourly snapshot added
+about 68 MB to the store. Consecutive uncompressed parts share most bytes; a
+measured pair of consecutive production generations transferred as a 0.5 MB
+thin pack and added about 0.5 MB to a fully packed repository. Subscribers
+receive each new part as a full object; strict refresh's post-advance geometric
+repack then folds it into deltas (see below).
+
+Initialization validates portable arguments before invoking Git and validates
+the artifact before saving configuration. Repeated initialization and a
+publisher's raw-to-gzip transition do not require a raw `.db` in the checkout.
+Use `init` for setup; it still regenerates configuration on success.
+Initial clones are staged privately and published only after Git
+finishes successfully. A failed clone leaves an absent or empty destination
+unchanged, so retrying `init` does not reuse an incomplete Git checkout.
+Pre-created empty directories stay in place with their permissions and ACLs;
+publication refuses to replace concurrently created entries. If publication
+fails after moving files, recovery material is preserved at the reported path.
+Platforms or filesystems without native exclusive renames retain the legacy
+clone behavior; support is probed before transferring data.
+If a dirty merge triggers legacy reset recovery and that reset fails, `init`
+reports the reset failure with the same credential-safe Git diagnostics used
+elsewhere, so the error identifies the recovery step that needs attention.
+
+## Routine subscriber refresh
+
+Use the strict subscriber command for scheduled updates:
+
+```bash
+gitcrawl --config /path/to/config.toml portable refresh \
+  --expected-remote https://github.com/example/archive-store.git \
+  --git /absolute/path/to/git \
+  --timeout 2m \
+  --min-free-bytes 2147483648 \
+  --max-growth-bytes 2147483648 \
+  --json
+```
+
+This uses the configured logical database and its existing checkout. Optional
+`--store-dir` and `--portable-db` assert that those configured paths match the
+intended store; they do not reconfigure it. `--expected-remote` is required
+because legacy configs do not pin an origin URL. `--branch` defaults to `main`;
+the checkout must be on that branch and track the matching origin branch.
+No credentials belong in the URL or command line; use Git's credential helper.
+HTTP(S) URL userinfo and passwords in any URL are refused. SSH transport
+usernames such as `ssh://git@host/repo` and `git@host:repo` remain supported.
+
+Refresh takes a nonblocking advisory lock for the canonical store path. All
+Gitcrawl portable Git writers, legacy recovery, runtime promotion and CLI
+writable-runtime sessions share that lease. Symlink aliases converge. Its
+permanent sibling `.STORE.gitcrawl.lock` file is never removed or stolen based
+on age; the operating system releases ownership when the process exits.
+An occupied lock is a refusal, not a reason to kill another process.
+
+Strict refresh refuses dirty indexes/worktrees, **all untracked or ignored
+checkout files**, hidden index entries, unrelated origins, divergent history,
+active Git locks or operation state, orphan/temporary packs, hooks, filters,
+attributes, submodules, linked worktrees, alternate object stores, config
+includes/redirections and unsupported extensions. Resolve these deliberately
+outside the subscriber command. It never resets, cleans, prunes, reclones,
+deletes backups or sidecars, or invokes reader/doctor auto-repair. The only
+repack is the bounded post-advance geometric repack of a split store described
+below; raw and gzip stores are never repacked.
+
+Admission examines every exposed Git configuration scope. Refusals identify
+the scope and unsafe category without printing keys or values. Single-valued
+hooks-path, fsmonitor, attributes-file and SSH-command settings overridden by
+the portable runner are inert; actual checkout hooks/attributes and exposed
+filter definitions still cause refusal. For a dedicated subscriber that must
+exclude machine-wide filters, Unix callers can set
+`GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1` for this invocation (Windows:
+`GIT_CONFIG_GLOBAL=NUL GIT_CONFIG_NOSYSTEM=1`). `GIT_CONFIG_SYSTEM` may also point
+to the platform null device. These scope-removal controls survive sanitization;
+arbitrary config paths, repository redirection and config injection do not.
+Disabling global configuration also removes global credential helpers, so the
+remaining authentication configuration must support the intended remote.
+No global files are changed, and repository-local safety checks still apply.
+
+Fetch requests only the intended branch into `FETCH_HEAD`, with no pruning,
+tags, submodule recursion or remote-tracking ref updates. Both existing HEAD
+and the tracking ref must be ancestors of the frozen fetched commit. Only its
+manifest and selected artifact are extracted into private staging beside the
+runtime mirror. Existing raw/gzip digest, expanded-size, SQLite `quick_check`
+and semantic-identity validation run before a fast-forward checkout. Tracking
+ref advancement uses compare-and-swap. Configuration, refs, store identity,
+Git metadata, cleanliness and capacity are checked again at mutation boundaries.
+
+The validated runtime generation is atomically renamed outside the checkout.
+A runtime with bytes differing from its recorded source digest, or any SQLite
+sidecars, is preserved as `preserved-local`; it is never overwritten to make
+the subscriber appear fresh. Newly materialized raw replicas record their digest
+even without a manifest. Verified disposable replicas use immutable SQLite reads
+so ordinary reads do not create sidecars that would claim local ownership.
+Writable CLI opens record local ownership before
+SQLite migrations or writes. Ordinary reads retain that ownership and the
+original source identity across later publisher generations; local closures,
+vectors and other runtime work survive repeated reads. A corrupt locally owned
+runtime reports an error without replacement; a corrupt disposable replica
+still follows the legacy recovery path. Other Gitcrawl CLI writers obey the lease, but
+external Git/SQLite writers do not. Observable changes cause refusal; this is
+not a universal filesystem transaction or protection against a hostile writer.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--expected-remote URL` | required | Expected identity of `origin` |
+| `--store-dir PATH` | configured store | Assert canonical store directory |
+| `--portable-db PATH` | configured logical DB | Assert clean relative slash path; never the gzip path |
+| `--branch NAME` | `main` | Expected local and origin branch |
+| `--git PATH` | `GITCRAWL_PORTABLE_GIT`, then resolved process PATH | Absolute executable; no login shell is used |
+| `--timeout DURATION` | `2m` | Total operation deadline, plus bounded process cleanup |
+| `--min-free-bytes N` | `2147483648` (2 GiB) | Free-space reserve on store and staging filesystems |
+| `--max-growth-bytes N` | `2147483648` (2 GiB) | Positive logical-file growth budget |
+| `--json` | off | Structured success, no-op, refusal or partial result |
+
+Admission requires reserve **plus the full growth budget** available on both
+filesystems. Growth is the sum of positive per-path size deltas under the
+checkout (including `.git`) and runtime database directory, relative to
+admission. Deleting/shrinking old files does not credit the budget. Metadata
+scans run at stage boundaries and every 100 ms in flight, with a 200,000-file
+scan limit; they never read or copy historical pack contents. Blob extraction
+is capped at its frozen Git size, and manifest-based staging estimates allow
+for inflation and semantic-identity copies. A budget is a sampled cancellation
+boundary, **not an OS quota**: rapid Git or filesystem writes can overshoot
+between scans. Reserve is also affected by unrelated processes. Use filesystem
+quotas where a hard physical allocation ceiling is required.
+
+On cancellation, owned Git process groups receive a graceful termination
+request, then are forced after at most 750 ms and reaped (pipe cleanup adds at
+most one second). Windows starts Git suspended, assigns a kill-on-close job,
+then resumes it; console break is best-effort before job termination. Unrelated
+processes are never targeted. Only this operation's private staging is removed.
+Filesystem and SQLite cancellation is cooperative; a kernel I/O stall can
+delay cancellation or process reaping beyond the requested deadline.
+Fetched objects and `FETCH_HEAD` may remain after failure. If checkout, tracking
+ref or mirror advancement has already started, JSON reports `partial`; no
+successful rollback is claimed, and an interrupted Git operation may need
+operator inspection before another strict refresh.
+
+JSON reports `stage`, `result` (`updated`, `no-op`, `refused`, `partial`),
+`before_commit`, `after_commit`, `target_commit`, `artifact_id`, `sha256`,
+`artifact_bytes`, `mirror_destination`, `mirror_result`, `capacity`,
+`elapsed_ms` and, for split stores, `repack`. A refusal includes a bounded `reason` and exits nonzero. Stderr
+contains stage/elapsed/result diagnostics; stdout remains data. A no-op means
+the refs already match; a missing runtime may still be materialized. Git failures
+use fixed, credential-safe repository, authentication, connection or disk-space
+diagnostics when recognized, with general troubleshooting guidance otherwise;
+raw remote/helper stderr is never included.
+
+When the checkout's generation is split, strict refresh runs
+`git repack -d --geometric=2` inside the same deadline and growth budget, so
+new generations are stored as deltas against their predecessors
+(`repack: "geometric"`). This also covers objects fetched by an implicit reader
+fast-forward, which never repacks, and generations kept as fetched packs
+(for example with `fetch.unpackLimit`), so a no-op refresh can still
+consolidate. With nothing loose and a single pack it reports
+`repack: "current"` and does nothing. A larger
+history pack is left untouched. With more than 512 loose objects, such as years of loose gzip
+generations, refresh skips this (`skipped-loose-backlog`); pack that backlog
+once with an owner-run `git repack -d` first. A consolidation failure is reported
+as `repack: "failed"` with a bounded `repack_reason` and next step, without
+undoing the validated generation.
+
+All portable Git entry points explicitly set `maintenance.auto=false` and
+`gc.auto=0`, including init, implicit reader fetch/merge and retained recovery
+clone/reset helpers. Fetch also uses `--no-auto-maintenance`. Hooks, fsmonitor
+and recursive submodule operations are disabled in the portable runner.
+Unsupported Git options fail closed; there is no fallback that drops safety
+flags. Set `GITCRAWL_PORTABLE_GIT` to an absolute path to select Git for legacy
+portable commands as well. Gitcrawl does not change global or local Git policy.
+
 ## How read-only commands behave
 
-Read-only commands (`search`, `threads`, `clusters`, `cluster-detail`, `neighbors`, the TUI) refresh the portable-store checkout before reading, so they always see the latest published data:
+Read-only commands (`search`, `threads`, `clusters`, `cluster-detail`, `neighbors`, the TUI) normally refresh the portable-store checkout before reading. A locally owned writable runtime continues serving its local data instead of accepting publisher replacement:
 
 - The refresh is best-effort and non-interactive
 - SSH attempts are bounded so an offline remote does not hang the CLI
 - Stale SQLite sidecars (WAL, SHM) are cleared after the pull so queries see freshly pulled data
 - Local Git pull configuration that tries to rebase onto multiple branch merge refs is handled cleanly
 - SQLite files are copied through a temporary runtime database, checked with `quick_check`, and verified against the portable manifest before replacing the previous runtime mirror
+- Manifest-backed gzip SQLite artifacts are verified before inflation and still use the uncompressed database digest as the runtime identity
 
 If the remote is unreachable, the read still answers from the local checkout.
 
+`status` is observational: it uses an existing runtime without fetching,
+repairing, migrating, or promoting anything. It reports `state: stale` when
+that runtime's recorded source generation differs from the checkout, with a
+warning for writable local state. Before a gzip-only subscriber has a runtime,
+status validates and reads the artifact in disposable temporary storage; its
+inventory reports the gzip path and compressed on-disk bytes, with a warning
+explaining that distinction. It never reports an absent logical `.db` as an
+empty, current subscriber.
+
+`status --json` and `doctor --json` report snapshot publication as
+`last_export_at`, separately from `last_sync_at`. The export time comes from
+the snapshot manifest, or from database metadata for legacy pruned stores.
+A runtime only uses the checkout's export time when its recorded source
+identity matches that manifest. A stale runtime does not borrow a newer
+checkout's timestamp.
+
+`last_sync_at` requires a retained successful sync run. Portable exports omit
+run history, so this timestamp is normally absent from subscriber status.
+An old scan checkpoint is not a substitute. Export time establishes when a
+snapshot was produced, not whether all GitHub data was collected. Use
+`coverage` and the relevant thread records to assess the evidence you need;
+`state: current` means the runtime matches its source generation, not that
+every record is current on GitHub.
+
+This is the **legacy reader recovery contract**, separate from strict
+`portable refresh`: a marked malformed store can still be backed up, reset and
+recloned with the existing recovery backoff. Its historical stale-index-lock
+check requires both age and an external open-file probe. Do not use these
+commands as a preservation-first subscriber verification step. They now share
+the canonical store lease and maintenance suppression, but do not inherit
+strict refresh's capacity limits or clean-only policy.
+
 ## How write commands behave
 
-Write commands (`embed`, `refresh`, `cluster`, neighbor generation) need to persist new data without mutating the published portable store. They open a **writable runtime mirror** alongside the portable checkout so vectors and overrides land in the runtime cache while the portable database remains read-only.
+Write commands (`sync`, `embed`, `refresh`, `portable prune`, `cluster`, neighbor generation) open a **writable runtime mirror** alongside the portable checkout so new GitHub data, vectors, and overrides persist without partially mutating the published portable store. When this redirect engages, gitcrawl prints one stderr notice naming both the runtime mirror and the checkout database.
+
+JSON output from `sync`, `refresh`, `fill-pr-details`, and `portable prune` makes that destination machine-readable: `db_target` is `runtime-mirror`, `db_target_path` names the database actually written, and `portable_source_db` names the database in the checkout. With a non-portable local database, `db_target` is `direct`, `db_target_path` names that database, and `portable_source_db` is omitted.
 
 This separation means:
 
 - You can `gitcrawl embed` against a portable store without dirtying the Git checkout
 - Local cluster overrides (`close-cluster`, exclusions, canonicals) live in the runtime mirror
-- Only the publishing workflow writes back into the portable checkout
+- Before publishing, even `refresh` writes only to the runtime mirror and leaves the checkout database untouched
+- The `portable prune` publishing step is the boundary that writes a validated database and manifest back into the checkout
 
 ## Publishing: `gitcrawl portable prune`
 
@@ -66,30 +299,210 @@ This separation means:
 gitcrawl portable prune
 gitcrawl portable prune --body-chars 256       # default
 gitcrawl portable prune --body-chars 512 --no-vacuum
+gitcrawl portable prune --include-sync-failures # opt-in, error text redacted
+gitcrawl portable prune --no-publish            # prune only the runtime mirror
 gitcrawl portable prune --json
 ```
 
-`portable prune` validates the pruned database with SQLite `quick_check`, writes a `.manifest.json` next to the database with size and SHA-256 integrity, and includes the manifest path plus hash in JSON output. Consumers use that manifest to reject incomplete or mismatched portable-store downloads before replacing a known-good runtime mirror.
+`portable prune` validates the pruned runtime-mirror database with SQLite `quick_check` and writes a `.manifest.json` next to it with size and SHA-256 integrity. When the configured `db_path` is inside a portable checkout, prune then stages the database and manifest inside that checkout, validates the staged pair, and replaces the published files with atomic renames while preserving their existing permissions. A failed publish restores the previously published pair; an interrupted one is caught later by manifest validation and the standard repair path, the same way an interrupted `git pull` of the store is. Pass `--no-publish` to leave the pruned result only in the runtime mirror. Consumers use the manifest to reject incomplete or mismatched portable-store downloads before replacing a known-good runtime mirror.
 
-`prune` converts the database into the portable v2 backup format and (by default) runs SQLite `VACUUM` to reclaim space. The result is a smaller database suitable for committing back to Git.
+`prune` converts the database into the portable v2 backup format and (by default) runs SQLite `VACUUM` to reclaim space. The result is a smaller database and matching manifest ready to commit from the portable checkout. JSON output includes `published`, which is true only when this copy-back happened, plus `published_db_path` and `published_manifest_path` when published.
 
 Portable v2 keeps the data agents most often need for offline GitHub reads:
 
-- Repositories, issues, pull requests, labels, authors, and timestamps
+- Repositories, issues, pull requests, labels, author login/type/association, and timestamps
 - Compact issue/PR body excerpts plus original body lengths
 - Compact comments, reviews, and review-comment excerpts plus original body lengths
 - PR details, files, commits, status checks, and workflow runs
-- Thread fingerprints used by duplicate and cluster-oriented workflows
+- Thread revisions, deterministic fingerprints, and key summaries used by duplicate and cluster-oriented workflows
 
-It strips the data that is large, easy to regenerate, or mainly useful for exact API replay: raw GitHub JSON, generated documents and FTS indexes, embeddings and vectors, code snapshots and diff blobs, cluster run history, similarity edges, and blob storage. The database records this contract in `portable_metadata` with `schema=gitcrawl-portable-sync-v2`, `includes`, `excluded`, and `capabilities` keys.
+It strips the data that is large, private, easy to regenerate, or mainly useful for exact API replay: raw GitHub JSON, generated documents and FTS indexes, embeddings and vectors, code snapshots and diff blobs (including `pull_request_files.patch`), cluster run history, the sync failure ledger, similarity edges, and blob storage. PR file path, status, line counts, rename metadata, and other current file identity remain. Pass `--include-sync-failures` only when failure history is useful to portable-store readers; the table is retained but every `error_message` is replaced with `[redacted for portable export]`. Once the source schema contains the ledger, pruning securely rewrites the database even with `--no-vacuum` so current, deleted, and historical retry text cannot remain in free pages. An interrupted rewrite remains marked pending and is retried by the next prune. The database records this contract in `portable_metadata` with `schema=gitcrawl-portable-sync-v2`, `includes`, `excluded`, `capabilities`, and `thread_author_profile` keys. The added revision, fingerprint, summary, and author-association fields are additive; the portable schema identifier remains v2 so older readers can continue using the columns and tables they understand.
+
+Portable mirrors retain existing revision-bound key summaries, but do not regenerate them from compact body excerpts. Pruning removes canonical revision evidence blobs, so run a fully hydrated sync in a writable archive before `summarize`; the summary queue requires the exact content-addressed payload bound to the revision.
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--body-chars <n>` | `256` | Maximum body characters to keep per thread/comment excerpt |
-| `--no-vacuum` | _(off)_ | Skip the post-prune `VACUUM` |
+| `--no-vacuum` | _(off)_ | Skip size-reclaim `VACUUM`; a present or pending failure ledger still forces a secure rewrite |
+| `--include-sync-failures` | _(off)_ | Keep the sync failure ledger while replacing every error message with a redaction marker |
+| `--no-publish` | _(off)_ | Prune the runtime mirror without publishing the database and manifest back to a portable checkout |
 | `--json` | _(off)_ | JSON output |
 
-After pruning, commit and push the database file from the portable checkout the way you would for any Git repository.
+After pruning, commit and push both the database and its `.manifest.json` from the portable checkout the way you would for any Git repository.
+
+## Derived generations: `gitcrawl portable export`
+
+`portable export` creates a new, validated database-and-manifest generation from
+the configured active database, preserving the source by default. It is generic
+artifact production: Gitcrawl owns the consistent SQLite snapshot, semantic
+shaping, validation, size budget, digest, and manifest. Promotion into a
+repository, replacement of an older generation, Git commits, and publication
+remain external operations.
+
+The initial snapshot uses SQLite's online backup API in bounded page chunks, so
+committed WAL state is captured consistently and cancellation can be observed
+between chunks without compacting the multi-gigabyte source first.
+The private working copy disables journaling, synchronous writes, and secure
+deletion because it is never exposed and is deleted on any error. Privacy and
+durability come from the separate compact generation, full validation, hashing,
+fsync, and atomic directory commit.
+
+For a disposable batch-job database with a verified external recovery copy,
+`--consume-source` moves the source into export staging instead of creating the
+initial full-size copy. Close all database users, checkpoint SQLite, and set
+`PRAGMA journal_mode=DELETE` before saving and verifying the recovery copy.
+The source must be a regular file with one hard link, no SQLite sidecars, and
+on the same filesystem as the output. An exclusive SQLite lock rejects active
+readers and writers. This mode is supported on Unix systems.
+
+Once the source moves, its original path is gone. Export errors discard the
+consumed staging file; recover from the verified backup. Do not save the pruned
+file over the full-runtime backup. All shaping, privacy checks, compaction,
+validation, and artifact publication remain the same as ordinary export.
+Compaction still needs space for the reduced database and compressed artifact.
+
+```bash
+gitcrawl --config /path/to/config.toml portable export \
+  --profile current-state-v1 \
+  --body-chars 32 \
+  --output-dir /path/to/artifact.next \
+  --database-name openclaw__openclaw.sync.db \
+  --public-path data/openclaw__openclaw.sync.db \
+  --repository openclaw/openclaw \
+  --compression gzip \
+  --max-archive-bytes 99999999 \
+  --json
+```
+
+The required `--profile` currently accepts only `current-state-v1`.
+`--output-dir` is also required and must not exist; export builds beside it and
+renames the complete pair into place only after validation. The database name
+defaults to `gitcrawl.db` and must be a safe basename. `--public-path` defaults
+to that name and is a clean relative slash path recorded in the manifest and
+`portable_metadata`; it is a logical consumer path, never the source or output
+host path. `--body-chars` defaults to `256`. `--max-bytes` is an optional,
+inclusive limit for raw database generations. `--compression gzip` instead
+commits only the gzip archive and manifest in the generation. Pair it with
+`--max-archive-bytes`; a Git host requiring an artifact smaller than
+100,000,000 bytes should pass `99999999`. `--compression split` commits the
+manifest and ordered uncompressed parts of 32 MiB (or `--max-archive-bytes`,
+when smaller); `--max-archive-bytes` then caps each part, and more than 64 parts
+is refused.
+The optional `--repository owner/repo` is semantic export behavior: Gitcrawl
+removes all other repositories and their dependent rows from the disposable
+snapshot, verifies the exact remaining identity, and records it in the manifest.
+Without the flag, multi-repository artifacts remain supported.
+The manifest reports every retained table as a sorted `{name, rows}` object.
+It includes a singular repository object for scoped exports and for unscoped
+artifacts that naturally contain exactly one repository; multi-repository
+artifacts omit that singular field.
+Its `exportedAt` value is event metadata for that generation and is not embedded
+in the derived SQLite database. Identical source state and export options
+therefore produce identical database bytes, SHA-256, and artifact identity even
+when exported at different times. The manifest `sha256` remains the exact digest
+of the finalized SQLite bytes. `artifactId` is instead the digest of a private,
+normalized compact copy and is identified by
+`artifactIdProfile: current-state-semantic-v1` (JSON command output uses
+`artifact_id_profile`). Publishers should use `artifactId` for no-op decisions
+and `sha256` for file integrity: repeated ingestion may legitimately change the
+file SHA while retaining the same meaningful portable state.
+For gzip generations, the manifest also records `compression`, `archivePath`,
+`archiveBytes`, `archiveSha256`, and `maxArchiveBytes`. Gitcrawl validates the
+archive against both compressed and expanded identities before atomically
+committing the generation. Split generations record `archiveParts` instead of
+`archivePath`; JSON command output lists them as `archive_parts` with output
+paths.
+Destructive `portable prune` continues to record its operation time as
+`portable_metadata.exported_at`.
+
+The semantic identity policy is an exact allowlist rather than a name pattern.
+Unknown future tables and columns remain in the identity, and a known column
+with an unexpected SQLite type fails identity computation. Missing known legacy
+tables and columns are skipped safely. The `current-state-semantic-v1` policy is:
+
+| Action | Tables or columns |
+| --- | --- |
+| Delete local-only tables when present | `observation_schema_convergence`, `repo_pipeline_state`, `repo_sync_state`, `sqlite_stat1`, `sqlite_stat4`, `thread_observation_sequence`, `thread_child_observation_reservations`, `workflow_run_observation_reservations`, `pull_request_review_thread_syncs` |
+| Clear repository ingestion time | `repositories.updated_at` |
+| Clear thread ingestion/order fields | `threads.first_pulled_at`, `last_pulled_at`, `updated_at`, `observation_sequence`, `evidence_observation_sequence`, `evidence_source_updated_at` |
+| Clear revision/fingerprint record bookkeeping | `thread_revisions.observation_sequence`, `thread_revisions.created_at`, `thread_fingerprints.created_at` |
+| Clear membership ordering but retain membership | `thread_child_observation_memberships.observation_sequence` becomes `1`; `member_ids_json` is retained |
+| Clear PR/workflow fetch and local record times | `pull_request_details.fetched_at` and `updated_at`; `pull_request_files.fetched_at`; `pull_request_commits.fetched_at`; `pull_request_checks.fetched_at`; `pull_request_review_threads.fetched_at`; `pull_request_review_thread_revisions.fetched_at` and `recorded_at`; `github_workflow_runs.fetched_at` |
+| Preserve tombstone state without local observation time | Non-NULL `threads.closed_at_local` and `deleted_at` values on comments, PR commits, review threads, and review-thread revisions become an empty non-NULL marker; NULL remains NULL |
+
+The policy also removes the named observation-convergence triggers associated
+with the deleted allocator/reservation state and normalizes SQLite's transient
+schema cookie before compaction. To prevent insertion-order-only hidden rowids
+from changing the compact bytes, it rebuilds child memberships, PR files, PR
+commits, review threads, workflow runs, and portable metadata in their declared
+primary-key order; retained triggers are restored in deterministic name order.
+The disposable compact file also zeroes SQLite's file-change,
+version-valid-for, and writer-library-version header words so a SQLite library
+upgrade cannot change semantic identity by itself. It does not clear titles, bodies or excerpts,
+body lengths, labels, assignees, states, URLs, GitHub timestamps, content hashes,
+comment/review content, revision or fingerprint content, membership IDs, PR or
+workflow public state, or repository identity. Manifest validation always
+recomputes the declared semantic profile and artifact ID in addition to checking
+the exact size and SHA-256 pair.
+
+The `current-state-v1` profile starts with portable v2 shaping and keeps current
+repositories, issue and pull-request threads, current comments, compact thread
+revisions and fingerprints, pull-request detail/review/check state, workflow
+runs, and child observation memberships. It omits comment revision history,
+generated thread key summaries, and derived cluster groups, memberships,
+lineage, overrides, and closures. PR file identity and change counts remain,
+while `pull_request_files.patch` diff payloads are set to `NULL`. It also removes ordinary non-unique indexes
+while retaining primary keys, unique constraints, and explicit unique indexes.
+The manifest records the exact dropped tables and indexes.
+
+Derived exports record `column_profile=sanitized-compatibility` in SQLite
+metadata and `columnProfile: sanitized-compatibility` in the manifest. They keep
+the full-schema compatibility columns `repositories.raw_json`,
+`threads.raw_json`, and `threads.body` to avoid three full-table SQLite rewrites;
+the raw JSON values are empty and `threads.body` contains only `body_excerpt`.
+Export rebuilds `threads` once from its stored constrained table definition,
+preserving table constraints, explicit unique indexes, triggers, child foreign
+keys, and all other columns while omitting ordinary transport indexes. Custom
+INSERT/DELETE triggers are retained; unsupported custom UPDATE-trigger semantics
+fail closed rather than silently diverging during the bulk copy.
+The final `VACUUM INTO` ensures the removed full payload bytes are absent. The
+portable schema identifier remains `gitcrawl-portable-sync-v2`, and ordinary
+`portable prune` continues to physically drop these columns.
+
+Those history and governance omissions are intentional data loss in the
+generation, not a promise that every omission can be rebuilt. Opening the
+export writable lets the current Gitcrawl migration recreate missing tables and
+ordinary schema indexes, but the omitted historical snapshots, summaries, and
+local maintainer decisions do not return. Rebuildable derived state may be
+generated again from the retained current data where the relevant command
+supports it.
+
+Before removing transport-only indexes, export requires an empty
+`foreign_key_check` while those indexes still make relationship proof efficient.
+It then creates one compact final generation with `VACUUM INTO`, closes and
+removes the larger private working database, and promotes the compact file
+within staging. The compact file must pass `quick_check` and full
+`integrity_check`; export then enforces the optional finalized byte
+budget, hashes the database with SHA-256, derives semantic identity through a
+second bounded online backup and compact normalization pass, writes and fsyncs
+the manifest, then
+re-reads the pair without repeating the unindexed foreign-key scan. Concise
+stage progress, including `artifact identity`, is written to stderr, including
+during JSON output. Any failure
+or handled interrupt leaves the requested output directory absent and removes
+the private staging directory.
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--profile <name>` | _(required)_ | Semantic export profile; currently `current-state-v1` |
+| `--output-dir <path>` | _(required)_ | New artifact directory; must not already exist |
+| `--database-name <name>` | `gitcrawl.db` | Safe database basename inside the generation |
+| `--public-path <path>` | database name | Logical relative slash path recorded in metadata and the manifest |
+| `--repository <owner/repo>` | _(unset)_ | Semantically restrict the artifact to exactly one repository |
+| `--body-chars <n>` | `256` | Maximum body characters retained in compact excerpts |
+| `--max-bytes <n>` | _(unset)_ | Inclusive maximum finalized database size |
+| `--consume-source` | _(off)_ | Move an exclusively owned, backed-up source into staging; errors after handoff discard it |
+| `--json` | _(off)_ | Stable structured result, including local source and output paths |
 
 ## A typical publishing flow
 
@@ -97,12 +510,13 @@ After pruning, commit and push the database file from the portable checkout the 
 # In the portable store checkout, refresh upstream data into the local runtime mirror.
 gitcrawl refresh owner/repo
 
-# Prune for a small, shareable footprint.
+# Prune for a small, shareable footprint and publish the database plus manifest into the checkout.
 gitcrawl portable prune --body-chars 256
 
-# Commit and push using normal Git.
-cd ~/.config/gitcrawl/portable
-git add data/openclaw__openclaw.sync.db
+# Commit and push using normal Git from the configured portable checkout.
+cd ~/Library/Application\ Support/gitcrawl/stores/gitcrawl-store
+# Linux default: cd ~/.config/gitcrawl/stores/gitcrawl-store
+git add data/openclaw__openclaw.sync.db data/openclaw__openclaw.sync.db.manifest.json
 git commit -m "data: refresh openclaw/gitcrawl"
 git push
 ```
@@ -119,7 +533,7 @@ The v2 backup also keeps comments and PR-detail tables for local review, cluster
 
 - The portable store carries the SQLite database. It does not carry the Octopool `gh` cache.
 - Vectors regenerated on each consumer's machine after `embed` are not shared; portable pruning removes vector tables from the published database.
-- Portable stores are read-mostly. Multiple writers pushing concurrently will race the way any Git workflow does — gate writes through a single publisher or a CI workflow.
+- Portable stores are read-mostly. Multiple writers pushing concurrently — including concurrent `portable prune` publishers against the same checkout — race the way any Git workflow does; gate writes through a single publisher or a CI workflow.
 
 ## See also
 
