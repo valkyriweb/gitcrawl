@@ -19,6 +19,7 @@ create table threads (
   body text,
   author_login text,
   author_type text,
+  author_association text,
   html_url text not null,
   labels_json text not null,
   assignees_json text not null,
@@ -33,6 +34,14 @@ create table threads (
   close_reason_local text,
   first_pulled_at text,
   last_pulled_at text,
+  observation_sequence integer not null default 0
+    check (
+      typeof(observation_sequence) = 'integer'
+      and observation_sequence >= -9223372036854775807
+    ),
+  evidence_observation_sequence integer not null default 0
+    check (typeof(evidence_observation_sequence) = 'integer' and evidence_observation_sequence >= 0),
+  evidence_source_updated_at text not null default '',
   updated_at text not null,
   unique(repo_id, kind, number)
 );
@@ -50,7 +59,28 @@ create table comments (
   raw_json_blob_id integer references blobs(id) on delete set null,
   created_at_gh text,
   updated_at_gh text,
+  deleted_at text,
+  deletion_reason text,
+  check (
+    (deleted_at is null and deletion_reason is null)
+    or (deleted_at is not null and deletion_reason is not null and trim(deletion_reason) <> '')
+  ),
   unique(thread_id, comment_type, github_id)
+);
+
+create table comment_revisions (
+  id integer primary key,
+  comment_id integer not null references comments(id) on delete cascade,
+  author_login text,
+  author_type text,
+  body text not null,
+  is_bot integer not null default 0,
+  raw_json text not null,
+  created_at_gh text,
+  updated_at_gh text,
+  deleted_at text,
+  deletion_reason text,
+  recorded_at text not null
 );
 
 create table blobs (
@@ -65,6 +95,46 @@ create table blobs (
   created_at text not null
 );
 
+create table thread_observation_sequence (
+  id integer primary key check (id = 1),
+  value integer not null check (typeof(value) = 'integer' and value >= 0),
+  last_started_at text not null
+);
+
+create table thread_child_observation_reservations (
+  thread_id integer not null references threads(id) on delete cascade,
+  family text not null check (family in (
+    'comments',
+    'pull_request_details',
+    'pull_request_files',
+    'pull_request_commits',
+    'pull_request_checks',
+    'pull_request_review_threads'
+  )),
+  source_updated_at text not null default '',
+  observation_sequence integer not null
+    check (typeof(observation_sequence) = 'integer' and observation_sequence > 0),
+  primary key(thread_id, family)
+);
+
+create table thread_child_observation_memberships (
+  thread_id integer not null references threads(id) on delete cascade,
+  family text not null,
+  observation_sequence integer not null
+    check (typeof(observation_sequence) = 'integer' and observation_sequence > 0),
+  member_ids_json text not null,
+  primary key(thread_id, family)
+);
+
+create table workflow_run_observation_reservations (
+  repo_id integer not null references repositories(id) on delete cascade,
+  head_sha text not null check (trim(head_sha) <> ''),
+  source_updated_at text not null default '',
+  observation_sequence integer not null
+    check (typeof(observation_sequence) = 'integer' and observation_sequence > 0),
+  primary key(repo_id, head_sha)
+);
+
 create table thread_revisions (
   id integer primary key,
   thread_id integer not null references threads(id) on delete cascade,
@@ -74,8 +144,9 @@ create table thread_revisions (
   body_hash text not null,
   labels_hash text not null,
   raw_json_blob_id integer references blobs(id) on delete set null,
-  created_at text not null,
-  unique(thread_id, content_hash)
+  observation_sequence integer not null default 0
+    check (typeof(observation_sequence) = 'integer' and observation_sequence >= 0),
+  created_at text not null
 );
 
 create table pull_request_details (
@@ -98,6 +169,12 @@ create table pull_request_details (
 
 create table pull_request_files (
   thread_id integer not null references threads(id) on delete cascade,
+  -- GitHub can return multiple file entries with the same filename for one PR,
+  -- for example a removed file and an added file at the same path. Store the
+  -- fetched file list as a replaceable snapshot instead of keying by path.
+  -- See https://github.com/openclaw/gitcrawl/issues/77 for the duplicate-path
+  -- bug and why position is snapshot-local rather than a durable file identity.
+  position integer not null default 0,
   path text not null,
   status text,
   additions integer not null default 0,
@@ -107,7 +184,7 @@ create table pull_request_files (
   patch text,
   raw_json text not null,
   fetched_at text not null,
-  primary key(thread_id, path)
+  primary key(thread_id, position)
 );
 
 create table pull_request_commits (
@@ -120,6 +197,12 @@ create table pull_request_commits (
   html_url text,
   raw_json text not null,
   fetched_at text not null,
+  deleted_at text,
+  deletion_reason text,
+  check (
+    (deleted_at is null and deletion_reason is null)
+    or (deleted_at is not null and deletion_reason is not null and trim(deletion_reason) <> '')
+  ),
   primary key(thread_id, sha)
 );
 
@@ -158,7 +241,42 @@ create table pull_request_review_threads (
   comments_json text not null,
   raw_json text not null,
   fetched_at text not null,
+  deleted_at text,
+  deletion_reason text,
+  check (
+    (deleted_at is null and deletion_reason is null)
+    or (deleted_at is not null and deletion_reason is not null and trim(deletion_reason) <> '')
+  ),
   primary key(thread_id, review_thread_id)
+);
+
+create table pull_request_review_thread_revisions (
+  id integer primary key,
+  thread_id integer not null,
+  review_thread_id text not null,
+  path text,
+  line integer not null default 0,
+  start_line integer not null default 0,
+  is_resolved integer not null default 0,
+  is_outdated integer not null default 0,
+  viewer_can_resolve integer not null default 0,
+  viewer_can_unresolve integer not null default 0,
+  viewer_can_reply integer not null default 0,
+  first_author_login text,
+  first_author_type text,
+  first_comment_body text,
+  first_comment_url text,
+  first_comment_created_at text,
+  first_comment_updated_at text,
+  comments_json text not null,
+  raw_json text not null,
+  fetched_at text not null,
+  deleted_at text,
+  deletion_reason text,
+  recorded_at text not null,
+  foreign key(thread_id, review_thread_id)
+    references pull_request_review_threads(thread_id, review_thread_id)
+    on delete cascade
 );
 
 create table pull_request_review_thread_syncs (
@@ -231,6 +349,23 @@ create table thread_vectors (
   primary key(thread_id, basis, model)
 );
 
+create table thread_fingerprints (
+  id integer primary key,
+  thread_revision_id integer not null references thread_revisions(id) on delete cascade,
+  algorithm_version text not null,
+  fingerprint_hash text not null,
+  fingerprint_slug text not null,
+  title_tokens_json text not null,
+  body_token_hash text not null,
+  linked_refs_json text not null,
+  file_set_hash text not null,
+  module_buckets_json text not null,
+  simhash64 text not null,
+  feature_json text not null,
+  created_at text not null,
+  unique(thread_revision_id, algorithm_version)
+);
+
 create table thread_key_summaries (
   id integer primary key,
   thread_revision_id integer not null references thread_revisions(id) on delete cascade,
@@ -254,6 +389,21 @@ create table sync_runs (
   finished_at text,
   stats_json text,
   error_text text
+);
+
+create table sync_attempt_failures (
+  id integer primary key,
+  repo_id integer not null references repositories(id) on delete cascade,
+  thread_id integer references threads(id) on delete set null,
+  number integer not null,
+  operation text not null,
+  error_class text not null,
+  error_message text not null,
+  first_seen_at text not null,
+  last_seen_at text not null,
+  retry_count integer not null default 0,
+  resolved_at text,
+  unique(repo_id, number, operation, error_class)
 );
 
 create table summary_runs (

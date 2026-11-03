@@ -12,13 +12,20 @@ permalink: /installation/
 
 ## Requirements
 
-- **Go 1.26+** if building from source
+- **Go 1.27.2+** if building from source
 - **Git** for cloning the repository (and for portable stores)
 - **A GitHub token** for any command that talks to GitHub (`sync`, `refresh`)
-- **An OpenAI API key** only for `embed`, `refresh` (embed stage), and any future summary commands
+- **An OpenAI API key** for `summarize`, `embed`, and the embedding stage of `refresh`
 - **`gh` CLI** optional, used by gitcrawl only as a token source via `gh auth token`
 
-gitcrawl runs on macOS and Linux. Windows is not actively tested.
+gitcrawl runs on macOS 13 Ventura or newer and Linux. Windows is not actively tested.
+
+CrawlKit v0.17.0 requires Go 1.27. The module keeps Go 1.27.2 as its language
+minimum and selects the patched Go 1.27.3 toolchain for source builds; keep
+`GOTOOLCHAIN=auto` (the default) to allow that download. Docker also builds with
+Go 1.27.3. This fixes the reachable crypto/x509 vulnerability GO-2026-6809.
+Go 1.27 also raises the minimum macOS version for newly built binaries
+to macOS 13; the previous Go 1.26 build baseline no longer applies.
 
 ## Install from Homebrew
 
@@ -30,11 +37,12 @@ Homebrew installs the `gitcrawl` binary. GitHub CLI shim behavior moved to Octop
 
 ## Install from a GitHub release
 
-Each tagged release publishes archives for `darwin_amd64`, `darwin_arm64`, `linux_amd64`, and `linux_arm64` via [GoReleaser](https://github.com/openclaw/gitcrawl/blob/main/.goreleaser.yaml).
+Each GitHub release includes archives for `darwin_amd64`, `darwin_arm64`, `linux_amd64`, and `linux_arm64` built via [GoReleaser](https://github.com/openclaw/gitcrawl/blob/main/.goreleaser.yaml).
+Official macOS archives are signed as `org.openclaw.gitcrawl` by `Developer ID Application: OpenClaw Foundation (FWJYW4S8P8)`; local source and snapshot builds do not require signing credentials.
 
 ```bash
 # Replace VERSION and PLATFORM with the values you want.
-VERSION=v0.1.2
+VERSION=v0.16.0
 PLATFORM=darwin_arm64
 mkdir -p "$HOME/bin"
 curl -L "https://github.com/openclaw/gitcrawl/releases/download/${VERSION}/gitcrawl_${VERSION#v}_${PLATFORM}.tar.gz" \
@@ -71,6 +79,17 @@ go build \
 
 Symlink or copy `bin/gitcrawl` somewhere on your `PATH` (`~/bin`, `/usr/local/bin`, `~/.local/bin`).
 
+For a metrics-only source deployment alongside an existing portable subscriber,
+use an [isolated versioned metrics runtime](/metrics/#isolated-source-built-installation)
+and verify it with `metrics status` and its separate config. Keep the subscriber's
+binary selection and refresh job unchanged.
+
+Source builds use scalar vector scoring by default. Set `GOEXPERIMENT=simd` on
+`go build` to enable Go 1.27's experimental portable SIMD kernels for clustering
+and exact neighbors. The API may change in Go 1.28; unsupported hardware and
+`GODEBUG=simd=0` use the scalar kernels. Release archives and Docker builds enable
+this SIMD path.
+
 ## GitHub CLI shim migration
 
 `gitcrawl gh` moved to Octopool:
@@ -85,7 +104,7 @@ See [the gh shim guide](/gh-shim/) for migration details.
 ## Verify the install
 
 ```bash
-gitcrawl init           # creates ~/.config/gitcrawl/{config.toml,gitcrawl.db,...}
+gitcrawl init           # creates config and data under platform default paths
 gitcrawl doctor         # confirms config, database, and credential discovery
 gitcrawl doctor --json  # same, machine-readable
 ```
@@ -96,4 +115,4 @@ gitcrawl doctor --json  # same, machine-readable
 
 - **Release archives:** download the new tarball and replace the binary.
 - **Source builds:** `git pull && go build ...` — the version string comes from `git describe`.
-- **Configuration is forward-compatible.** Existing `config.toml` and `gitcrawl.db` files are reused across versions; no migration step is needed for normal point releases.
+- **Configuration is forward-compatible.** Existing `config.toml` and `gitcrawl.db` files are reused across versions; no migration step is needed for normal point releases. Existing `~/.config/gitcrawl/config.toml` installs continue to load from that path until the new platform config path exists.

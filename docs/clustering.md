@@ -44,12 +44,15 @@ The defaults match ghcrawl's tuning so the output is comparable across tools:
 | `--min-size <n>` | `1` | Minimum members per emitted cluster |
 | `--max-cluster-size <n>` | `40` | Hard cap on cluster size |
 | `--k <n>` | `16` | Nearest-neighbor fanout per thread |
-| `--limit <n>` | _(no limit)_ | Maximum vector rows to consider |
+| `--limit <n>` | _(no limit)_ | Maximum fresh vector rows to consider; explicitly permits a partial run |
 | `--model <name>` | _(config)_ | Embedding model override |
 | `--basis <name>` | _(config)_ | Embedding basis override |
 | `--include-closed` | _(off)_ | Include closed threads |
+| `--strict-vectors` | _(off)_ | Require complete fresh configured vectors before mutation |
 
 Every active vector-backed thread is represented in the result: singleton clusters use `kind = singleton_orphan`, multi-member clusters use `kind = duplicate_candidate`.
+
+Clustering excludes stale configured vectors and reports incomplete work as `partial` without retiring clusters outside the processed subset. When no fresh configured vectors exist, the default preserves the established compatible fallback to existing vectors from another model or basis. Use `--strict-vectors` to require complete fresh configured coverage and fail before mutation; `--limit` remains an explicit non-retiring partial run even in strict mode.
 
 ## List clusters
 
@@ -124,8 +127,37 @@ gitcrawl neighbors owner/repo --number 123 --limit 10
 | `--limit <n>` | `10` | Maximum neighbors |
 | `--threshold <float>` | `0.2` | Minimum cosine score |
 | `--include-closed` | _(off)_ | Include closed issue and pull request vectors |
+| `--open-at <time>` | _(off)_ | Only rows created by the time and not closed by then; implies `--include-closed` |
+| `--created-after <time\|ref>` | _(off)_ | Only rows created after the time, or numbered after the issue/PR reference |
+| `--merged-after <time>` | _(off)_ | Only pull requests merged after the time; implies `--include-closed` |
+
+Time filters take an RFC 3339 time or a `YYYY-MM-DD` date (UTC) and apply before `--limit`. Comparisons use SQLite date functions with millisecond precision. `--created-after` also takes an issue or pull request reference (`456`, `#456`, or its URL) and keeps rows numbered after it.
+
+Each neighbor row carries the thread's `state`, `html_url`, `is_draft`, and, when known, `author_login`, `author_association`, `created_at_gh`, `closed_at_gh`, `merged_at_gh`, and `closed_at_local`, so a closed row can be told apart from a merged one without a second lookup. The output's `state_as_of` is the start of the newest successful complete open (or all) sync, one without `--numbers`, `--limit`, or `--since`; it is omitted when none is recorded. Failed runs and partial checkpoints do not advance it. This is a sync-and-sweep watermark, not a guarantee that all historical threads have been imported.
+
+### How far row state and time filters can be trusted
+
+The archive keeps each thread's current GitHub values, not its history. What follows from that:
+
+- **Each row is current as of `state_as_of` or later.** A complete sync lists every open thread and sweeps closed threads updated since the previous complete sync started, and `state_as_of` is the start of the newest one, so it is no later than the time any row's `state`, `closed_at_gh`, and `merged_at_gh` were read: the listing runs after the start, and `sync --numbers` can refresh a row afterwards. Changes after a row was read are not in the archive. This holds once sweeps cover the time since each row was stored. The first sweep of an archive reaches back only to the earliest pull of a row that is still open (or 24 hours when there is none), so a closed row stored earlier keeps an older `closed_at_gh` if it was reopened and closed again before that; `sync --state all` refreshes every row.
+- **A merge is final.** `merged_at_gh` never changes once set. For archived rows covered by the sweeps above, `--merged-after` filters recorded merge times through `state_as_of`; later merges may be missing. Threads never imported into the archive cannot appear in results. Use `sync --state all` to backfill historical threads and refresh legacy closed rows.
+- **Creation is fixed, and numbers follow it.** `created_at_gh` and the number never change, and GitHub numbers issues and pull requests together in creation order, so `--created-after <ref>` needs no clock.
+- **`--open-at` errs only by including rows.** It reads the current `created_at` and `closed_at`, and reopening clears `closed_at`, so a row with a reopen in its history counts as open from creation to its latest close. It can list a row that was closed at that moment, but never drops one that was open, apart from the stale closed rows described above.
+
+Similarity and these filters find candidates; confirm the current state with `gh` before acting on one.
+
+```bash
+# Pull requests that were open when issue 123 was filed.
+gitcrawl neighbors owner/repo --number 123 --open-at 2026-09-01T10:00:00Z --json \
+  | jq '.neighbors[] | select(.kind == "pull_request")'
+
+# Similar pull requests merged after my pull request was opened.
+gitcrawl neighbors owner/repo --number 456 --merged-after 2026-09-15 --json
+```
 
 Useful for "what else looks like this?" without committing to a cluster. If the source row is present but lacks a current embedding, the CLI command backfills that one row when an OpenAI key is configured; otherwise it prints the exact `gitcrawl embed --number ... --limit 1` command to run. The TUI's `n` shortcut and "Enter on a member" also load vector neighbors for the selected row.
+
+Large `--limit` values are supported without hitting SQLite's SQL variable limit when loading result metadata. Neighbor search still scores all eligible stored vectors, so larger archives can take longer even with a small result limit.
 
 ## Tuning recipes
 
@@ -173,6 +205,44 @@ Durable cluster IDs are derived from the representative thread, so they survive 
 - You can safely re-cluster after every refresh without losing maintainer state
 
 Cluster runs are recorded in `run_records` and visible via `gitcrawl runs --kind cluster`.
+
+## Computed candidate generations
+
+The native available-subset producer keeps durable IDs stable by quarantining
+any computed candidate whose identity is ambiguous: merges, splits and
+protected targets. Those threads keep their retained durable membership, but
+the current computation would otherwise be invisible. Every accepted native run
+now also records its complete computed partition as an immutable
+`gitcrawl.cluster-candidates.v3` generation, and selects it, in the same
+transaction:
+
+- Candidate IDs are `GENERATION:ORDINAL`. They are scoped to that run and are
+  not claimed stable across topology changes. Durable IDs remain the stable,
+  curated domain.
+- `observed_overlaps` lists durable groups that share active members with a
+  candidate. These are lineage observations, not aliases or equivalence. The
+  six durable history tables (`cluster_groups`, `cluster_memberships`,
+  `cluster_overrides`, `cluster_closures`, `cluster_aliases`,
+  `cluster_events`) are never written by generations.
+- `durable_status` says whether the v2 run published the candidate under a
+  durable ID (`published`, with `durable_cluster_id`) or quarantined it
+  (`identity_quarantined`). Both are present in the computed generation.
+- Generation rows cannot be updated or deleted, with one exception: owner
+  removal (`purge`) deletes a removed thread, then its member rows, and readers derive
+  counts and representatives from the remaining members.
+- `cluster-candidates --rollback` selects the previous generation. The next
+  accepted run selects its own generation again. A ref no-op run records
+  nothing.
+
+```bash
+gitcrawl cluster-candidates openclaw/openclaw --limit 20 --json
+gitcrawl cluster-candidates openclaw/openclaw --generations --json
+```
+
+The dedicated native cluster reader also permits `cluster-candidates`, but not
+`--rollback`. Strict v2 scope metadata is unchanged; consumers that need
+current computed clusters read this explicit, versioned domain rather than
+reinterpreting v2 scope fields.
 
 ## See also
 
