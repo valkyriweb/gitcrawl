@@ -3,8 +3,10 @@ package github
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -112,16 +114,21 @@ type graphqlEnvelope struct {
 }
 
 type graphqlResponseEnvelope struct {
-	Data   json.RawMessage `json:"data"`
-	Errors []struct {
-		Message string `json:"message"`
-	} `json:"errors"`
+	Data   json.RawMessage        `json:"data"`
+	Errors []graphqlResponseError `json:"errors"`
+}
+
+type graphqlResponseError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Path    []any  `json:"path"`
 }
 
 // ListPullReviewThreads fetches GitHub's review-thread graph for a pull request.
 func (c *Client) ListPullReviewThreads(ctx context.Context, owner, repo string, number int, reporter Reporter) ([]map[string]any, error) {
 	var out []map[string]any
 	var cursor string
+	seen := make(map[string]struct{})
 	for {
 		vars := map[string]any{
 			"owner": owner,
@@ -148,7 +155,15 @@ func (c *Client) ListPullReviewThreads(ctx context.Context, owner, repo string, 
 		if !page.PageInfo.HasNextPage {
 			break
 		}
-		cursor = page.PageInfo.EndCursor
+		next := page.PageInfo.EndCursor
+		if next == "" {
+			return nil, fmt.Errorf("review threads page missing endCursor")
+		}
+		if _, ok := seen[next]; ok {
+			return nil, fmt.Errorf("review threads page repeated endCursor %q", next)
+		}
+		seen[next] = struct{}{}
+		cursor = next
 	}
 	return out, nil
 }
@@ -162,11 +177,16 @@ func (c *Client) completeReviewThreadComments(ctx context.Context, thread map[st
 	if !comments.PageInfo.HasNextPage {
 		return nil
 	}
+	seen := make(map[string]struct{})
 	for comments.PageInfo.HasNextPage {
 		cursor := comments.PageInfo.EndCursor
 		if cursor == "" {
 			return fmt.Errorf("review thread %s comments page missing endCursor", threadID)
 		}
+		if _, ok := seen[cursor]; ok {
+			return fmt.Errorf("review thread %s comments page repeated endCursor %q", threadID, cursor)
+		}
+		seen[cursor] = struct{}{}
 		vars := map[string]any{"threadID": threadID, "cursor": cursor}
 		var resp pullReviewThreadCommentsResponse
 		if err := c.doGraphQL(ctx, pullReviewThreadCommentsQuery, vars, reporter, &resp); err != nil {
@@ -221,21 +241,40 @@ func (c *Client) doGraphQL(ctx context.Context, query string, variables map[stri
 		return fmt.Errorf("encode graphql request: %w", err)
 	}
 	var envelope graphqlResponseEnvelope
-	if err := c.doJSON(ctx, http.MethodPost, c.graphQLURL, bytes.NewReader(payload), reporter, &envelope); err != nil {
-		return err
+	response, err := c.do(ctx, http.MethodPost, c.graphQLURL, bytes.NewReader(payload), reporter)
+	if err != nil {
+		return requestFailureAt("graphql_request", "", err)
+	}
+	defer response.Body.Close()
+	reader := &historyResponseReader{reader: response.Body, hash: sha256.New()}
+	var input io.Reader = reader
+	if c.graphQLResponseLimit > 0 {
+		input = io.LimitReader(reader, c.graphQLResponseLimit+1)
+	}
+	decodeErr := decodeJSON(input, &envelope)
+	reporter.Printf("[github] graphql bytes %d", reader.read)
+	if c.graphQLResponseLimit > 0 && reader.read > c.graphQLResponseLimit {
+		failure := reader.failure(fmt.Errorf("review-state response exceeded byte limit"))
+		failure.Stage = "response_size"
+		return failure
+	}
+	if err := decodeErr; err != nil {
+		return reader.failure(fmt.Errorf("decode github response: %w", err))
 	}
 	if len(envelope.Errors) > 0 {
 		messages := make([]string, 0, len(envelope.Errors))
 		for _, graphqlErr := range envelope.Errors {
 			messages = append(messages, graphqlErr.Message)
 		}
-		return fmt.Errorf("github graphql: %s", strings.Join(messages, "; "))
+		var rejected any
+		_ = decodeJSON(bytes.NewReader(envelope.Data), &rejected)
+		return graphQLRejection(rejected, envelope.Errors, fmt.Errorf("github graphql: %s", strings.Join(messages, "; ")))
 	}
 	if len(envelope.Data) == 0 || string(envelope.Data) == "null" {
-		return fmt.Errorf("github graphql response missing data")
+		return historyFailure("missing_data", 0, nil, fmt.Errorf("github graphql response missing data"))
 	}
-	if err := json.Unmarshal(envelope.Data, out); err != nil {
-		return fmt.Errorf("decode github graphql data: %w", err)
+	if err := decodeJSON(bytes.NewReader(envelope.Data), out); err != nil {
+		return historyFailure("response_decode", 0, nil, fmt.Errorf("decode github graphql data: %w", err))
 	}
 	return nil
 }

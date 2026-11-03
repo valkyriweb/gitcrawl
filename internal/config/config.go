@@ -39,6 +39,7 @@ type OpenAIConfig struct {
 	APIKeyEnv       string `toml:"api_key_env"`
 	SummaryModel    string `toml:"summary_model"`
 	EmbedModel      string `toml:"embed_model"`
+	EmbedBaseURL    string `toml:"embed_base_url"`
 	EmbedDimensions int    `toml:"embed_dimensions"`
 	BatchSize       int    `toml:"batch_size"`
 	Concurrency     int    `toml:"concurrency"`
@@ -54,7 +55,12 @@ type TokenResolution struct {
 	Source string
 }
 
-var appConfig = crawlconfig.App{Name: "gitcrawl", ConfigEnv: DefaultConfigEnv}
+var appConfig = crawlconfig.App{
+	Name:          "gitcrawl",
+	ConfigEnv:     DefaultConfigEnv,
+	LegacyBaseDir: "~/.config/gitcrawl",
+	PlatformDirs:  true,
+}
 
 func Default() Config {
 	paths, err := appConfig.DefaultPaths()
@@ -120,7 +126,9 @@ func LoadRuntime(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	cfg.ApplyRuntimeEnv()
+	if err := cfg.ApplyRuntimeEnv(); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
@@ -173,6 +181,7 @@ func (c *Config) Normalize() error {
 	if c.OpenAI.EmbedModel == "" {
 		c.OpenAI.EmbedModel = def.OpenAI.EmbedModel
 	}
+	c.OpenAI.EmbedBaseURL = strings.TrimSpace(c.OpenAI.EmbedBaseURL)
 	if c.OpenAI.EmbedDimensions <= 0 {
 		c.OpenAI.EmbedDimensions = def.OpenAI.EmbedDimensions
 	}
@@ -200,6 +209,9 @@ func (c *Config) Normalize() error {
 	}
 	c.Remote.Normalize()
 	c.DBPath = expandHome(c.DBPath)
+	if err := validateDatabasePath(c.DBPath); err != nil {
+		return err
+	}
 	c.CacheDir = expandHome(c.CacheDir)
 	if vectorDirWasDefault {
 		c.VectorDir = defaultVectorDirForDB(c.DBPath)
@@ -210,9 +222,10 @@ func (c *Config) Normalize() error {
 	return nil
 }
 
-func (c *Config) ApplyRuntimeEnv() {
+func (c *Config) ApplyRuntimeEnv() error {
 	c.OpenAI.SummaryModel = c.envOrDefault("GITCRAWL_SUMMARY_MODEL", c.OpenAI.SummaryModel)
 	c.OpenAI.EmbedModel = c.envOrDefault("GITCRAWL_EMBED_MODEL", c.OpenAI.EmbedModel)
+	c.OpenAI.EmbedBaseURL = c.envOrDefault("GITCRAWL_EMBED_BASE_URL", c.OpenAI.EmbedBaseURL)
 	c.VectorBackend = c.envOrDefault("GITCRAWL_VECTOR_BACKEND", c.VectorBackend)
 	c.TUI.DefaultLayout = c.envOrDefault("GITCRAWL_TUI_LAYOUT", c.TUI.DefaultLayout)
 	c.Remote.Mode = c.envOrDefault("GITCRAWL_REMOTE_MODE", c.Remote.Mode)
@@ -229,6 +242,14 @@ func (c *Config) ApplyRuntimeEnv() {
 	if c.VectorBackend == "" {
 		c.VectorBackend = "exact"
 	}
+	return validateDatabasePath(c.DBPath)
+}
+
+func validateDatabasePath(path string) error {
+	if path == ":memory:" || strings.HasPrefix(path, "file:") {
+		return fmt.Errorf("db_path requires a filesystem path; SQLite file: URIs and :memory: are unsupported")
+	}
+	return nil
 }
 
 func ResolveGitHubToken(cfg Config) TokenResolution {
@@ -265,9 +286,6 @@ func (c Config) envOrDefault(primary, fallback string) string {
 }
 
 func (c Config) configEnv(primary string) string {
-	if c.Env == nil {
-		return ""
-	}
 	return strings.TrimSpace(c.Env[primary])
 }
 

@@ -4,37 +4,58 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
+// Reporter receives synchronous request progress. A reporter used by a
+// reserve-guarded client must not call back into that same Client.
 type Reporter func(message string)
 
 type Client struct {
-	httpClient *http.Client
-	baseURL    string
-	graphQLURL string
-	token      string
-	userAgent  string
-	pageDelay  time.Duration
-	rateLimit  RateLimitObserver
+	httpClient           *http.Client
+	baseURL              string
+	graphQLURL           string
+	token                string
+	tokenProvider        func(context.Context) (string, error)
+	userAgent            string
+	pageDelay            time.Duration
+	rateLimit            RateLimitObserver
+	reserve              *rateLimitReserve
+	graphQLResponseLimit int64
+	graphQLQuotaGuard    bool
 }
 
 type Options struct {
-	Token      string
-	BaseURL    string
-	UserAgent  string
-	HTTPClient *http.Client
-	PageDelay  time.Duration
-	RateLimit  RateLimitObserver
+	GraphQLResponseLimit int64
+	GraphQLQuotaGuard    bool
+	Token                string
+	// TokenProvider exclusively selects credentials immediately before dispatch.
+	TokenProvider func(context.Context) (string, error)
+	BaseURL       string
+	UserAgent     string
+	HTTPClient    *http.Client
+	PageDelay     time.Duration
+	RateLimit     RateLimitObserver
+	// RateLimitReserve preserves a best-effort observed floor for the shared
+	// token. Unless GraphQLQuotaGuard uses explicit observed GraphQL quota,
+	// guarded requests refresh /rate_limit before dispatch so other token
+	// consumers are observed, but unrelated consumers cannot be locked between
+	// that probe and dispatch.
+	RateLimitReserve  int
+	InitialRateLimits []RateLimitSnapshot
 }
 
-type RateLimitObserver func(RateLimitSnapshot)
+// RateLimitObserver receives synchronous quota snapshots. An observer used by
+// a reserve-guarded client must not call back into that same Client.
+type RateLimitObserver func(token string, snapshot RateLimitSnapshot)
 
 type RateLimitSnapshot struct {
 	Host      string
@@ -42,6 +63,76 @@ type RateLimitSnapshot struct {
 	Remaining int
 	ResetAt   time.Time
 	Resource  string
+}
+
+type RateLimitReserveError struct {
+	RateLimit RateLimitSnapshot
+	Reserve   int
+}
+
+func (e *RateLimitReserveError) Error() string {
+	return fmt.Sprintf(
+		"github %s rate limit reserve %d reached with %d remaining",
+		e.RateLimit.Resource,
+		e.Reserve,
+		e.RateLimit.Remaining,
+	)
+}
+
+type rateLimitReserve struct {
+	requestMu sync.Mutex
+	mu        sync.Mutex
+	reserve   int
+	snapshots map[string]RateLimitSnapshot
+	// GraphQL response evidence must survive REST snapshot replacement and
+	// upward provider anomalies until the observed reset boundary has passed.
+	graphqlObserved RateLimitSnapshot
+	graphqlToken    string
+}
+
+type graphQLQuotaProbeKey struct{}
+type graphQLRequestEstimateKey struct{}
+
+func (r *rateLimitReserve) bindGraphQLToken(token string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.graphqlToken != token {
+		r.graphqlObserved = RateLimitSnapshot{}
+		r.graphqlToken = token
+	}
+}
+
+func (r *rateLimitReserve) beforeObservedGraphQL(token string, cost int) error {
+	if r == nil {
+		return requestFailureAt("dispatch_guard", "quota_guard_missing", fmt.Errorf("observed GraphQL quota guard required"))
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	q := r.graphqlObserved
+	if token != r.graphqlToken {
+		return requestFailureAt("dispatch_guard", "credential_changed", fmt.Errorf("GraphQL credential changed; quota probe required"))
+	}
+	if q.Resource != "graphql" || !q.ResetAt.After(time.Now()) {
+		return requestFailureAt("dispatch_guard", "quota_observation_stale", fmt.Errorf("fresh observed GraphQL quota required"))
+	}
+	if q.Remaining-cost < r.reserve {
+		return &RateLimitReserveError{RateLimit: q, Reserve: r.reserve}
+	}
+	r.graphqlObserved.Remaining -= cost
+	return nil
+}
+
+type rateLimitRequestLockKey struct{}
+
+type rateLimitStatusExpiredError struct {
+	RateLimit RateLimitSnapshot
+}
+
+func (e *rateLimitStatusExpiredError) Error() string {
+	return fmt.Sprintf("github %s rate limit status expired at %s", e.RateLimit.Resource, e.RateLimit.ResetAt.Format(time.RFC3339))
 }
 
 type ListIssuesOptions struct {
@@ -85,15 +176,107 @@ func New(options Options) *Client {
 	if userAgent == "" {
 		userAgent = "gitcrawl"
 	}
-	return &Client{
-		httpClient: httpClient,
-		baseURL:    baseURL,
-		graphQLURL: graphQLURLForBaseURL(baseURL),
-		token:      options.Token,
-		userAgent:  userAgent,
-		pageDelay:  options.PageDelay,
-		rateLimit:  options.RateLimit,
+	client := &Client{
+		httpClient:           httpClient,
+		baseURL:              baseURL,
+		graphQLURL:           graphQLURLForBaseURL(baseURL),
+		token:                options.Token,
+		tokenProvider:        options.TokenProvider,
+		userAgent:            userAgent,
+		pageDelay:            options.PageDelay,
+		graphQLResponseLimit: options.GraphQLResponseLimit,
+		graphQLQuotaGuard:    options.GraphQLQuotaGuard,
+		rateLimit:            options.RateLimit,
 	}
+	if options.RateLimitReserve > 0 {
+		client.reserve = newRateLimitReserve(options.RateLimitReserve, options.InitialRateLimits)
+	}
+	return client
+}
+
+func newRateLimitReserve(reserve int, initial []RateLimitSnapshot) *rateLimitReserve {
+	guard := &rateLimitReserve{
+		reserve:   reserve,
+		snapshots: make(map[string]RateLimitSnapshot, len(initial)),
+	}
+	guard.replace(initial)
+	return guard
+}
+
+func (r *rateLimitReserve) beforeRequest(resource string, cost int) error {
+	if r == nil || cost <= 0 {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	snapshot, ok := r.snapshots[resource]
+	if !ok {
+		return requestFailureAt("dispatch_guard", "quota_snapshot_missing", fmt.Errorf("github %s rate limit status unavailable; cannot preserve reserve %d", resource, r.reserve))
+	}
+	if !snapshot.ResetAt.IsZero() && !time.Now().UTC().Before(snapshot.ResetAt) {
+		return &rateLimitStatusExpiredError{RateLimit: snapshot}
+	}
+	if snapshot.Remaining-cost < r.reserve {
+		return &RateLimitReserveError{RateLimit: snapshot, Reserve: r.reserve}
+	}
+	snapshot.Remaining -= cost
+	r.snapshots[resource] = snapshot
+	return nil
+}
+
+func (r *rateLimitReserve) observe(snapshot RateLimitSnapshot) {
+	if r == nil || strings.TrimSpace(snapshot.Resource) == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.snapshots[snapshot.Resource] = snapshot
+}
+
+func (r *rateLimitReserve) observeGraphQL(snapshot RateLimitSnapshot, now time.Time) RateLimitSnapshot {
+	if r == nil || snapshot.Remaining < 0 || !snapshot.ResetAt.After(now) {
+		return snapshot
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	previous := r.graphqlObserved
+	nearbyLaterReset := !previous.ResetAt.IsZero() && snapshot.ResetAt.After(previous.ResetAt) && snapshot.ResetAt.Sub(previous.ResetAt) <= time.Minute
+	if previous.ResetAt.After(now) || nearbyLaterReset {
+		snapshot.Remaining = min(snapshot.Remaining, previous.Remaining)
+		// A shifted reset timestamp before the prior boundary is not a new
+		// window. Wait through both boundaries before accepting a refill.
+		// An early sample of the next hourly window must not postpone the
+		// current boundary by another hour. Only nearby reset jitter extends it.
+		if previous.ResetAt.After(snapshot.ResetAt) || snapshot.ResetAt.Sub(previous.ResetAt) > time.Minute {
+			snapshot.ResetAt = previous.ResetAt
+		}
+	}
+	r.graphqlObserved = snapshot
+	return snapshot
+}
+
+func (r *rateLimitReserve) replace(snapshots []RateLimitSnapshot) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.snapshots = make(map[string]RateLimitSnapshot, len(snapshots))
+	for _, snapshot := range snapshots {
+		if strings.TrimSpace(snapshot.Resource) != "" {
+			r.snapshots[snapshot.Resource] = snapshot
+		}
+	}
+}
+
+func (r *rateLimitReserve) snapshot(resource string) (RateLimitSnapshot, bool) {
+	if r == nil {
+		return RateLimitSnapshot{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	snapshot, ok := r.snapshots[resource]
+	return snapshot, ok
 }
 
 func (c *Client) GetRepo(ctx context.Context, owner, repo string, reporter Reporter) (map[string]any, error) {
@@ -102,6 +285,62 @@ func (c *Client) GetRepo(ctx context.Context, owner, repo string, reporter Repor
 		return nil, err
 	}
 	return out, nil
+}
+
+func (c *Client) GetRateLimits(ctx context.Context, reporter Reporter) ([]RateLimitSnapshot, error) {
+	snapshots, _, err := c.getRateLimits(ctx, reporter, nil)
+	return snapshots, err
+}
+
+func (c *Client) getRateLimits(ctx context.Context, reporter Reporter, selectedToken *string) ([]RateLimitSnapshot, string, error) {
+	if c.reserve != nil {
+		lockedReserve, _ := ctx.Value(rateLimitRequestLockKey{}).(*rateLimitReserve)
+		if lockedReserve != c.reserve {
+			c.reserve.requestMu.Lock()
+			defer c.reserve.requestMu.Unlock()
+			ctx = context.WithValue(ctx, rateLimitRequestLockKey{}, c.reserve)
+		}
+	}
+	var payload struct {
+		Resources map[string]struct {
+			Limit     int   `json:"limit"`
+			Remaining int   `json:"remaining"`
+			Reset     int64 `json:"reset"`
+		} `json:"resources"`
+	}
+	resp, err := c.doWithToken(ctx, http.MethodGet, "/rate_limit", nil, reporter, selectedToken)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, "", requestFailureAt("rest_quota_decode", "", fmt.Errorf("decode github response: %w", err))
+	}
+	token := strings.TrimPrefix(resp.Request.Header.Get("Authorization"), "Bearer ")
+	host := rateLimitHostForBaseURL(c.baseURL)
+	out := make([]RateLimitSnapshot, 0, len(payload.Resources))
+	for resource, value := range payload.Resources {
+		snapshot := RateLimitSnapshot{
+			Host:      host,
+			Limit:     value.Limit,
+			Remaining: value.Remaining,
+			Resource:  resource,
+		}
+		if value.Reset > 0 {
+			snapshot.ResetAt = time.Unix(value.Reset, 0).UTC()
+		}
+		out = append(out, snapshot)
+	}
+	c.reserve.replace(out)
+	if c.rateLimit != nil {
+		for _, snapshot := range out {
+			if snapshot.Resource == "core" {
+				c.rateLimit(token, snapshot)
+				break
+			}
+		}
+	}
+	return out, token, nil
 }
 
 func (c *Client) GetIssue(ctx context.Context, owner, repo string, number int, reporter Reporter) (map[string]any, error) {
@@ -182,10 +421,30 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, owner, repo string, optio
 	return c.paginateEnvelope(ctx, path, options.Limit, 0, "workflow_runs", reporter)
 }
 
+func (c *Client) GetWorkflowRun(
+	ctx context.Context,
+	owner string,
+	repo string,
+	runID string,
+	reporter Reporter,
+) (map[string]any, error) {
+	path := fmt.Sprintf(
+		"/repos/%s/%s/actions/runs/%s",
+		pathEscape(owner),
+		pathEscape(repo),
+		pathEscape(runID),
+	)
+	var run map[string]any
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, reporter, &run); err != nil {
+		return nil, err
+	}
+	return run, nil
+}
+
 func (c *Client) paginate(ctx context.Context, firstPath string, limit int, expectedItems int, reporter Reporter) ([]map[string]any, error) {
 	return c.paginatePages(ctx, firstPath, limit, expectedItems, reporter, func(resp *http.Response) ([]map[string]any, error) {
 		var rows []map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		if err := decodeJSON(resp.Body, &rows); err != nil {
 			return nil, fmt.Errorf("decode github page: %w", err)
 		}
 		return rows, nil
@@ -203,7 +462,7 @@ func (c *Client) paginateEnvelope(ctx context.Context, firstPath string, limit i
 			return nil, fmt.Errorf("decode github page: missing %q", field)
 		}
 		var rows []map[string]any
-		if err := json.Unmarshal(raw, &rows); err != nil {
+		if err := decodeJSON(bytes.NewReader(raw), &rows); err != nil {
 			return nil, fmt.Errorf("decode github page %q: %w", field, err)
 		}
 		return rows, nil
@@ -213,12 +472,14 @@ func (c *Client) paginateEnvelope(ctx context.Context, firstPath string, limit i
 func (c *Client) paginatePages(ctx context.Context, firstPath string, limit int, expectedItems int, reporter Reporter, decode func(*http.Response) ([]map[string]any, error)) ([]map[string]any, error) {
 	var out []map[string]any
 	nextPath := firstPath
+	visited := make(map[string]struct{})
 	page := 0
 	totalPages := 0
 	if expectedItems > 0 {
 		totalPages = (expectedItems + 99) / 100
 	}
 	for nextPath != "" {
+		visited[nextPath] = struct{}{}
 		page++
 		resp, err := c.do(ctx, http.MethodGet, nextPath, nil, reporter)
 		if err != nil {
@@ -250,6 +511,9 @@ func (c *Client) paginatePages(ctx context.Context, firstPath string, limit int,
 			break
 		}
 		nextPath = nextPage(linkHeader, c.baseURL)
+		if _, repeated := visited[nextPath]; repeated {
+			return nil, fmt.Errorf("github pagination repeated next link")
+		}
 		if nextPath != "" && c.pageDelay > 0 {
 			select {
 			case <-ctx.Done():
@@ -261,19 +525,30 @@ func (c *Client) paginatePages(ctx context.Context, firstPath string, limit int,
 	return out, nil
 }
 
+func decodeJSON(reader io.Reader, out any) error {
+	// Preserve provider IDs before untyped maps reach persistence.
+	decoder := json.NewDecoder(reader)
+	decoder.UseNumber()
+	return decoder.Decode(out)
+}
+
 func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader, reporter Reporter, out any) error {
 	resp, err := c.do(ctx, method, path, body, reporter)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := decodeJSON(resp.Body, out); err != nil {
 		return fmt.Errorf("decode github response: %w", err)
 	}
 	return nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, reporter Reporter) (*http.Response, error) {
+	return c.doWithToken(ctx, method, path, body, reporter, nil)
+}
+
+func (c *Client) doWithToken(ctx context.Context, method, path string, body io.Reader, reporter Reporter, selectedToken *string) (*http.Response, error) {
 	var bodyBytes []byte
 	if body != nil {
 		var err error
@@ -288,7 +563,7 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, re
 		}
 		return bytes.NewReader(bodyBytes)
 	}
-	resp, err := c.doOnce(ctx, method, path, bodyReader(), reporter)
+	resp, err := c.doOnce(ctx, method, path, bodyReader(), reporter, selectedToken)
 	if err == nil {
 		return resp, nil
 	}
@@ -304,13 +579,94 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, re
 		return nil, ctx.Err()
 	case <-timer.C:
 	}
-	return c.doOnce(ctx, method, path, bodyReader(), reporter)
+	return c.doOnce(ctx, method, path, bodyReader(), reporter, nil)
 }
 
-func (c *Client) doOnce(ctx context.Context, method, path string, body io.Reader, reporter Reporter) (*http.Response, error) {
+func (c *Client) doOnce(ctx context.Context, method, path string, body io.Reader, reporter Reporter, selectedToken *string) (*http.Response, error) {
 	fullURL := path
 	if !isAbsoluteURL(path) {
 		fullURL = c.baseURL + path
+	}
+	if c.tokenProvider != nil {
+		target, targetErr := url.Parse(fullURL)
+		origin, originErr := url.Parse(c.baseURL)
+		if targetErr != nil || originErr != nil || target.User != nil || origin.Host == "" ||
+			(target.Scheme != "https" && target.Scheme != "http") ||
+			!strings.EqualFold(target.Scheme, origin.Scheme) || !strings.EqualFold(target.Host, origin.Host) {
+			return nil, requestFailureAt("dispatch_guard", "origin_mismatch", errors.New("GitHub token provider requires the configured API origin"))
+		}
+	}
+	resource, cost := c.requestRateLimit(method, fullURL)
+	if c.reserve != nil {
+		lockedReserve, _ := ctx.Value(rateLimitRequestLockKey{}).(*rateLimitReserve)
+		if lockedReserve != c.reserve {
+			c.reserve.requestMu.Lock()
+			defer c.reserve.requestMu.Unlock()
+			ctx = context.WithValue(ctx, rateLimitRequestLockKey{}, c.reserve)
+		}
+	}
+	var probeToken string
+	observedGraphQL := c.graphQLQuotaGuard && resource == "graphql"
+	if c.reserve != nil && cost > 0 && !observedGraphQL {
+		var err error
+		_, probeToken, err = c.getRateLimits(ctx, reporter, nil)
+		if err != nil {
+			return nil, requestFailureAt("rest_preflight", "", fmt.Errorf("refresh GitHub rate limit status: %w", err))
+		}
+	}
+	token := c.token
+	if selectedToken != nil {
+		token = *selectedToken
+	} else {
+		var err error
+		token, err = c.requestToken(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if c.tokenProvider != nil && c.reserve != nil && cost > 0 && !observedGraphQL && token != probeToken {
+		// A new token cannot spend the previous token's quota. Allow one new
+		// probe, then reject further rotation before the protected request.
+		_, probeToken, err := c.getRateLimits(ctx, reporter, &token)
+		if err != nil {
+			return nil, requestFailureAt("rest_preflight", "", fmt.Errorf("refresh GitHub rate limit status: %w", err))
+		}
+		token, err = c.requestToken(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if token != probeToken {
+			return nil, requestFailureAt("dispatch_guard", "credential_changed", errors.New("GitHub token changed during rate limit reservation"))
+		}
+	}
+	if observedGraphQL {
+		probe, _ := ctx.Value(graphQLQuotaProbeKey{}).(bool)
+		if probe {
+			c.reserve.bindGraphQLToken(token)
+		} else if err := c.reserve.beforeObservedGraphQL(token, cost); err != nil {
+			return nil, err
+		}
+	} else if err := c.reserve.beforeRequest(resource, cost); err != nil {
+		var expired *rateLimitStatusExpiredError
+		if errors.As(err, &expired) && resource == "graphql" {
+			if err := c.refreshExpiredGraphQLQuota(ctx, token, cost); err != nil {
+				return nil, requestFailureAt("graphql_quota_refresh", "", err)
+			}
+		} else {
+			if c.tokenProvider != nil || !errors.As(err, &expired) {
+				return nil, requestFailureAt("dispatch_guard", "", err)
+			}
+			_, refreshErr := c.GetRateLimits(ctx, reporter)
+			if refreshErr != nil {
+				return nil, requestFailureAt("rest_preflight", "", fmt.Errorf("refresh GitHub rate limit status: %w", refreshErr))
+			}
+			if err := c.reserve.beforeRequest(resource, cost); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if resource == "graphql" && !observedGraphQL {
+		c.reserve.bindGraphQLToken(token)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
@@ -322,15 +678,19 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body io.Reader
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	reporter.Printf("[github] request %s %s", method, path)
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.guardedHTTPClient().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("github request: %w", err)
+		return nil, requestFailureAt("transport", "", fmt.Errorf("github request: %w", err))
 	}
-	c.observeRateLimit(resp.Header)
+	responseResource, responseCost := c.requestRateLimit(resp.Request.Method, resp.Request.URL.String())
+	responseToken := strings.TrimPrefix(resp.Request.Header.Get("Authorization"), "Bearer ")
+	if responseCost > 0 && !c.observeRateLimit(responseToken, resp.Header, responseResource) {
+		c.observeReservedRateLimit(responseToken, responseResource)
+	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return resp, nil
 	}
@@ -343,6 +703,78 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body io.Reader
 		Body:    strings.TrimSpace(string(data)),
 		Headers: resp.Header,
 	}
+}
+
+// refreshExpiredGraphQLQuota runs only after an expired REST GraphQL snapshot,
+// with requestMu already held. A quota-only probe may cross that stale boundary;
+// content may not. Reuse the authoritative probe and conservative same-window
+// accounting, pinning its credential until the protected dispatch is rechecked.
+func (c *Client) refreshExpiredGraphQLQuota(ctx context.Context, token string, cost int) error {
+	quotaClient := *c
+	quotaClient.tokenProvider = func(context.Context) (string, error) { return token, nil }
+	_, observed, err := quotaClient.AnalyticsRateLimit(ctx)
+	if err != nil {
+		return err
+	}
+	if !observed.ResetAt.After(time.Now()) {
+		return &rateLimitStatusExpiredError{RateLimit: observed}
+	}
+	current, err := c.requestToken(ctx)
+	if err != nil {
+		return err
+	}
+	if current != token {
+		return requestFailureAt("dispatch_guard", "credential_changed", errors.New("GitHub token changed during quota refresh"))
+	}
+	// A history session checked its estimate before entering transport, using
+	// the prior observation. Recheck against the newly refreshed balance too.
+	estimate, _ := ctx.Value(graphQLRequestEstimateKey{}).(int)
+	return c.reserve.beforeObservedGraphQL(token, max(cost, estimate))
+}
+
+func (c *Client) guardedHTTPClient() *http.Client {
+	if c.reserve == nil && c.tokenProvider == nil {
+		return c.httpClient
+	}
+	client := *c.httpClient
+	checkRedirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if c.tokenProvider != nil {
+			return http.ErrUseLastResponse
+		}
+		if checkRedirect != nil {
+			if err := checkRedirect(req, via); err != nil {
+				return err
+			}
+		}
+		return http.ErrUseLastResponse
+	}
+	return &client
+}
+
+func (c *Client) requestToken(ctx context.Context) (string, error) {
+	if c.tokenProvider == nil {
+		return c.token, nil
+	}
+	token, err := c.tokenProvider(ctx)
+	if err != nil || token == "" {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", requestFailureAt("credential", "credential_provider_failed", errors.New("GitHub token provider failed"))
+	}
+	return token, nil
+}
+
+func (c *Client) requestRateLimit(method, fullURL string) (string, int) {
+	if method == http.MethodPost && fullURL == c.graphQLURL {
+		// The read-only GraphQL queries in this client each have a calculated cost of one point.
+		return "graphql", 1
+	}
+	if method == http.MethodGet && fullURL == c.baseURL+"/rate_limit" {
+		return "core", 0
+	}
+	return "core", 1
 }
 
 func isAbsoluteURL(value string) bool {
@@ -366,13 +798,10 @@ func graphQLURLForBaseURL(baseURL string) string {
 	return parsed.String()
 }
 
-func (c *Client) observeRateLimit(header http.Header) {
-	if c.rateLimit == nil {
-		return
-	}
+func (c *Client) observeRateLimit(token string, header http.Header, fallbackResource string) bool {
 	remaining, err := strconv.Atoi(strings.TrimSpace(header.Get("X-RateLimit-Remaining")))
 	if err != nil {
-		return
+		return false
 	}
 	limit, _ := strconv.Atoi(strings.TrimSpace(header.Get("X-RateLimit-Limit")))
 	var resetAt time.Time
@@ -381,13 +810,31 @@ func (c *Client) observeRateLimit(header http.Header) {
 			resetAt = time.Unix(secs, 0).UTC()
 		}
 	}
-	c.rateLimit(RateLimitSnapshot{
+	resource := strings.TrimSpace(header.Get("X-RateLimit-Resource"))
+	if resource == "" {
+		resource = fallbackResource
+	}
+	snapshot := RateLimitSnapshot{
 		Host:      rateLimitHostForBaseURL(c.baseURL),
 		Limit:     limit,
 		Remaining: remaining,
 		ResetAt:   resetAt,
-		Resource:  strings.TrimSpace(header.Get("X-RateLimit-Resource")),
-	})
+		Resource:  resource,
+	}
+	c.reserve.observe(snapshot)
+	if c.rateLimit != nil {
+		c.rateLimit(token, snapshot)
+	}
+	return true
+}
+
+func (c *Client) observeReservedRateLimit(token, resource string) {
+	snapshot, ok := c.reserve.snapshot(resource)
+	if !ok || c.rateLimit == nil {
+		return
+	}
+	snapshot.Host = rateLimitHostForBaseURL(c.baseURL)
+	c.rateLimit(token, snapshot)
 }
 
 func rateLimitHostForBaseURL(baseURL string) string {
@@ -401,6 +848,10 @@ func rateLimitHostForBaseURL(baseURL string) string {
 	return parsed.Host
 }
 
+// maxRateLimitWait bounds GitHub Retry-After and X-RateLimit-Reset sleeps so a
+// huge or malicious header cannot hang sync indefinitely.
+const maxRateLimitWait = 5 * time.Minute
+
 func rateLimitWait(err error) (time.Duration, bool) {
 	reqErr, ok := err.(*RequestError)
 	if !ok {
@@ -410,8 +861,8 @@ func rateLimitWait(err error) (time.Duration, bool) {
 		return 0, false
 	}
 	if v := strings.TrimSpace(reqErr.Headers.Get("Retry-After")); v != "" {
-		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
-			return time.Duration(secs) * time.Second, true
+		if wait, ok := retryAfterWait(v); ok {
+			return wait, true
 		}
 	}
 	if reqErr.Headers.Get("X-RateLimit-Remaining") != "0" {
@@ -422,9 +873,33 @@ func rateLimitWait(err error) (time.Duration, bool) {
 		return 0, false
 	}
 	if wait := time.Until(time.Unix(secs, 0)); wait > 0 {
-		return wait, true
+		return capRateLimitWait(wait), true
 	}
 	return time.Second, true
+}
+
+func retryAfterWait(value string) (time.Duration, bool) {
+	seconds, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return maxRateLimitWait, true
+		}
+		return 0, false
+	}
+	if seconds == 0 {
+		return 0, false
+	}
+	if seconds >= uint64(maxRateLimitWait/time.Second) {
+		return maxRateLimitWait, true
+	}
+	return time.Duration(seconds) * time.Second, true
+}
+
+func capRateLimitWait(wait time.Duration) time.Duration {
+	if wait > maxRateLimitWait || wait < 0 {
+		return maxRateLimitWait
+	}
+	return wait
 }
 
 func nextPage(linkHeader, baseURL string) string {
