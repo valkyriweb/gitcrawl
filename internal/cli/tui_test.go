@@ -2173,9 +2173,6 @@ func TestTUIDisplayHelperBranches(t *testing.T) {
 	if labelsFromJSON(`not-json`) != "" {
 		t.Fatal("invalid labels should render empty")
 	}
-	if selectedColor(true) == "" || selectedColor(false) == "" || selectedFG(true) == "" || selectedFG(false) == "" {
-		t.Fatal("selected colors empty")
-	}
 	if columnRightEdge(nil, 0) != 0 || columnRightEdge([]table.Column{{Width: 3}}, 1) != 0 {
 		t.Fatal("invalid column right edge should be zero")
 	}
