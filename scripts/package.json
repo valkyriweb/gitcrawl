@@ -1,0 +1,7 @@
+{
+  "name": "gitcrawl-docs",
+  "private": true,
+  "dependencies": {
+    "@pierre/words": "0.2.2"
+  }
+}
