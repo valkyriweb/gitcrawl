@@ -48,3 +48,47 @@ test("link URLs are HTML-escaped exactly once", (t) => {
   const page = fs.readFileSync(path.join(root, "dist", "docs-site", "index.html"), "utf8");
   assert.ok(page.includes('href="https://example.test/?one=1&amp;two=2"'));
 });
+
+test("the docs build preserves links, navigation and highlighted code", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "gitcrawl-docs-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, "docs"));
+  fs.writeFileSync(path.join(root, "docs", "CNAME"), "gitcrawl.example.test\n");
+  fs.writeFileSync(path.join(root, "docs", "index.md"), [
+    "# Gitcrawl",
+    "",
+    "[Quickstart](quickstart.md) [View on GitHub](https://github.com/openclaw/gitcrawl)",
+    "",
+    "## Install & run",
+    "",
+    "[Choose a command](/guides/quickstart/#choose-a-command) and [bad](javascript:bad).",
+    "",
+    "<script>alert('raw HTML is not trusted')</script>",
+    "",
+    "## Output",
+    "",
+    "| Name | Value |",
+    "| --- | ---: |",
+    "| Test | 1 |",
+    "",
+    "~~~json",
+    '{"enabled": true}',
+    "~~~",
+  ].join("\n"));
+  fs.writeFileSync(
+    path.join(root, "docs", "quickstart.md"),
+    "---\npermalink: /guides/quickstart/\n---\n# Quickstart\n\n## Choose a command\n\n## Install & run\n",
+  );
+  const result = spawnSync(process.execPath, [builder], { cwd: root, encoding: "utf8", timeout: 20_000 });
+  assert.equal(result.status, 0, result.stderr);
+  const html = fs.readFileSync(path.join(root, "dist", "docs-site", "index.html"), "utf8");
+  const article = html.slice(html.indexOf('<article class="doc'), html.indexOf("</article>"));
+  assert.match(article, /class="home-actions"/);
+  assert.match(article, /<h2 id="install-run">/);
+  const guide = fs.readFileSync(path.join(root, "dist", "docs-site", "guides", "quickstart", "index.html"), "utf8");
+  assert.match(guide, /class="toc-l2" href="#install-run">Install &amp; run<\/a>/);
+  assert.match(article, /\bhref="guides\/quickstart\/(?:index\.html)?#choose-a-command"/);
+  assert.match(article, /<table[\s>]/);
+  assert.match(article, /<code[^>]*class="language-json"[^>]*>[\s\S]*?<span class="hl-key">&quot;enabled&quot;<\/span>/);
+  assert.doesNotMatch(article, /href="javascript:|<script>/);
+});

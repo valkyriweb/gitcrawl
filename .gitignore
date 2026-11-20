@@ -7,6 +7,7 @@ bin/
 dist/
 coverage/
 coverage.out
+/scripts/node_modules/
 
 *.db
 *.db-shm
