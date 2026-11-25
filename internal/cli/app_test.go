@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,6 +26,8 @@ import (
 	crawlremote "github.com/openclaw/crawlkit/remote"
 	clusterer "github.com/openclaw/gitcrawl/internal/cluster"
 	"github.com/openclaw/gitcrawl/internal/config"
+	gh "github.com/openclaw/gitcrawl/internal/github"
+	portableexport "github.com/openclaw/gitcrawl/internal/portable"
 	"github.com/openclaw/gitcrawl/internal/store"
 	"github.com/zalando/go-keyring"
 )
@@ -53,6 +57,213 @@ func TestInitWritesConfig(t *testing.T) {
 	}
 	if _, err := os.Stat(wantVectorDir); err != nil {
 		t.Fatalf("stat vector dir: %v", err)
+	}
+}
+
+func TestInitRelativeDBPathIsAbsoluteAndReadable(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	workDir := filepath.Join(dir, "work")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir work dir: %v", err)
+	}
+	t.Chdir(workDir)
+	configPath := filepath.Join(dir, "config.toml")
+
+	if err := New().Run(ctx, []string{"--config", configPath, "init", "--db", "archive.db"}); err != nil {
+		t.Fatalf("init relative db: %v", err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	wantDBPath := filepath.Join(workDir, "archive.db")
+	if cfg.DBPath != wantDBPath {
+		t.Fatalf("db path = %q, want %q", cfg.DBPath, wantDBPath)
+	}
+	if cfg.VectorDir != filepath.Join(workDir, "vectors") {
+		t.Fatalf("vector dir = %q, want sibling of resolved db", cfg.VectorDir)
+	}
+	st, err := store.OpenReadOnly(ctx, cfg.DBPath)
+	if err != nil {
+		t.Fatalf("open resolved db: %v", err)
+	}
+	if _, err := st.Status(ctx); err != nil {
+		t.Fatalf("read initialized db status: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close resolved db: %v", err)
+	}
+	if info, err := os.Stat(wantDBPath); err != nil || info.Size() == 0 {
+		t.Fatalf("resolved db was not initialized: info=%v err=%v", info, err)
+	}
+}
+
+func TestInitRelativeRuntimeDirIsAbsolute(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	configPath := filepath.Join(dir, "config.toml")
+
+	if err := New().Run(context.Background(), []string{"--config", configPath, "init", "--runtime-dir", "runtime"}); err != nil {
+		t.Fatalf("init relative runtime: %v", err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	wantRoot := filepath.Join(dir, "runtime")
+	if cfg.DBPath != filepath.Join(wantRoot, "gitcrawl.db") || cfg.CacheDir != filepath.Join(wantRoot, "cache") || cfg.VectorDir != filepath.Join(wantRoot, "vectors") || cfg.LogDir != filepath.Join(wantRoot, "logs") {
+		t.Fatalf("relative runtime paths not anchored under %q: %+v", wantRoot, cfg)
+	}
+}
+
+func TestInitHomeRelativePathsExpandBeforeAnchoring(t *testing.T) {
+	homeDir := t.TempDir()
+	workDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Chdir(workDir)
+
+	dbConfigPath := filepath.Join(workDir, "db.toml")
+	if err := New().Run(context.Background(), []string{"--config", dbConfigPath, "init", "--db", "~/archive.db"}); err != nil {
+		t.Fatalf("init home-relative db: %v", err)
+	}
+	dbConfig, err := config.Load(dbConfigPath)
+	if err != nil {
+		t.Fatalf("load db config: %v", err)
+	}
+	if want := filepath.Join(homeDir, "archive.db"); dbConfig.DBPath != want {
+		t.Fatalf("home-relative db path = %q, want %q", dbConfig.DBPath, want)
+	}
+
+	runtimeConfigPath := filepath.Join(workDir, "runtime.toml")
+	if err := New().Run(context.Background(), []string{"--config", runtimeConfigPath, "init", "--runtime-dir", "~/runtime"}); err != nil {
+		t.Fatalf("init home-relative runtime: %v", err)
+	}
+	runtimeConfig, err := config.Load(runtimeConfigPath)
+	if err != nil {
+		t.Fatalf("load runtime config: %v", err)
+	}
+	wantRuntimeRoot := filepath.Join(homeDir, "runtime")
+	if runtimeConfig.DBPath != filepath.Join(wantRuntimeRoot, "gitcrawl.db") || runtimeConfig.CacheDir != filepath.Join(wantRuntimeRoot, "cache") || runtimeConfig.VectorDir != filepath.Join(wantRuntimeRoot, "vectors") || runtimeConfig.LogDir != filepath.Join(wantRuntimeRoot, "logs") {
+		t.Fatalf("home-relative runtime paths not anchored under %q: %+v", wantRuntimeRoot, runtimeConfig)
+	}
+}
+
+func TestInitResolvesWorkingDirectoryOnlyForRelativePaths(t *testing.T) {
+	app := New()
+	app.getWorkingDirectory = func() (string, error) {
+		return "", errors.New("working directory unavailable")
+	}
+
+	relativeCases := []struct {
+		name string
+		args []string
+		flag string
+	}{
+		{name: "database", args: []string{"init", "--db", "archive.db"}, flag: "--db"},
+		{name: "runtime", args: []string{"init", "--runtime-dir", "runtime"}, flag: "--runtime-dir"},
+		{name: "portable store", args: []string{"init", "--portable-store", "https://example.com/store.git", "--store-dir", "store"}, flag: "--store-dir"},
+	}
+	for _, tc := range relativeCases {
+		err := app.Run(context.Background(), tc.args)
+		if err == nil || !strings.Contains(err.Error(), "resolve "+tc.flag+" path") {
+			t.Errorf("%s error = %v, want %s resolution failure", tc.name, err, tc.flag)
+		}
+	}
+
+	dir := t.TempDir()
+	absoluteConfig := filepath.Join(dir, "absolute.toml")
+	if err := app.Run(context.Background(), []string{"--config", absoluteConfig, "init", "--db", filepath.Join(dir, "archive.db")}); err != nil {
+		t.Fatalf("absolute db init consulted working directory: %v", err)
+	}
+	remoteConfig := filepath.Join(dir, "remote.toml")
+	if err := app.Run(context.Background(), []string{"--config", remoteConfig, "init", "--remote", "https://archive.example.com", "--archive", "example"}); err != nil {
+		t.Fatalf("remote init consulted working directory: %v", err)
+	}
+}
+
+func TestInitRejectsNonFilesystemDBValues(t *testing.T) {
+	for _, dbPath := range []string{":memory:", "file:archive.db", "file:/tmp/archive.db?mode=rwc"} {
+		err := New().Run(context.Background(), []string{"init", "--db", dbPath})
+		if err == nil || !strings.Contains(err.Error(), "--db requires a filesystem path") {
+			t.Errorf("init --db %q error = %v", dbPath, err)
+		}
+	}
+}
+
+func TestInitRejectsHomeRelativePathsWithoutHomeDirectory(t *testing.T) {
+	t.Setenv("HOME", "")
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "database", args: []string{"init", "--db", "~/archive.db"}},
+		{name: "runtime", args: []string{"init", "--runtime-dir", "~/runtime"}},
+		{name: "portable store", args: []string{"init", "--portable-store", "https://example.com/store.git", "--store-dir", "~/store"}},
+	}
+	for _, tc := range tests {
+		err := New().Run(context.Background(), tc.args)
+		if err == nil || !strings.Contains(err.Error(), "home directory unavailable") {
+			t.Errorf("%s error = %v, want unavailable-home failure", tc.name, err)
+		}
+	}
+}
+
+func TestInitRuntimeDirIsolatesRuntimePaths(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	runtimeDir := filepath.Join(dir, "runtime")
+	app := New()
+	var stdout bytes.Buffer
+	app.Stdout = &stdout
+
+	if err := app.Run(context.Background(), []string{"--config", configPath, "--json", "init", "--runtime-dir", runtimeDir}); err != nil {
+		t.Fatalf("run isolated init: %v", err)
+	}
+	var result initResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode init output: %v\n%s", err, stdout.String())
+	}
+	if result.RuntimeDir != runtimeDir {
+		t.Fatalf("runtime dir = %q, want %q", result.RuntimeDir, runtimeDir)
+	}
+	wantPaths := map[string]string{
+		"db":      filepath.Join(runtimeDir, "gitcrawl.db"),
+		"cache":   filepath.Join(runtimeDir, "cache"),
+		"vectors": filepath.Join(runtimeDir, "vectors"),
+		"logs":    filepath.Join(runtimeDir, "logs"),
+	}
+	gotPaths := map[string]string{
+		"db":      result.DBPath,
+		"cache":   result.CacheDir,
+		"vectors": result.VectorDir,
+		"logs":    result.LogDir,
+	}
+	for name, want := range wantPaths {
+		if gotPaths[name] != want {
+			t.Errorf("%s path = %q, want %q", name, gotPaths[name], want)
+		}
+	}
+	for _, path := range []string{filepath.Dir(wantPaths["db"]), wantPaths["cache"], wantPaths["vectors"], wantPaths["logs"]} {
+		if info, err := os.Stat(path); err != nil || !info.IsDir() {
+			t.Errorf("runtime directory %q: info=%v err=%v", path, info, err)
+		}
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load isolated config: %v", err)
+	}
+	if loaded.DBPath != wantPaths["db"] || loaded.CacheDir != wantPaths["cache"] || loaded.VectorDir != wantPaths["vectors"] || loaded.LogDir != wantPaths["logs"] {
+		t.Fatalf("isolated config paths = %+v", loaded)
+	}
+}
+
+func TestInitRuntimeDirRejectsOtherArchiveModes(t *testing.T) {
+	dir := t.TempDir()
+	app := New()
+	err := app.Run(context.Background(), []string{"--config", filepath.Join(dir, "config.toml"), "init", "--runtime-dir", filepath.Join(dir, "runtime"), "--db", filepath.Join(dir, "other.db")})
+	if err == nil || !strings.Contains(err.Error(), "use only one of") {
+		t.Fatalf("runtime/db conflict error = %v", err)
 	}
 }
 
@@ -162,7 +373,74 @@ func TestCloudSQLiteSnapshotDropsLocalCodeCorpus(t *testing.T) {
 	}, []store.CodeDocument{{Path: "secret.txt", Language: "txt", ContentHash: "h", Text: "secret", ByteSize: 6, UpdatedAt: "2026-06-06T00:00:00Z"}}); err != nil {
 		t.Fatalf("replace code snapshot: %v", err)
 	}
-	snapshotPath, cleanup, err := cloudSQLiteSnapshotPath(ctx, st.DB(), dbPath)
+	if _, err := st.DB().ExecContext(ctx, `
+		insert into threads(
+			id, repo_id, github_id, number, kind, state, title, body, html_url,
+			labels_json, assignees_json, raw_json, content_hash, updated_at
+		) values(
+			1, ?, 'pr-1', 1, 'pull_request', 'open', 'PR', 'body',
+			'https://github.com/openclaw/gitcrawl/pull/1', '[]', '[]',
+			'{"secret":"thread"}', 'hash', '2026-06-06T00:00:00Z'
+		);
+		insert into pull_request_details(
+			thread_id, repo_id, number, raw_json, fetched_at, updated_at
+		) values(
+			1, ?, 1, '{"secret":"detail"}',
+			'2026-06-06T00:00:00Z', '2026-06-06T00:00:00Z'
+		);
+			insert into pull_request_files(
+				thread_id, position, path, patch, raw_json, fetched_at
+			) values(
+				1, 0, 'secret.go', '@@ private source', '{"secret":"file"}',
+				'2026-06-06T00:00:00Z'
+			);
+			insert into pull_request_review_threads(
+				thread_id, review_thread_id, path, comments_json, raw_json, fetched_at
+			) values(
+				1, 'review-thread-1', 'secret.go',
+				'[{"body":"review body","diffHunk":"@@ private review source"}]',
+				'{"secret":"review-thread"}', '2026-06-06T00:00:00Z'
+			);
+			insert into blobs(
+				sha256, media_type, compression, size_bytes, storage_kind, inline_text, created_at
+			) values(
+			'blob-hash', 'application/json', 'none', 6, 'inline', 'secret',
+			'2026-06-06T00:00:00Z'
+		);
+			insert into sync_runs(
+				repo_id, scope, status, started_at, finished_at, stats_json, error_text
+			) values(
+				?, 'all', 'failed', '2026-06-06T00:00:00Z',
+				'2026-06-06T00:01:00Z',
+				'{"message":"/private/host/token","threads":1}', '/private/host/token'
+			);
+			insert into summary_runs(
+				repo_id, scope, status, started_at, finished_at, stats_json, error_text
+			) values(
+				?, 'all', 'failed', '2026-06-06T00:00:00Z',
+				'2026-06-06T00:01:00Z',
+				'{"failures":[{"message":"provider secret"}]}', 'provider secret'
+			);
+			insert into embedding_runs(
+				repo_id, scope, status, started_at, finished_at, stats_json, error_text
+			) values(
+				?, 'all', 'failed', '2026-06-06T00:00:00Z',
+				'2026-06-06T00:01:00Z',
+				'{"failures":[{"message":"/private/embed"}]}', '/private/embed'
+			);
+			insert into cluster_runs(
+				repo_id, scope, status, started_at, finished_at, stats_json, error_text
+			) values(
+				?, 'all', 'failed', '2026-06-06T00:00:00Z',
+				'2026-06-06T00:01:00Z',
+				'{"message":"/private/cluster"}', '/private/cluster'
+			);
+			create table portable_metadata(key text primary key, value text not null);
+			insert into portable_metadata(key, value) values('source_path', '/private/archive.db')
+		`, repoID, repoID, repoID, repoID, repoID, repoID); err != nil {
+		t.Fatalf("seed private cloud payloads: %v", err)
+	}
+	snapshotPath, _, cleanup, err := cloudSQLiteSnapshotPath(ctx, st.DB(), dbPath, gitcrawlCloudPublishOptions{})
 	if err != nil {
 		t.Fatalf("cloud snapshot: %v", err)
 	}
@@ -172,7 +450,14 @@ func TestCloudSQLiteSnapshotDropsLocalCodeCorpus(t *testing.T) {
 		t.Fatalf("open cloud snapshot: %v", err)
 	}
 	defer snapshotDB.Close()
-	for _, table := range []string{"code_snapshots", "code_documents", "code_documents_fts"} {
+	for _, table := range []string{
+		"code_snapshots",
+		"code_documents",
+		"code_documents_fts",
+		"thread_code_snapshots",
+		"thread_changed_files",
+		"thread_hunk_signatures",
+	} {
 		var count int
 		if err := snapshotDB.QueryRowContext(ctx, `select count(*) from sqlite_schema where name = ?`, table).Scan(&count); err != nil {
 			t.Fatalf("inspect %s: %v", table, err)
@@ -180,6 +465,67 @@ func TestCloudSQLiteSnapshotDropsLocalCodeCorpus(t *testing.T) {
 		if count != 0 {
 			t.Fatalf("cloud snapshot retained %s", table)
 		}
+	}
+	var repositoryRawJSON, threadRawJSON, detailRawJSON, filePatch, fileRawJSON string
+	if err := snapshotDB.QueryRowContext(ctx, `
+		select repository.raw_json, thread.raw_json, detail.raw_json, file.patch, file.raw_json
+		from repositories repository
+		join threads thread on thread.repo_id = repository.id
+		join pull_request_details detail on detail.thread_id = thread.id
+		join pull_request_files file on file.thread_id = thread.id
+	`).Scan(&repositoryRawJSON, &threadRawJSON, &detailRawJSON, &filePatch, &fileRawJSON); err != nil {
+		t.Fatalf("inspect scrubbed cloud payloads: %v", err)
+	}
+	if repositoryRawJSON != "" || threadRawJSON != "" || detailRawJSON != "" || fileRawJSON != "" {
+		t.Fatalf(
+			"cloud snapshot retained raw payloads: repository=%q thread=%q detail=%q file=%q",
+			repositoryRawJSON,
+			threadRawJSON,
+			detailRawJSON,
+			fileRawJSON,
+		)
+	}
+	if filePatch != "@@ private source" {
+		t.Fatalf("cloud snapshot patch = %q, want full structured patch text", filePatch)
+	}
+	var blobCount int
+	if err := snapshotDB.QueryRowContext(ctx, `select count(*) from blobs`).Scan(&blobCount); err != nil {
+		t.Fatalf("inspect cloud blobs: %v", err)
+	}
+	if blobCount != 0 {
+		t.Fatalf("cloud snapshot retained %d blobs", blobCount)
+	}
+	var reviewComments string
+	if err := snapshotDB.QueryRowContext(ctx, `
+			select comments_json from pull_request_review_threads limit 1
+		`).Scan(&reviewComments); err != nil {
+		t.Fatalf("inspect scrubbed review comments: %v", err)
+	}
+	if reviewComments != "" {
+		t.Fatalf("cloud snapshot retained review diff payloads: %q", reviewComments)
+	}
+	for _, table := range []string{"sync_runs", "summary_runs", "embedding_runs", "cluster_runs"} {
+		var statsJSON, errorText string
+		if err := snapshotDB.QueryRowContext(ctx, `
+				select coalesce(stats_json, ''), coalesce(error_text, '') from `+table+` limit 1
+			`).Scan(&statsJSON, &errorText); err != nil {
+			t.Fatalf("inspect scrubbed cloud %s payload: %v", table, err)
+		}
+		if statsJSON != "" || errorText != "" {
+			t.Fatalf(
+				"cloud snapshot retained %s failure payloads: stats=%q error=%q",
+				table,
+				statsJSON,
+				errorText,
+			)
+		}
+	}
+	var sourcePath string
+	if err := snapshotDB.QueryRowContext(ctx, `select value from portable_metadata where key = 'source_path'`).Scan(&sourcePath); err != nil {
+		t.Fatalf("inspect scrubbed cloud source path: %v", err)
+	}
+	if sourcePath != "" {
+		t.Fatalf("cloud snapshot retained private source path: %q", sourcePath)
 	}
 	var sourceCount int
 	if err := st.DB().QueryRowContext(ctx, `select count(*) from code_documents`).Scan(&sourceCount); err != nil {
@@ -356,7 +702,7 @@ func TestRemoteCloudModeDoesNotCreateLocalDB(t *testing.T) {
 	t.Setenv("HOME", dir)
 	t.Setenv("CRAWL_REMOTE_TOKEN", "test-token")
 
-	var sawQuery bool
+	var queryArgSets [][]string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("authorization"); got != "Bearer test-token" {
 			http.Error(w, "missing bearer", http.StatusUnauthorized)
@@ -385,7 +731,12 @@ func TestRemoteCloudModeDoesNotCreateLocalDB(t *testing.T) {
 				http.Error(w, "unexpected query", http.StatusBadRequest)
 				return
 			}
-			sawQuery = true
+			argNames := make([]string, 0, len(req.Args))
+			for name := range req.Args {
+				argNames = append(argNames, name)
+			}
+			sort.Strings(argNames)
+			queryArgSets = append(queryArgSets, argNames)
 			_ = json.NewEncoder(w).Encode(crawlremote.QueryResult{
 				Values: []map[string]any{{
 					"thread_id":    10,
@@ -452,8 +803,10 @@ func TestRemoteCloudModeDoesNotCreateLocalDB(t *testing.T) {
 	if err := searchApp.Run(ctx, []string{"--config", configPath, "--json", "search", "openclaw/openclaw", "--query", "remote"}); err != nil {
 		t.Fatalf("remote search: %v", err)
 	}
-	if !sawQuery || !strings.Contains(searchOut.String(), `"remote search"`) {
-		t.Fatalf("remote search did not use worker query: saw=%v out=%s", sawQuery, searchOut.String())
+	if len(queryArgSets) != 1 ||
+		!slices.Equal(queryArgSets[0], []string{"limit", "mode", "owner", "query", "repo"}) ||
+		!strings.Contains(searchOut.String(), `"remote search"`) {
+		t.Fatalf("remote search query args=%v out=%s", queryArgSets, searchOut.String())
 	}
 	ghSearchApp := New()
 	var ghSearchOut bytes.Buffer
@@ -463,6 +816,10 @@ func TestRemoteCloudModeDoesNotCreateLocalDB(t *testing.T) {
 	}
 	if !strings.Contains(ghSearchOut.String(), `"number": 42`) || !strings.Contains(ghSearchOut.String(), `"url": "https://github.com/openclaw/openclaw/issues/42"`) {
 		t.Fatalf("remote gh search output = %s", ghSearchOut.String())
+	}
+	if len(queryArgSets) != 2 ||
+		!slices.Equal(queryArgSets[1], []string{"kind", "limit", "owner", "query", "repo", "state"}) {
+		t.Fatalf("remote gh search query args=%v", queryArgSets)
 	}
 	doctorApp := New()
 	var doctorOut bytes.Buffer
@@ -488,7 +845,252 @@ func TestRemoteCloudModeDoesNotCreateLocalDB(t *testing.T) {
 	}
 }
 
+func testSnapshotPublishContract() crawlremote.Contract {
+	contract := crawlremote.BaseContract()
+	contract.Routes = append(contract.Routes, crawlremote.RouteSpec{
+		Method: http.MethodGet,
+		Path:   "/v1/apps/:app/archives/:archive/sqlite",
+		Auth:   crawlremote.AuthReader,
+	})
+	contract.Apps = []crawlremote.AppSpec{{
+		App: "gitcrawl",
+		Queries: []crawlremote.QuerySpec{
+			{Name: "gitcrawl.threads.search", Args: []string{"limit", "mode", "state", "kind", "query", "repo", "owner"}},
+			{Name: "gitcrawl.clusters.related", Args: []string{"owner", "repo", "number"}},
+			{Name: "gitcrawl.clusters.list", Args: []string{"owner", "repo", "status", "min_size"}},
+			{Name: "gitcrawl.clusters.members", Args: []string{"owner", "repo", "cluster_id"}},
+			{Name: "gitcrawl.pull_requests.review_context", Args: []string{"owner", "repo", "number"}},
+			{Name: "gitcrawl.coverage", Args: []string{"dataset"}},
+		},
+		IngestTables: []crawlremote.IngestTableSpec{
+			{Name: "repositories", Columns: gitcrawlRepositoryColumns},
+			{Name: "threads", Columns: gitcrawlThreadColumns},
+			{Name: "thread_revisions", Columns: []string{
+				"id", "thread_id", "source_updated_at", "content_hash", "title_hash",
+				"body_hash", "labels_hash", "created_at",
+			}},
+			{Name: "thread_fingerprints", Columns: []string{
+				"id", "thread_revision_id", "algorithm_version", "fingerprint_hash",
+				"fingerprint_slug", "body_token_hash", "file_set_hash", "simhash64", "created_at",
+			}},
+			{Name: "thread_key_summaries", Columns: []string{
+				"id", "thread_revision_id", "summary_kind", "prompt_version", "provider",
+				"model", "input_hash", "output_hash", "key_text", "created_at",
+			}},
+			{Name: "cluster_groups", Columns: []string{
+				"id", "repo_id", "stable_key", "stable_slug", "status", "cluster_type",
+				"representative_thread_id", "title", "member_count", "created_at", "updated_at",
+				"closed_at",
+			}},
+			{Name: "cluster_memberships", Columns: []string{
+				"cluster_id", "thread_id", "role", "state", "score_to_representative",
+				"created_at", "updated_at", "removed_at",
+			}},
+			{Name: "pull_request_details", Columns: []string{
+				"thread_id", "repo_id", "number", "base_sha", "head_sha", "head_ref",
+				"head_repo_full_name", "mergeable_state", "additions", "deletions",
+				"changed_files", "fetched_at", "updated_at",
+			}},
+			{Name: "pull_request_files", Columns: []string{
+				"thread_id", "position", "path", "status", "additions", "deletions",
+				"changes", "previous_path", "fetched_at",
+			}},
+			{Name: "dataset_coverage", Columns: gitcrawlCloudCoverageColumns},
+		},
+		Capabilities: []string{
+			gitcrawlSnapshotAtomicCapability,
+			gitcrawlSnapshotCutoverCapability,
+			gitcrawlSnapshotProvenanceCapability,
+			gitcrawlSnapshotStagingCapability,
+			sqliteBundleGzipUploadCapability,
+		},
+	}}
+	return contract
+}
+
+func TestCloudPublishRejectsPublisherOnlyTokenBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	cfg := config.Default()
+	cfg.DBPath = dbPath
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	seedCommandFlowStore(t, dbPath)
+
+	const tokenEnv = "GITCRAWL_TEST_PUBLISHER_ONLY_TOKEN"
+	t.Setenv(tokenEnv, "publisher-only-token")
+	whoamiRequests := 0
+	mutations := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.EscapedPath() == "/v1/contract":
+			w.Header().Set("content-type", "application/json")
+			_ = json.NewEncoder(w).Encode(testSnapshotPublishContract())
+		case r.Method == http.MethodGet && r.URL.EscapedPath() == "/v1/whoami":
+			whoamiRequests++
+			if got := r.Header.Get("authorization"); got != "Bearer publisher-only-token" {
+				http.Error(w, "missing bearer", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("content-type", "application/json")
+			_ = json.NewEncoder(w).Encode(crawlremote.Identity{
+				Owner: "openclaw",
+				Org:   "openclaw",
+				Login: "publisher",
+				Roles: []string{crawlremote.AuthPublisher},
+			})
+		default:
+			if r.Method == http.MethodPost ||
+				r.Method == http.MethodPut ||
+				r.Method == http.MethodPatch ||
+				r.Method == http.MethodDelete {
+				mutations++
+			}
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	err := New().Run(ctx, []string{
+		"--config", configPath,
+		"cloud", "publish",
+		"--remote", server.URL,
+		"--archive", "gitcrawl/openclaw__openclaw",
+		"--token-env", tokenEnv,
+		"--allow-incomplete",
+		"--json",
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing reader") {
+		t.Fatalf("cloud publish error = %v, want missing reader role", err)
+	}
+	if whoamiRequests != 1 {
+		t.Fatalf("whoami requests = %d, want 1", whoamiRequests)
+	}
+	if mutations != 0 {
+		t.Fatalf("remote mutations = %d, want 0", mutations)
+	}
+}
+
+func TestGitcrawlPublisherStatusMatchesExactMetadata(t *testing.T) {
+	snapshotID := strings.Repeat("a", 64)
+	manifest := crawlremote.IngestManifest{
+		App:           "gitcrawl",
+		Archive:       "gitcrawl/openclaw__openclaw",
+		SchemaName:    gitcrawlCloudSchemaName,
+		SchemaVersion: gitcrawlCloudSchemaVersion,
+		SchemaHash:    gitcrawlCloudSchemaHash,
+		SourceSyncAt:  "2026-07-12T12:00:00Z",
+		SnapshotID:    snapshotID,
+		SourceSHA256:  snapshotID,
+	}
+	publicationCapabilities := gitcrawlCloudPublicationCapabilities(manifest.Capabilities)
+	status := crawlremote.PublisherStatus{
+		App:              "gitcrawl",
+		Archive:          manifest.Archive,
+		ActiveSnapshotID: snapshotID,
+		CoverageComplete: true,
+		Snapshot: &crawlremote.ArchiveSnapshot{
+			ID:                 snapshotID,
+			SourceSHA256:       snapshotID,
+			SourceSyncAt:       manifest.SourceSyncAt,
+			DatasetGeneratedAt: "2026-07-12T12:01:00Z",
+			SchemaName:         gitcrawlCloudSchemaName,
+			SchemaVersion:      gitcrawlCloudSchemaVersion,
+			SchemaHash:         gitcrawlCloudSchemaHash,
+			Capabilities:       publicationCapabilities,
+			CoverageComplete:   true,
+		},
+	}
+	if !gitcrawlPublisherStatusMatches(status, manifest, publicationCapabilities) {
+		t.Fatal("exact staged snapshot did not match")
+	}
+
+	activeMismatch := status
+	activeMismatch.ActiveSnapshotID = strings.Repeat("f", 64)
+	if gitcrawlPublisherStatusMatches(activeMismatch, manifest, publicationCapabilities) {
+		t.Fatal("publisher status candidate mismatch was reused")
+	}
+
+	sourceMismatch := status
+	sourceMismatch.Snapshot = &crawlremote.ArchiveSnapshot{}
+	*sourceMismatch.Snapshot = *status.Snapshot
+	sourceMismatch.Snapshot.SourceSHA256 = strings.Repeat("b", 64)
+	if gitcrawlPublisherStatusMatches(sourceMismatch, manifest, publicationCapabilities) {
+		t.Fatal("source digest mismatch was reused")
+	}
+
+	sourceSyncMismatch := status
+	sourceSyncMismatch.Snapshot = &crawlremote.ArchiveSnapshot{}
+	*sourceSyncMismatch.Snapshot = *status.Snapshot
+	sourceSyncMismatch.Snapshot.SourceSyncAt = "2026-07-12T12:00:01Z"
+	if gitcrawlPublisherStatusMatches(sourceSyncMismatch, manifest, publicationCapabilities) {
+		t.Fatal("source sync mismatch was reused")
+	}
+
+	schemaMismatch := status
+	schemaMismatch.Snapshot = &crawlremote.ArchiveSnapshot{}
+	*schemaMismatch.Snapshot = *status.Snapshot
+	schemaMismatch.Snapshot.SchemaVersion++
+	if gitcrawlPublisherStatusMatches(schemaMismatch, manifest, publicationCapabilities) {
+		t.Fatal("schema mismatch was reused")
+	}
+
+	missingGeneratedAt := status
+	missingGeneratedAt.Snapshot = &crawlremote.ArchiveSnapshot{}
+	*missingGeneratedAt.Snapshot = *status.Snapshot
+	missingGeneratedAt.Snapshot.DatasetGeneratedAt = ""
+	if gitcrawlPublisherStatusMatches(missingGeneratedAt, manifest, publicationCapabilities) {
+		t.Fatal("snapshot without its staged generation timestamp was reused")
+	}
+
+	status.CoverageComplete = false
+	if gitcrawlPublisherStatusMatches(status, manifest, publicationCapabilities) {
+		t.Fatal("incomplete publisher status was reused")
+	}
+	status.CoverageComplete = true
+
+	nestedIncomplete := status
+	nestedIncomplete.Snapshot = &crawlremote.ArchiveSnapshot{}
+	*nestedIncomplete.Snapshot = *status.Snapshot
+	nestedIncomplete.Snapshot.CoverageComplete = false
+	if gitcrawlPublisherStatusMatches(nestedIncomplete, manifest, publicationCapabilities) {
+		t.Fatal("snapshot with nested incomplete coverage was reused")
+	}
+
+	manifest.Capabilities = []string{gitcrawlObservationOrderCapability}
+	publicationCapabilities = gitcrawlCloudPublicationCapabilities(manifest.Capabilities)
+	if gitcrawlPublisherStatusMatches(status, manifest, publicationCapabilities) {
+		t.Fatal("staged snapshot reused without snapshot capability proof")
+	}
+	status.Snapshot.Capabilities = slices.Clone(publicationCapabilities)
+	if !gitcrawlPublisherStatusMatches(status, manifest, publicationCapabilities) {
+		t.Fatal("staged snapshot with requested capability did not match")
+	}
+	status.Snapshot.Capabilities = append(
+		slices.Clone(publicationCapabilities),
+		"gitcrawl.unrequested-profile.v1",
+	)
+	if gitcrawlPublisherStatusMatches(status, manifest, publicationCapabilities) {
+		t.Fatal("snapshot with a broader publication profile was reused")
+	}
+	status.Snapshot.Capabilities = append(
+		slices.Clone(publicationCapabilities),
+		gitcrawlObservationOrderCapability,
+	)
+	if gitcrawlPublisherStatusMatches(status, manifest, publicationCapabilities) {
+		t.Fatal("snapshot with duplicate publication capabilities was reused")
+	}
+}
+
 func TestCloudPublishSendsLocalRows(t *testing.T) {
+	t.Run("legacy allow incomplete", func(t *testing.T) { testCloudPublishSendsLocalRows(t, false) })
+	t.Run("archive admission", func(t *testing.T) { testCloudPublishSendsLocalRows(t, true) })
+}
+
+func testCloudPublishSendsLocalRows(t *testing.T, archiveAdmission bool) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
@@ -505,12 +1107,46 @@ func TestCloudPublishSendsLocalRows(t *testing.T) {
 	seenTables := map[string]crawlremote.IngestRequest{}
 	var sawSQLitePart bool
 	var sawSQLiteManifest bool
+	var sawCutover bool
+	var sawSQLiteRead bool
+	var snapshotID string
+	var sqliteImage []byte
+	var publishedSnapshot *crawlremote.ArchiveSnapshot
+	var publishedDatasets []crawlremote.DatasetCoverage
+	var publisherStatusSnapshotIDs []string
+	mutationCounter := 0
+	uploadRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.EscapedPath() == "/v1/contract" {
+			w.Header().Set("content-type", "application/json")
+			contract := testSnapshotPublishContract()
+			if archiveAdmission {
+				contract.Apps[0].Capabilities = append(contract.Apps[0].Capabilities, gitcrawlArchiveAdmissionCapability, gitcrawlObservationOrderCapability)
+				for index := range contract.Apps[0].IngestTables {
+					table := &contract.Apps[0].IngestTables[index]
+					if table.Name == "threads" || table.Name == "thread_revisions" {
+						table.Columns = append(table.Columns, "observation_sequence")
+					}
+				}
+			}
+			_ = json.NewEncoder(w).Encode(contract)
+			return
+		}
 		if got := r.Header.Get("authorization"); got != "Bearer publish-token" {
 			http.Error(w, "missing bearer", http.StatusUnauthorized)
 			return
 		}
+		if r.Method == http.MethodGet && r.URL.EscapedPath() == "/v1/whoami" {
+			_ = json.NewEncoder(w).Encode(crawlremote.Identity{
+				Owner: "openclaw",
+				Org:   "openclaw",
+				Login: "publisher",
+				Roles: []string{crawlremote.AuthPublisher, crawlremote.AuthReader},
+			})
+			return
+		}
 		if r.Method == http.MethodPut && r.URL.EscapedPath() == "/v1/apps/gitcrawl/archives/gitcrawl%2Fopenclaw__openclaw/sqlite" {
+			uploadRequests++
 			uploadKind := r.Header.Get("x-crawl-sqlite-upload")
 			payload, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -521,7 +1157,17 @@ func TestCloudPublishSendsLocalRows(t *testing.T) {
 			switch uploadKind {
 			case "bundle-part":
 				sawSQLitePart = true
-				if r.Header.Get("content-type") != "application/gzip" || r.Header.Get("x-crawl-content-sha256") == "" {
+				if got := r.Header.Get("x-crawl-snapshot-id"); len(got) != 64 {
+					http.Error(w, "missing snapshot id", http.StatusBadRequest)
+					return
+				} else {
+					snapshotID = got
+				}
+				partSHA := r.Header.Get("x-crawl-content-sha256")
+				partIndex, err := strconv.Atoi(r.Header.Get("x-crawl-bundle-part-index"))
+				if r.Header.Get("content-type") != "application/gzip" ||
+					partSHA == "" ||
+					err != nil {
 					http.Error(w, "bad bundle part headers", http.StatusBadRequest)
 					return
 				}
@@ -546,11 +1192,21 @@ func TestCloudPublishSendsLocalRows(t *testing.T) {
 					http.Error(w, "bundle did not contain sqlite", http.StatusBadRequest)
 					return
 				}
+				sqliteImage = decompressed
 				_ = json.NewEncoder(w).Encode(crawlremote.SQLiteUploadResult{
 					App:      "gitcrawl",
 					Archive:  "gitcrawl/openclaw__openclaw",
 					Complete: false,
-					Object:   &crawlremote.SQLiteObject{Key: "v1/gitcrawl/gitcrawl%2Fopenclaw__openclaw/sqlite/chunks/current.db.gz.part-0000", Size: int64(len(payload))},
+					Object: &crawlremote.SQLiteObject{
+						Key: crawlremote.SQLiteSnapshotBundlePartKey(
+							"gitcrawl",
+							"gitcrawl/openclaw__openclaw",
+							snapshotID,
+							partSHA,
+							partIndex,
+						),
+						Size: int64(len(payload)),
+					},
 				})
 			case "bundle-manifest":
 				sawSQLiteManifest = true
@@ -563,15 +1219,103 @@ func TestCloudPublishSendsLocalRows(t *testing.T) {
 					http.Error(w, "bad manifest", http.StatusBadRequest)
 					return
 				}
+				if manifest.Privacy["includes_private_messages"] != true {
+					http.Error(w, "bundle privacy should disclose message bodies", http.StatusBadRequest)
+					return
+				}
+				if manifest.Privacy["includes_source_code"] != true {
+					http.Error(w, "bundle privacy should disclose patch text", http.StatusBadRequest)
+					return
+				}
+				if manifest.SnapshotID != snapshotID ||
+					manifest.Object.Key != crawlremote.SQLiteSnapshotObjectKey("gitcrawl", "gitcrawl/openclaw__openclaw", snapshotID) {
+					http.Error(w, "bundle snapshot mismatch", http.StatusBadRequest)
+					return
+				}
 				_ = json.NewEncoder(w).Encode(crawlremote.SQLiteBundleUploadResult{
 					App:      "gitcrawl",
 					Archive:  "gitcrawl/openclaw__openclaw",
 					Complete: true,
-					Bundle:   &crawlremote.SQLiteBundle{Key: "v1/gitcrawl/gitcrawl%2Fopenclaw__openclaw/sqlite/current.manifest.json", Manifest: &manifest},
+					Bundle: &crawlremote.SQLiteBundle{
+						Key:      crawlremote.SQLiteSnapshotBundleManifestKey("gitcrawl", "gitcrawl/openclaw__openclaw", snapshotID),
+						Manifest: &manifest,
+					},
 				})
 			default:
 				http.Error(w, "missing upload kind", http.StatusBadRequest)
 			}
+			return
+		}
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.EscapedPath(), "/publish-status") {
+			publisherStatusSnapshotIDs = append(
+				publisherStatusSnapshotIDs,
+				r.URL.Query().Get("snapshot_id"),
+			)
+			if publishedSnapshot == nil {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(crawlremote.PublisherStatus{
+				App:              "gitcrawl",
+				Archive:          "gitcrawl/openclaw__openclaw",
+				ActiveSnapshotID: snapshotID,
+				CoverageComplete: true,
+				Snapshot:         publishedSnapshot,
+			})
+			return
+		}
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.EscapedPath(), "/status") {
+			status := crawlremote.Status{
+				App:     "gitcrawl",
+				Archive: "gitcrawl/openclaw__openclaw",
+			}
+			if sawCutover && publishedSnapshot != nil {
+				status.Mode = "cloud"
+				status.SnapshotMode = "snapshot"
+				status.SnapshotCutoverAt = "2026-07-12T09:00:00Z"
+				status.SchemaName = publishedSnapshot.SchemaName
+				status.SchemaVersion = publishedSnapshot.SchemaVersion
+				status.SchemaHash = publishedSnapshot.SchemaHash
+				status.Capabilities = slices.Clone(publishedSnapshot.Capabilities)
+				status.ActiveSnapshotID = publishedSnapshot.ID
+				status.SourceSyncAt = publishedSnapshot.SourceSyncAt
+				status.DatasetGeneratedAt = publishedSnapshot.DatasetGeneratedAt
+				status.CoverageComplete = true
+				status.Datasets = slices.Clone(publishedDatasets)
+				snapshot := *publishedSnapshot
+				snapshot.CutoverAt = status.SnapshotCutoverAt
+				status.Snapshot = &snapshot
+			}
+			_ = json.NewEncoder(w).Encode(status)
+			return
+		}
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.EscapedPath(), "/cutover") {
+			var request struct {
+				SnapshotID string `json:"snapshot_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.SnapshotID != snapshotID {
+				http.Error(w, "cutover snapshot mismatch", http.StatusBadRequest)
+				return
+			}
+			sawCutover = true
+			_ = json.NewEncoder(w).Encode(crawlremote.CutoverResult{
+				Archive:      "gitcrawl/openclaw__openclaw",
+				SnapshotID:   snapshotID,
+				SnapshotMode: "snapshot",
+				CutoverAt:    "2026-07-12T09:00:00Z",
+			})
+			return
+		}
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.EscapedPath(), "/sqlite") {
+			if !sawCutover || len(sqliteImage) == 0 {
+				http.Error(w, "bound snapshot unavailable", http.StatusConflict)
+				return
+			}
+			sawSQLiteRead = true
+			w.Header().Set("content-type", "application/vnd.sqlite3")
+			w.Header().Set("content-length", strconv.Itoa(len(sqliteImage)))
+			w.Header().Set("x-crawl-content-sha256", snapshotID)
+			_, _ = w.Write(sqliteImage)
 			return
 		}
 		if r.Method != http.MethodPost || r.URL.EscapedPath() != "/v1/apps/gitcrawl/archives/gitcrawl%2Fopenclaw__openclaw/ingest" {
@@ -583,32 +1327,79 @@ func TestCloudPublishSendsLocalRows(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if body.Manifest.App != "gitcrawl" || body.Manifest.Archive != "gitcrawl/openclaw__openclaw" {
+		if body.Manifest.App != "gitcrawl" ||
+			body.Manifest.Archive != "gitcrawl/openclaw__openclaw" ||
+			body.Manifest.SnapshotID != snapshotID ||
+			body.Manifest.SourceSHA256 != snapshotID {
 			http.Error(w, "manifest mismatch", http.StatusBadRequest)
 			return
 		}
+		if body.Table == "dataset_coverage" {
+			if body.MutationToken == "" || !body.Final || len(body.Rows) != 9 {
+				http.Error(w, "coverage activation mismatch", http.StatusBadRequest)
+				return
+			}
+			publishedDatasets = testGitcrawlDatasetCoverageRows(t, body.Rows)
+			for _, row := range body.Rows {
+				if row[len(row)-1] != body.MutationToken {
+					http.Error(w, "coverage token mismatch", http.StatusBadRequest)
+					return
+				}
+			}
+			publishedSnapshot = &crawlremote.ArchiveSnapshot{
+				ID:            body.Manifest.SnapshotID,
+				SourceSHA256:  body.Manifest.SourceSHA256,
+				SchemaName:    body.Manifest.SchemaName,
+				SchemaVersion: body.Manifest.SchemaVersion,
+				SchemaHash:    body.Manifest.SchemaHash,
+				Capabilities: gitcrawlCloudPublicationCapabilities(
+					body.Manifest.Capabilities,
+				),
+				SourceSyncAt:       body.Manifest.SourceSyncAt,
+				DatasetGeneratedAt: fmt.Sprint(body.Rows[0][5]),
+				CoverageComplete:   true,
+				Warnings:           slices.Clone(body.Manifest.Warnings),
+			}
+		}
 		seenTables[body.Table] = body
+		mutationCounter++
+		token := fmt.Sprintf("mutation-%d", mutationCounter)
+		if body.Table == "dataset_coverage" {
+			token = body.MutationToken
+		}
 		w.Header().Set("content-type", "application/json")
-		_ = json.NewEncoder(w).Encode(crawlremote.IngestResult{Table: body.Table, RowsAccepted: int64(len(body.Rows)), Complete: body.Final})
+		_ = json.NewEncoder(w).Encode(crawlremote.IngestResult{
+			Table:         body.Table,
+			SnapshotID:    snapshotID,
+			MutationToken: token,
+			RowsAccepted:  int64(len(body.Rows)),
+			Complete:      body.Final,
+		})
 	}))
 	defer server.Close()
 
 	app := New()
 	var out bytes.Buffer
 	app.Stdout = &out
-	if err := app.Run(ctx, []string{
+	args := []string{
 		"--config", cfgPath,
 		"cloud", "publish",
 		"--remote", server.URL,
 		"--archive", "gitcrawl/openclaw__openclaw",
 		"--token-env", tokenEnv,
 		"--json",
-	}); err != nil {
+	}
+	if archiveAdmission {
+		args = append(args, "--admission-policy=archive-v1", "--observation-order")
+	} else {
+		args = append(args, "--allow-incomplete")
+	}
+	if err := app.Run(ctx, args); err != nil {
 		t.Fatalf("cloud publish: %v", err)
 	}
 
-	if len(seenTables) != 2 {
-		t.Fatalf("tables = %v, want repositories and threads", seenTables)
+	if len(seenTables) != 10 {
+		t.Fatalf("tables = %v, want all cloud-v2 datasets and coverage", seenTables)
 	}
 	if got := len(seenTables["repositories"].Rows); got != 1 {
 		t.Fatalf("repositories rows = %d, want 1", got)
@@ -616,21 +1407,1000 @@ func TestCloudPublishSendsLocalRows(t *testing.T) {
 	if got := len(seenTables["threads"].Rows); got != 3 {
 		t.Fatalf("threads rows = %d, want 3", got)
 	}
-	if !seenTables["threads"].Final {
-		t.Fatalf("threads batch should finish ingest")
+	if seenTables["threads"].Final {
+		t.Fatalf("threads batch should remain staged")
+	}
+	if !seenTables["dataset_coverage"].Final {
+		t.Fatalf("coverage batch should activate the snapshot")
 	}
 	if !sawSQLitePart || !sawSQLiteManifest {
 		t.Fatalf("cloud publish did not upload compressed sqlite bundle: part=%v manifest=%v", sawSQLitePart, sawSQLiteManifest)
+	}
+	if !sawCutover {
+		t.Fatal("cloud publish did not cut over the activated snapshot")
+	}
+	if !sawSQLiteRead {
+		t.Fatal("cloud publish did not verify the readable bound SQLite snapshot")
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
 		t.Fatalf("decode output: %v\n%s", err, out.String())
 	}
-	if payload["repositories"] != float64(1) || payload["threads"] != float64(3) {
+	datasets, ok := payload["datasets"].(map[string]any)
+	if !ok || datasets["repositories"] != float64(1) || datasets["threads"] != float64(3) {
 		t.Fatalf("unexpected output: %#v", payload)
+	}
+	if payload["snapshot_id"] != snapshotID || payload["source_sha256"] != snapshotID {
+		t.Fatalf("missing snapshot provenance: %#v", payload)
 	}
 	if payload["sqlite_bundle"] == nil {
 		t.Fatalf("missing sqlite bundle output: %#v", payload)
+	}
+	for _, requestedSnapshotID := range publisherStatusSnapshotIDs {
+		if requestedSnapshotID != snapshotID {
+			t.Fatalf(
+				"publisher status requested snapshot %q, want %q",
+				requestedSnapshotID,
+				snapshotID,
+			)
+		}
+	}
+	privacy, ok := payload["sqlite_bundle_privacy"].(map[string]any)
+	if !ok ||
+		privacy["includes_private_messages"] != true ||
+		privacy["includes_source_code"] != true {
+		t.Fatalf("missing sqlite bundle privacy output: %#v", payload)
+	}
+	if archiveAdmission {
+		if len(publishedSnapshot.Warnings) == 0 || payload["admission"] == nil {
+			t.Fatal("archive publication lost persistent admission evidence")
+		}
+		for _, dataset := range publishedDatasets {
+			if dataset.Dataset == "thread_revisions" && (dataset.EligibleCount != 3 || dataset.Complete) {
+				t.Fatalf("archive admission hid incomplete revision coverage: %+v", dataset)
+			}
+		}
+	}
+	beforeMutations, beforeUploads := mutationCounter, uploadRequests
+	out.Reset()
+	if err := app.Run(ctx, append(args, "--stage-only")); err != nil {
+		t.Fatalf("stage-only replay: %v", err)
+	}
+	if mutationCounter != beforeMutations || uploadRequests != beforeUploads {
+		t.Fatal("identical staged snapshot was uploaded or ingested again")
+	}
+}
+
+func TestCloudPublishRejectsMissingSnapshotCapabilityBeforeUpload(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	cfg := config.Default()
+	cfg.DBPath = dbPath
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	seedCommandFlowStore(t, dbPath)
+
+	const tokenEnv = "GITCRAWL_TEST_CONTRACT_TOKEN"
+	t.Setenv(tokenEnv, "publish-token")
+	mutations := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.EscapedPath() == "/v1/contract" {
+			contract := testSnapshotPublishContract()
+			contract.Apps[0].Capabilities = []string{
+				gitcrawlSnapshotAtomicCapability,
+				sqliteBundleGzipUploadCapability,
+			}
+			w.Header().Set("content-type", "application/json")
+			_ = json.NewEncoder(w).Encode(contract)
+			return
+		}
+		mutations++
+		http.Error(w, "unexpected mutation", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	err := New().Run(ctx, []string{
+		"--config", configPath,
+		"cloud", "publish",
+		"--remote", server.URL,
+		"--archive", "gitcrawl/openclaw__openclaw",
+		"--token-env", tokenEnv,
+		"--allow-incomplete",
+		"--json",
+	})
+	if err == nil || !strings.Contains(err.Error(), gitcrawlSnapshotProvenanceCapability) {
+		t.Fatalf("cloud publish error = %v", err)
+	}
+	if mutations != 0 {
+		t.Fatalf("remote mutations = %d, want 0", mutations)
+	}
+}
+
+func TestCloudPublishRejectsMissingRequestedCapabilityBeforeUpload(t *testing.T) {
+	tests := []struct {
+		name              string
+		args              []string
+		missingCapability string
+		archiveAdmission  bool
+	}{
+		{
+			name:              "archive admission",
+			args:              []string{"--admission-policy=archive-v1", "--observation-order", "--stage-only"},
+			missingCapability: gitcrawlArchiveAdmissionCapability,
+			archiveAdmission:  true,
+		},
+		{
+			name:              "archive observation fence",
+			args:              []string{"--admission-policy=archive-v1", "--observation-order", "--stage-only"},
+			missingCapability: gitcrawlObservationOrderCapability,
+			archiveAdmission:  true,
+		},
+		{
+			name:              "observation order",
+			args:              []string{"--observation-order", "--stage-only"},
+			missingCapability: gitcrawlObservationOrderCapability,
+		},
+		{
+			name:              "stage isolation",
+			args:              []string{"--stage-only"},
+			missingCapability: gitcrawlSnapshotStagingCapability,
+		},
+		{
+			name:              "cutover",
+			missingCapability: gitcrawlSnapshotCutoverCapability,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			dbPath := filepath.Join(dir, "gitcrawl.db")
+			cfg := config.Default()
+			cfg.DBPath = dbPath
+			if err := config.Save(configPath, cfg); err != nil {
+				t.Fatalf("save config: %v", err)
+			}
+			seedCommandFlowStore(t, dbPath)
+
+			const tokenEnv = "GITCRAWL_TEST_OPTION_CONTRACT_TOKEN"
+			t.Setenv(tokenEnv, "publish-token")
+			mutations := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.EscapedPath() == "/v1/contract" {
+					contract := testSnapshotPublishContract()
+					if test.archiveAdmission {
+						contract.Apps[0].Capabilities = append(contract.Apps[0].Capabilities, gitcrawlArchiveAdmissionCapability, gitcrawlObservationOrderCapability)
+						for index := range contract.Apps[0].IngestTables {
+							table := &contract.Apps[0].IngestTables[index]
+							if table.Name == "threads" || table.Name == "thread_revisions" {
+								table.Columns = append(table.Columns, "observation_sequence")
+							}
+						}
+					}
+					capabilities := make([]string, 0, len(contract.Apps[0].Capabilities))
+					for _, capability := range contract.Apps[0].Capabilities {
+						if capability != test.missingCapability {
+							capabilities = append(capabilities, capability)
+						}
+					}
+					contract.Apps[0].Capabilities = capabilities
+					w.Header().Set("content-type", "application/json")
+					_ = json.NewEncoder(w).Encode(contract)
+					return
+				}
+				mutations++
+				http.Error(w, "unexpected mutation", http.StatusInternalServerError)
+			}))
+			defer server.Close()
+
+			args := []string{
+				"--config", configPath,
+				"cloud", "publish",
+				"--remote", server.URL,
+				"--archive", "gitcrawl/openclaw__openclaw",
+				"--token-env", tokenEnv,
+				"--json",
+			}
+			if !test.archiveAdmission {
+				args = append(args, "--allow-incomplete")
+			}
+			args = append(args, test.args...)
+			err := New().Run(ctx, args)
+			if err == nil || !strings.Contains(err.Error(), test.missingCapability) {
+				t.Fatalf("cloud publish error = %v", err)
+			}
+			if mutations != 0 {
+				t.Fatalf("remote mutations = %d, want 0", mutations)
+			}
+		})
+	}
+}
+
+func TestCloudPublishRejectsIncompleteRemoteSurfaceBeforeUpload(t *testing.T) {
+	type remoteSurfaceTest struct {
+		name      string
+		want      string
+		mutate    func(*crawlremote.Contract)
+		extraArgs []string
+	}
+	tests := []remoteSurfaceTest{
+		{
+			name: "missing authenticated whoami route",
+			want: "GET /v1/whoami",
+			mutate: func(contract *crawlremote.Contract) {
+				contract.Routes = slices.DeleteFunc(
+					contract.Routes,
+					func(route crawlremote.RouteSpec) bool {
+						return route.Method == http.MethodGet &&
+							route.Path == "/v1/whoami"
+					},
+				)
+			},
+		},
+		{
+			name: "missing ingest column",
+			want: "pull_request_files is missing required column position",
+			mutate: func(contract *crawlremote.Contract) {
+				for tableIndex := range contract.Apps[0].IngestTables {
+					table := &contract.Apps[0].IngestTables[tableIndex]
+					if table.Name == "pull_request_files" {
+						table.Columns = slices.DeleteFunc(
+							table.Columns,
+							func(column string) bool { return column == "position" },
+						)
+					}
+				}
+			},
+		},
+		{
+			name: "missing cutover route",
+			want: "POST /v1/apps/:app/archives/:archive/cutover",
+			mutate: func(contract *crawlremote.Contract) {
+				contract.Routes = slices.DeleteFunc(
+					contract.Routes,
+					func(route crawlremote.RouteSpec) bool {
+						return route.Method == http.MethodPost &&
+							route.Path == "/v1/apps/:app/archives/:archive/cutover"
+					},
+				)
+			},
+		},
+		{
+			name: "missing publisher status route",
+			want: "GET /v1/apps/:app/archives/:archive/publish-status",
+			mutate: func(contract *crawlremote.Contract) {
+				contract.Routes = slices.DeleteFunc(
+					contract.Routes,
+					func(route crawlremote.RouteSpec) bool {
+						return route.Method == http.MethodGet &&
+							route.Path == "/v1/apps/:app/archives/:archive/publish-status"
+					},
+				)
+			},
+		},
+		{
+			name: "publisher status route with reader auth",
+			want: "GET /v1/apps/:app/archives/:archive/publish-status",
+			mutate: func(contract *crawlremote.Contract) {
+				for index := range contract.Routes {
+					route := &contract.Routes[index]
+					if route.Method == http.MethodGet &&
+						route.Path == "/v1/apps/:app/archives/:archive/publish-status" {
+						route.Auth = crawlremote.AuthReader
+					}
+				}
+			},
+		},
+		{
+			name: "missing reader query route",
+			want: "POST /v1/apps/:app/archives/:archive/query",
+			mutate: func(contract *crawlremote.Contract) {
+				contract.Routes = slices.DeleteFunc(
+					contract.Routes,
+					func(route crawlremote.RouteSpec) bool {
+						return route.Method == http.MethodPost &&
+							route.Path == "/v1/apps/:app/archives/:archive/query"
+					},
+				)
+			},
+		},
+		{
+			name: "missing SQLite hydration route",
+			want: "GET /v1/apps/:app/archives/:archive/sqlite",
+			mutate: func(contract *crawlremote.Contract) {
+				contract.Routes = slices.DeleteFunc(
+					contract.Routes,
+					func(route crawlremote.RouteSpec) bool {
+						return route.Method == http.MethodGet &&
+							route.Path == "/v1/apps/:app/archives/:archive/sqlite"
+					},
+				)
+			},
+		},
+		{
+			name: "SQLite hydration route with publisher auth",
+			want: "GET /v1/apps/:app/archives/:archive/sqlite",
+			mutate: func(contract *crawlremote.Contract) {
+				for index := range contract.Routes {
+					route := &contract.Routes[index]
+					if route.Method == http.MethodGet &&
+						route.Path == "/v1/apps/:app/archives/:archive/sqlite" {
+						route.Auth = crawlremote.AuthPublisher
+					}
+				}
+			},
+		},
+		{
+			name: "zero reader queries",
+			want: "required reader query gitcrawl.threads.search",
+			mutate: func(contract *crawlremote.Contract) {
+				contract.Apps[0].Queries = nil
+			},
+		},
+		{
+			name: "thread search missing mode and limit",
+			want: "reader query gitcrawl.threads.search has arguments",
+			mutate: func(contract *crawlremote.Contract) {
+				contract.Apps[0].Queries[0].Args = []string{
+					"owner", "repo", "query", "kind", "state",
+				}
+			},
+		},
+		{
+			name: "thread search duplicate argument",
+			want: "reader query gitcrawl.threads.search has arguments",
+			mutate: func(contract *crawlremote.Contract) {
+				contract.Apps[0].Queries[0].Args = []string{
+					"owner", "repo", "query", "kind", "state", "mode", "mode",
+				}
+			},
+		},
+		{
+			name: "duplicate reader query",
+			want: "required reader query gitcrawl.threads.search more than once",
+			mutate: func(contract *crawlremote.Contract) {
+				contract.Apps[0].Queries = append(
+					contract.Apps[0].Queries,
+					contract.Apps[0].Queries[0],
+				)
+			},
+		},
+	}
+	for _, required := range gitcrawlCloudReaderQuerySpecs() {
+		tests = append(tests, remoteSurfaceTest{
+			name: "missing reader query " + required.Name,
+			want: "required reader query " + required.Name,
+			mutate: func(contract *crawlremote.Contract) {
+				contract.Apps[0].Queries = slices.DeleteFunc(
+					contract.Apps[0].Queries,
+					func(query crawlremote.QuerySpec) bool {
+						return query.Name == required.Name
+					},
+				)
+			},
+		})
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.toml")
+			dbPath := filepath.Join(dir, "gitcrawl.db")
+			cfg := config.Default()
+			cfg.DBPath = dbPath
+			if err := config.Save(configPath, cfg); err != nil {
+				t.Fatalf("save config: %v", err)
+			}
+			seedCommandFlowStore(t, dbPath)
+
+			const tokenEnv = "GITCRAWL_TEST_SURFACE_CONTRACT_TOKEN"
+			t.Setenv(tokenEnv, "publish-token")
+			mutations := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.EscapedPath() == "/v1/contract" {
+					contract := testSnapshotPublishContract()
+					test.mutate(&contract)
+					w.Header().Set("content-type", "application/json")
+					_ = json.NewEncoder(w).Encode(contract)
+					return
+				}
+				mutations++
+				http.Error(w, "unexpected mutation", http.StatusInternalServerError)
+			}))
+			defer server.Close()
+
+			args := []string{
+				"--config", configPath,
+				"cloud", "publish",
+				"--remote", server.URL,
+				"--archive", "gitcrawl/openclaw__openclaw",
+				"--token-env", tokenEnv,
+				"--allow-incomplete",
+				"--json",
+			}
+			args = append(args, test.extraArgs...)
+			err := New().Run(ctx, args)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("cloud publish error = %v", err)
+			}
+			if mutations != 0 {
+				t.Fatalf("remote mutations = %d, want 0", mutations)
+			}
+		})
+	}
+}
+
+func TestCloudPublishStageOnlyThenResumesDefaultCutover(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	cfg := config.Default()
+	cfg.DBPath = dbPath
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	seedCommandFlowStore(t, dbPath)
+
+	const tokenEnv = "GITCRAWL_TEST_RESUME_TOKEN"
+	const concurrentDatasetGeneratedAt = "2000-01-02T03:04:05.678901234Z"
+	t.Setenv(tokenEnv, "publish-token")
+	var snapshotID string
+	var stagedSnapshot *crawlremote.ArchiveSnapshot
+	var stagedDatasets []crawlremote.DatasetCoverage
+	servingSnapshotID := strings.Repeat("f", 64)
+	var sqliteImage []byte
+	uploadRequests := 0
+	ingestRequests := 0
+	publisherStatusRequests := 0
+	var publisherStatusSnapshotIDs []string
+	snapshotMismatchResponsesRemaining := 1
+	readerStatusRequests := 0
+	sqliteReadRequests := 0
+	cutovers := 0
+	hydrationFailuresRemaining := 1
+	concurrentFinalCompletionsRemaining := 1
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.EscapedPath() == "/v1/contract" {
+			contract := testSnapshotPublishContract()
+			contract.Apps[0].Capabilities = append(
+				contract.Apps[0].Capabilities,
+				gitcrawlObservationOrderCapability,
+			)
+			for index := range contract.Apps[0].IngestTables {
+				table := &contract.Apps[0].IngestTables[index]
+				if table.Name == "threads" || table.Name == "thread_revisions" {
+					table.Columns = append(table.Columns, "observation_sequence")
+				}
+			}
+			w.Header().Set("content-type", "application/json")
+			_ = json.NewEncoder(w).Encode(contract)
+			return
+		}
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.EscapedPath(), "/status") {
+			readerStatusRequests++
+			if r.Header.Get("authorization") != "Bearer publish-token" {
+				http.Error(w, "missing dual-role bearer", http.StatusForbidden)
+				return
+			}
+			status := crawlremote.Status{
+				App:              "gitcrawl",
+				Archive:          "gitcrawl/openclaw__openclaw",
+				ActiveSnapshotID: servingSnapshotID,
+			}
+			readerProjectionExact := false
+			switch readerStatusRequests {
+			case 3, 5, 6, 7:
+				readerProjectionExact = true
+			}
+			if servingSnapshotID == snapshotID &&
+				readerProjectionExact &&
+				stagedSnapshot != nil {
+				status.Mode = "cloud"
+				status.SnapshotMode = "snapshot"
+				status.SnapshotCutoverAt = "2026-07-12T11:00:00Z"
+				status.SchemaName = stagedSnapshot.SchemaName
+				status.SchemaVersion = stagedSnapshot.SchemaVersion
+				status.SchemaHash = stagedSnapshot.SchemaHash
+				status.Capabilities = slices.Clone(stagedSnapshot.Capabilities)
+				status.SourceSyncAt = stagedSnapshot.SourceSyncAt
+				status.DatasetGeneratedAt = stagedSnapshot.DatasetGeneratedAt
+				status.CoverageComplete = true
+				status.Datasets = slices.Clone(stagedDatasets)
+				snapshot := *stagedSnapshot
+				snapshot.CutoverAt = status.SnapshotCutoverAt
+				status.Snapshot = &snapshot
+			}
+			_ = json.NewEncoder(w).Encode(status)
+			return
+		}
+		if got := r.Header.Get("authorization"); got != "Bearer publish-token" {
+			http.Error(w, "missing bearer", http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.EscapedPath() == "/v1/whoami" {
+			_ = json.NewEncoder(w).Encode(crawlremote.Identity{
+				Owner: "openclaw",
+				Org:   "openclaw",
+				Login: "publisher",
+				Roles: []string{crawlremote.AuthPublisher, crawlremote.AuthReader},
+			})
+			return
+		}
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.EscapedPath(), "/sqlite") {
+			sqliteReadRequests++
+			if servingSnapshotID != snapshotID || len(sqliteImage) == 0 {
+				http.Error(w, "bound snapshot unavailable", http.StatusConflict)
+				return
+			}
+			if hydrationFailuresRemaining > 0 {
+				hydrationFailuresRemaining--
+				http.Error(w, "temporary hydration failure", http.StatusConflict)
+				return
+			}
+			w.Header().Set("content-type", "application/vnd.sqlite3")
+			w.Header().Set("content-length", strconv.Itoa(len(sqliteImage)))
+			w.Header().Set("x-crawl-content-sha256", snapshotID)
+			_, _ = w.Write(sqliteImage)
+			return
+		}
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.EscapedPath(), "/publish-status") {
+			publisherStatusRequests++
+			requestedSnapshotID := r.URL.Query().Get("snapshot_id")
+			publisherStatusSnapshotIDs = append(
+				publisherStatusSnapshotIDs,
+				requestedSnapshotID,
+			)
+			if requestedSnapshotID != "" && snapshotMismatchResponsesRemaining > 0 {
+				snapshotMismatchResponsesRemaining--
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error":   "snapshot_mismatch",
+					"message": "snapshot ingest is incomplete",
+				})
+				return
+			}
+			if stagedSnapshot == nil {
+				http.NotFound(w, r)
+				return
+			}
+			statusSnapshot := stagedSnapshot
+			if requestedSnapshotID == "" {
+				concurrent := *stagedSnapshot
+				concurrent.ID = strings.Repeat("c", 64)
+				concurrent.SourceSHA256 = concurrent.ID
+				statusSnapshot = &concurrent
+			}
+			activeSnapshotID := ""
+			if statusSnapshot != nil {
+				activeSnapshotID = statusSnapshot.ID
+			}
+			_ = json.NewEncoder(w).Encode(crawlremote.PublisherStatus{
+				App:              "gitcrawl",
+				Archive:          "gitcrawl/openclaw__openclaw",
+				ActiveSnapshotID: activeSnapshotID,
+				CoverageComplete: statusSnapshot != nil,
+				Snapshot:         statusSnapshot,
+			})
+			return
+		}
+		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.EscapedPath(), "/sqlite") {
+			uploadRequests++
+			w.Header().Set("content-type", "application/json")
+			switch r.Header.Get("x-crawl-sqlite-upload") {
+			case "bundle-part":
+				snapshotID = r.Header.Get("x-crawl-snapshot-id")
+				partSHA := r.Header.Get("x-crawl-content-sha256")
+				partIndex, err := strconv.Atoi(r.Header.Get("x-crawl-bundle-part-index"))
+				if len(snapshotID) != 64 || len(partSHA) != 64 || err != nil {
+					http.Error(w, "invalid bundle part", http.StatusBadRequest)
+					return
+				}
+				compressed, err := io.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				reader, err := gzip.NewReader(bytes.NewReader(compressed))
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				sqliteImage, err = io.ReadAll(reader)
+				if closeErr := reader.Close(); err == nil {
+					err = closeErr
+				}
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(crawlremote.SQLiteUploadResult{
+					App:      "gitcrawl",
+					Archive:  "gitcrawl/openclaw__openclaw",
+					Complete: false,
+					Object: &crawlremote.SQLiteObject{
+						Key: crawlremote.SQLiteSnapshotBundlePartKey(
+							"gitcrawl",
+							"gitcrawl/openclaw__openclaw",
+							snapshotID,
+							partSHA,
+							partIndex,
+						),
+					},
+				})
+			case "bundle-manifest":
+				var manifest crawlremote.SQLiteBundleManifest
+				if err := json.NewDecoder(r.Body).Decode(&manifest); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				if manifest.SnapshotID != snapshotID {
+					http.Error(w, "snapshot mismatch", http.StatusBadRequest)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(crawlremote.SQLiteBundleUploadResult{
+					App:      "gitcrawl",
+					Archive:  "gitcrawl/openclaw__openclaw",
+					Complete: true,
+					Bundle: &crawlremote.SQLiteBundle{
+						Key:      crawlremote.SQLiteSnapshotBundleManifestKey("gitcrawl", "gitcrawl/openclaw__openclaw", snapshotID),
+						Manifest: &manifest,
+					},
+				})
+			default:
+				http.Error(w, "missing upload kind", http.StatusBadRequest)
+			}
+			return
+		}
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.EscapedPath(), "/ingest") {
+			ingestRequests++
+			if stagedSnapshot != nil {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error":   "snapshot_active",
+					"message": "activated Gitcrawl snapshots are immutable",
+				})
+				return
+			}
+			var body crawlremote.IngestRequest
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if body.Manifest.SnapshotID != snapshotID ||
+				body.Manifest.SourceSHA256 != snapshotID {
+				http.Error(w, "ingest provenance mismatch", http.StatusBadRequest)
+				return
+			}
+			mutationToken := fmt.Sprintf("resume-mutation-%d", ingestRequests)
+			if body.Final {
+				if body.Table != "dataset_coverage" || body.MutationToken == "" {
+					http.Error(w, "invalid snapshot activation", http.StatusBadRequest)
+					return
+				}
+				mutationToken = body.MutationToken
+				stagedDatasets = testGitcrawlDatasetCoverageRows(t, body.Rows)
+				if got := fmt.Sprint(body.Rows[0][5]); got == concurrentDatasetGeneratedAt {
+					t.Fatalf("loser generation unexpectedly equals independent winner generation %q", got)
+				}
+				for index := range stagedDatasets {
+					stagedDatasets[index].DatasetGeneratedAt = concurrentDatasetGeneratedAt
+				}
+				stagedSnapshot = &crawlremote.ArchiveSnapshot{
+					ID:                 body.Manifest.SnapshotID,
+					SourceSHA256:       body.Manifest.SourceSHA256,
+					SourceSyncAt:       body.Manifest.SourceSyncAt,
+					DatasetGeneratedAt: concurrentDatasetGeneratedAt,
+					SchemaName:         body.Manifest.SchemaName,
+					SchemaVersion:      body.Manifest.SchemaVersion,
+					SchemaHash:         body.Manifest.SchemaHash,
+					Capabilities: gitcrawlCloudPublicationCapabilities(
+						body.Manifest.Capabilities,
+					),
+					CoverageComplete: true,
+				}
+				if concurrentFinalCompletionsRemaining > 0 {
+					concurrentFinalCompletionsRemaining--
+					w.WriteHeader(http.StatusConflict)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"error":   "snapshot_active",
+						"message": "a concurrent publisher completed the snapshot",
+					})
+					return
+				}
+			}
+			_ = json.NewEncoder(w).Encode(crawlremote.IngestResult{
+				Table:         body.Table,
+				SnapshotID:    body.Manifest.SnapshotID,
+				MutationToken: mutationToken,
+				RowsAccepted:  int64(len(body.Rows)),
+				Complete:      body.Final,
+			})
+			return
+		}
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.EscapedPath(), "/cutover") {
+			var request struct {
+				SnapshotID string `json:"snapshot_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil ||
+				request.SnapshotID != snapshotID {
+				http.Error(w, "cutover snapshot mismatch", http.StatusBadRequest)
+				return
+			}
+			if stagedSnapshot == nil || stagedSnapshot.ID != request.SnapshotID {
+				http.Error(w, "snapshot is not staged", http.StatusConflict)
+				return
+			}
+			cutovers++
+			servingSnapshotID = request.SnapshotID
+			_ = json.NewEncoder(w).Encode(crawlremote.CutoverResult{
+				Archive:      "gitcrawl/openclaw__openclaw",
+				SnapshotID:   snapshotID,
+				SnapshotMode: "snapshot",
+				CutoverAt:    "2026-07-12T11:00:00Z",
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	baseArgs := []string{
+		"--config", configPath,
+		"cloud", "publish",
+		"--remote", server.URL,
+		"--archive", "gitcrawl/openclaw__openclaw",
+		"--token-env", tokenEnv,
+		"--allow-incomplete",
+		"--observation-order",
+		"--json",
+	}
+	stageIngestRequests := 0
+	stageUploadRequests := 0
+	originalServingSnapshotID := servingSnapshotID
+	var stagedDatasetGeneratedAt string
+	for index, extra := range [][]string{{"--stage-only"}, nil, nil, nil} {
+		app := New()
+		var output bytes.Buffer
+		app.Stdout = &output
+		args := append(append([]string(nil), baseArgs...), extra...)
+		err := app.Run(ctx, args)
+		if index == 1 {
+			if err == nil || !strings.Contains(err.Error(), "temporary hydration failure") {
+				t.Fatalf("first cutover hydration error = %v", err)
+			}
+			if servingSnapshotID != snapshotID {
+				t.Fatalf("failed hydration did not leave snapshot serving: %q", servingSnapshotID)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("cloud publish run %d: %v", index+1, err)
+		}
+		var result struct {
+			DatasetGeneratedAt string                     `json:"dataset_generated_at"`
+			AlreadyStaged      bool                       `json:"already_staged"`
+			AlreadyCutOver     bool                       `json:"already_cut_over"`
+			MutationToken      string                     `json:"mutation_token"`
+			Cutover            *crawlremote.CutoverResult `json:"cutover"`
+		}
+		if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+			t.Fatalf("decode run %d output: %v\n%s", index+1, err, output.String())
+		}
+		if index == 0 && result.Cutover != nil {
+			t.Fatalf("stage-only publish unexpectedly cut over: %#v", result.Cutover)
+		}
+		if index == 0 && !result.AlreadyStaged {
+			t.Fatal("initial stage-only publish did not recover concurrent completion")
+		}
+		if index == 0 {
+			stageIngestRequests = ingestRequests
+			stageUploadRequests = uploadRequests
+			if stageIngestRequests == 0 || stagedSnapshot == nil {
+				t.Fatal("stage-only publish did not complete the candidate snapshot")
+			}
+			if servingSnapshotID != originalServingSnapshotID {
+				t.Fatalf("stage-only changed serving snapshot to %q", servingSnapshotID)
+			}
+			stagedDatasetGeneratedAt = result.DatasetGeneratedAt
+			if stagedDatasetGeneratedAt != concurrentDatasetGeneratedAt ||
+				result.MutationToken != "" {
+				t.Fatalf(
+					"stage-only generation mismatch: generation_matches=%t mutation_token_present=%t mutation_token_length=%d",
+					stagedDatasetGeneratedAt == concurrentDatasetGeneratedAt,
+					result.MutationToken != "",
+					len(result.MutationToken),
+				)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		if index == 2 {
+			if result.AlreadyCutOver || result.Cutover == nil {
+				t.Fatalf("incomplete reader status incorrectly skipped cutover: %s", output.String())
+			}
+		}
+		if index == 3 {
+			if !result.AlreadyStaged || !result.AlreadyCutOver || result.Cutover != nil {
+				t.Fatalf("retry did not reuse the staged serving snapshot: %s", output.String())
+			}
+			if result.DatasetGeneratedAt != stagedDatasetGeneratedAt {
+				t.Fatalf(
+					"resumed generation = %q, want staged generation %q",
+					result.DatasetGeneratedAt,
+					stagedDatasetGeneratedAt,
+				)
+			}
+			if result.MutationToken != "" {
+				t.Fatalf("resumed publish minted mutation token: length=%d", len(result.MutationToken))
+			}
+		}
+	}
+	if ingestRequests != stageIngestRequests {
+		t.Fatalf(
+			"ingest requests = %d after complete resume, want stage-only count %d",
+			ingestRequests,
+			stageIngestRequests,
+		)
+	}
+	if uploadRequests != stageUploadRequests {
+		t.Fatalf(
+			"upload requests = %d after staged resume, want stage-only count %d",
+			uploadRequests,
+			stageUploadRequests,
+		)
+	}
+	if cutovers != 2 {
+		t.Fatalf("cutovers = %d, want 2 after incomplete reader status", cutovers)
+	}
+	if servingSnapshotID != snapshotID {
+		t.Fatalf("serving snapshot = %q, want staged snapshot %q", servingSnapshotID, snapshotID)
+	}
+	if publisherStatusRequests != 8 {
+		t.Fatalf(
+			"publisher status requests = %d, want 8 including concurrent completion recovery",
+			publisherStatusRequests,
+		)
+	}
+	for _, requestedSnapshotID := range publisherStatusSnapshotIDs {
+		if requestedSnapshotID != snapshotID {
+			t.Fatalf(
+				"publisher status requested snapshot %q, want %q",
+				requestedSnapshotID,
+				snapshotID,
+			)
+		}
+	}
+	if readerStatusRequests != 7 {
+		t.Fatalf(
+			"reader status requests = %d, want 7 pre-cutover and exact post-cutover checks",
+			readerStatusRequests,
+		)
+	}
+	if sqliteReadRequests != 3 {
+		t.Fatalf("SQLite read requests = %d, want failed hydration plus two retries", sqliteReadRequests)
+	}
+}
+
+func testGitcrawlDatasetCoverageRows(
+	t *testing.T,
+	rows [][]any,
+) []crawlremote.DatasetCoverage {
+	t.Helper()
+	datasets := make([]crawlremote.DatasetCoverage, 0, len(rows))
+	for _, row := range rows {
+		if len(row) != len(gitcrawlCloudCoverageColumns) {
+			t.Fatalf("coverage row columns = %d, want %d", len(row), len(gitcrawlCloudCoverageColumns))
+		}
+		number := func(value any) int64 {
+			t.Helper()
+			switch typed := value.(type) {
+			case float64:
+				return int64(typed)
+			case int64:
+				return typed
+			default:
+				t.Fatalf("coverage count type = %T", value)
+				return 0
+			}
+		}
+		complete, ok := row[6].(bool)
+		if !ok {
+			t.Fatalf("coverage complete type = %T", row[6])
+		}
+		covered := number(row[3])
+		datasets = append(datasets, crawlremote.DatasetCoverage{
+			Dataset:            fmt.Sprint(row[0]),
+			RowCount:           number(row[1]),
+			EligibleCount:      number(row[2]),
+			CoveredCount:       covered,
+			FreshCount:         covered,
+			MaxSourceAt:        fmt.Sprint(row[4]),
+			DatasetGeneratedAt: fmt.Sprint(row[5]),
+			Complete:           complete,
+		})
+	}
+	return datasets
+}
+
+func TestCloudPublishRejectsIncompleteHydrationBeforeRemoteMutation(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	cfg := config.Default()
+	cfg.DBPath = dbPath
+	if err := config.Save(cfgPath, cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	seedCommandFlowStore(t, dbPath)
+
+	tokenEnv := "GITCRAWL_TEST_INCOMPLETE_PUBLISH_TOKEN"
+	t.Setenv(tokenEnv, "publish-token")
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	err := New().Run(ctx, []string{
+		"--config", cfgPath,
+		"cloud", "publish",
+		"--remote", server.URL,
+		"--archive", "gitcrawl/openclaw__openclaw",
+		"--token-env", tokenEnv,
+		"--json",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cloud snapshot enrichment is incomplete") {
+		t.Fatalf("cloud publish error = %v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("remote requests = %d, want 0", requests)
+	}
+}
+
+func TestCloudPublishRejectsLegacyExportSchemaBeforeRemoteMutation(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	cfg := config.Default()
+	cfg.DBPath = dbPath
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	seedCommandFlowStore(t, dbPath)
+	seedDoctorLegacyPullRequestFilesSchema(t, ctx, dbPath)
+
+	const tokenEnv = "GITCRAWL_TEST_LEGACY_EXPORT_TOKEN"
+	t.Setenv(tokenEnv, "publish-token")
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "unexpected remote request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	err := New().Run(ctx, []string{
+		"--config", configPath,
+		"cloud", "publish",
+		"--remote", server.URL,
+		"--archive", "gitcrawl/openclaw__openclaw",
+		"--token-env", tokenEnv,
+		"--allow-incomplete",
+		"--json",
+	})
+	if err == nil ||
+		!strings.Contains(err.Error(), "prepare cloud dataset pull_request_files export") ||
+		!strings.Contains(err.Error(), "no such column: position") {
+		t.Fatalf("cloud publish error = %v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("remote requests = %d, want 0", requests)
 	}
 }
 
@@ -693,7 +2463,13 @@ func TestRemoteLoginStoresKeyringToken(t *testing.T) {
 		t.Fatalf("remote login: %v", err)
 	}
 	if pollSecretHash == "" || pollSecret == "" || crawlremote.LoginPollSecretHash(pollSecret) != pollSecretHash {
-		t.Fatalf("poll secret/hash not linked: secret=%q hash=%q", pollSecret, pollSecretHash)
+		t.Fatalf(
+			"poll secret/hash not linked: secret_present=%t secret_length=%d hash_present=%t hash_length=%d",
+			pollSecret != "",
+			len(pollSecret),
+			pollSecretHash != "",
+			len(pollSecretHash),
+		)
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -707,7 +2483,7 @@ func TestRemoteLoginStoresKeyringToken(t *testing.T) {
 		t.Fatalf("keyring get: %v", err)
 	}
 	if stored != "session-token" {
-		t.Fatalf("stored token = %q", stored)
+		t.Fatalf("stored token mismatch: present=%t length=%d", stored != "", len(stored))
 	}
 
 	whoami := New()
@@ -765,7 +2541,7 @@ func TestRemoteLoginWithGitHubTokenEnvStoresKeyringToken(t *testing.T) {
 		t.Fatalf("remote login: %v", err)
 	}
 	if sawToken != "github-token" {
-		t.Fatalf("github token = %q", sawToken)
+		t.Fatalf("github token mismatch: present=%t length=%d", sawToken != "", len(sawToken))
 	}
 	if !strings.Contains(out.String(), `"login_method": "github-token"`) {
 		t.Fatalf("login output = %s", out.String())
@@ -779,7 +2555,7 @@ func TestRemoteLoginWithGitHubTokenEnvStoresKeyringToken(t *testing.T) {
 		t.Fatalf("keyring get: %v", err)
 	}
 	if stored != "session-token" {
-		t.Fatalf("stored token = %q", stored)
+		t.Fatalf("stored token mismatch: present=%t length=%d", stored != "", len(stored))
 	}
 
 	whoami := New()
@@ -854,6 +2630,7 @@ func TestMetadataStatusAndControlStatusJSON(t *testing.T) {
 		OpenThreadCount: 1,
 		ClusterCount:    4,
 		LastSyncAt:      lastSync,
+		LastExportAt:    lastSync.Add(time.Hour),
 	})
 	if out.DatabaseBytes == 0 {
 		t.Fatalf("database bytes should be populated: %#v", out)
@@ -863,6 +2640,9 @@ func TestMetadataStatusAndControlStatusJSON(t *testing.T) {
 	}
 	if out.LastSyncAt != lastSync.UTC().Format(time.RFC3339) {
 		t.Fatalf("last sync = %q", out.LastSyncAt)
+	}
+	if out.LastExportAt != lastSync.Add(time.Hour).UTC().Format(time.RFC3339) {
+		t.Fatalf("last export = %q", out.LastExportAt)
 	}
 	if len(out.Databases) != 1 || out.Databases[0].Path != sizePath || !out.Databases[0].IsPrimary {
 		t.Fatalf("database metadata = %#v", out.Databases)
@@ -877,7 +2657,7 @@ func TestMetadataStatusAndControlStatusJSON(t *testing.T) {
 	if err := help.printCommandUsage("portable"); err != nil {
 		t.Fatalf("portable help: %v", err)
 	}
-	if !strings.Contains(helpOut.String(), "portable") {
+	if !strings.Contains(helpOut.String(), "portable") || !strings.Contains(helpOut.String(), "--include-sync-failures") || !strings.Contains(helpOut.String(), "--no-publish") || !strings.Contains(helpOut.String(), "redact") {
 		t.Fatalf("portable help output = %q", helpOut.String())
 	}
 	helpOut.Reset()
@@ -887,7 +2667,7 @@ func TestMetadataStatusAndControlStatusJSON(t *testing.T) {
 	if !strings.Contains(helpOut.String(), "cluster browser") {
 		t.Fatalf("tui help output = %q", helpOut.String())
 	}
-	for _, topic := range []string{"metadata", "status", "remote", "whoami", "init", "configure", "doctor", "sync", "refresh", "embed", "threads", "search", "code", "cluster", "clusters", "clusters-report", "durable-clusters", "cluster-detail", "cluster-explain", "neighbors", "runs", "close-thread", "reopen-thread", "close-cluster", "reopen-cluster", "exclude-cluster-member", "include-cluster-member", "set-cluster-canonical", "gh"} {
+	for _, topic := range []string{"metadata", "status", "remote", "whoami", "init", "configure", "doctor", "sync", "fill-pr-details", "refresh", "summarize", "embed", "threads", "search", "code", "cluster", "clusters", "clusters-report", "durable-clusters", "cluster-detail", "cluster-explain", "neighbors", "runs", "close-thread", "reopen-thread", "close-cluster", "reopen-cluster", "exclude-cluster-member", "include-cluster-member", "set-cluster-canonical", "gh"} {
 		helpOut.Reset()
 		if err := help.printCommandUsage(topic); err != nil {
 			t.Fatalf("%s help: %v", topic, err)
@@ -902,6 +2682,20 @@ func TestMetadataStatusAndControlStatusJSON(t *testing.T) {
 	}
 	if strings.Contains(helpOut.String(), "--sync-if-stale") {
 		t.Fatalf("refresh help should not advertise search-only --sync-if-stale: %q", helpOut.String())
+	}
+	helpOut.Reset()
+	if err := help.printCommandUsage("fill-pr-details"); err != nil {
+		t.Fatalf("fill-pr-details help: %v", err)
+	}
+	if !strings.Contains(helpOut.String(), "--include-comments") || !strings.Contains(helpOut.String(), "default floor is 1500") || !strings.Contains(helpOut.String(), "/rate_limit") || !strings.Contains(helpOut.String(), "best-effort") {
+		t.Fatalf("fill-pr-details help output = %q", helpOut.String())
+	}
+	helpOut.Reset()
+	if err := help.printCommandUsage("coverage"); err != nil {
+		t.Fatalf("coverage help: %v", err)
+	}
+	if !strings.HasSuffix(helpOut.String(), "[--json]\n") {
+		t.Fatalf("coverage help has unexpected suffix: %q", helpOut.String())
 	}
 	if err := New().Run(ctx, []string{"--config", configPath, "status", "extra"}); err == nil {
 		t.Fatal("status extra arg should fail")
@@ -953,8 +2747,8 @@ func TestControlRepositoryAndClusterHelperBranches(t *testing.T) {
 		t.Fatalf("short github remote repo = %q", got)
 	}
 
-	with, err := parseSyncWith(" pr-details, ")
-	if err != nil || !with["pr-details"] {
+	with, err := parseSyncWith(" pr-details, pr-metadata, ")
+	if err != nil || !with["pr-details"] || !with["pr-metadata"] {
 		t.Fatalf("parse sync with = %#v, %v", with, err)
 	}
 	if _, err := parseSyncWith("reviews"); err == nil {
@@ -1002,7 +2796,7 @@ func TestDefaultPortableStoreDir(t *testing.T) {
 
 func TestDatabaseSourceLocationLocal(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "gitcrawl.db")
-	if got := databaseSourceKind(dbPath); got != "local" {
+	if got := databaseSourceKind(context.Background(), dbPath); got != "local" {
 		t.Fatalf("source kind = %q, want local", got)
 	}
 	if got := databaseSourceLocation(context.Background(), dbPath); got != "gitcrawl.db" {
@@ -1025,7 +2819,7 @@ func TestDatabaseSourceLocationRemoteGitHubStore(t *testing.T) {
 		t.Fatalf("git remote add: %v", err)
 	}
 
-	if got := databaseSourceKind(dbPath); got != "remote" {
+	if got := databaseSourceKind(ctx, dbPath); got != "remote" {
 		t.Fatalf("source kind = %q, want remote", got)
 	}
 	want := "openclaw/gitcrawl-store:openclaw__openclaw.sync.db"
@@ -1285,7 +3079,7 @@ func TestSameGitRemoteIgnoresHTTPSCredentials(t *testing.T) {
 func TestGitRemoteForMessageRedactsURLCredentials(t *testing.T) {
 	got := gitRemoteForMessage("https://user:secret@example.com/org/store.git")
 	if strings.Contains(got, "user") || strings.Contains(got, "secret") {
-		t.Fatalf("remote message leaked credentials: %q", got)
+		t.Fatal("remote message leaked credentials")
 	}
 	if got != "https://example.com/org/store.git" {
 		t.Fatalf("remote message = %q, want sanitized URL", got)
@@ -1295,8 +3089,10 @@ func TestGitRemoteForMessageRedactsURLCredentials(t *testing.T) {
 func TestInitWithPortableStoreCloneAndPull(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
+	t.Chdir(dir)
 	remoteDir := filepath.Join(dir, "remote")
-	checkoutDir := filepath.Join(dir, "checkout")
+	checkoutDir := "checkout"
+	wantCheckoutDir := filepath.Join(dir, checkoutDir)
 	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
 	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
 		t.Fatalf("mkdir remote data: %v", err)
@@ -1321,6 +3117,13 @@ func TestInitWithPortableStoreCloneAndPull(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "Portable store") || !strings.Contains(stdout.String(), "cloned") {
 		t.Fatalf("portable init output = %q", stdout.String())
+	}
+	loaded, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load portable config: %v", err)
+	}
+	if loaded.DBPath != filepath.Join(wantCheckoutDir, dbRel) {
+		t.Fatalf("portable db path = %q, want %q", loaded.DBPath, filepath.Join(wantCheckoutDir, dbRel))
 	}
 	action, err := syncPortableStore(ctx, remoteDir, checkoutDir)
 	if err != nil {
@@ -1399,7 +3202,7 @@ func TestReadCommandRefreshesPortableStore(t *testing.T) {
 	if !gitWorktreeClean(ctx, checkoutDir) {
 		t.Fatal("portable checkout should stay clean after read-only command")
 	}
-	mirrorPath, err := run.portableRuntimeDBPath(filepath.Join(checkoutDir, dbRel))
+	mirrorPath, err := run.portableRuntimeDBPath(ctx, filepath.Join(checkoutDir, dbRel))
 	if err != nil {
 		t.Fatalf("runtime db path: %v", err)
 	}
@@ -1420,6 +3223,80 @@ func TestReadCommandRefreshesPortableStore(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), "too soon issue") {
 		t.Fatalf("read command should not refresh portable store again within ttl, got %q", stdout.String())
+	}
+}
+
+func TestRefreshPortableStoreRecoversFromStaleIndexLock(t *testing.T) {
+	if _, err := exec.LookPath("lsof"); err != nil {
+		t.Skip("lsof is required for verified stale-lock recovery")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	seedPortableThread(t, filepath.Join(remoteDir, dbRel), 1, "portable issue")
+	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("clone portable store: %v", err)
+	}
+
+	lockPath := filepath.Join(checkoutDir, ".git", "index.lock")
+	if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
+		t.Fatalf("write index lock: %v", err)
+	}
+	oldLock := time.Now().Add(-staleGitIndexLockAge - time.Second)
+	if err := os.Chtimes(lockPath, oldLock, oldLock); err != nil {
+		t.Fatalf("age index lock: %v", err)
+	}
+	if err := refreshPortableStoreForDB(ctx, filepath.Join(checkoutDir, dbRel)); err != nil {
+		t.Fatalf("refresh portable store: %v", err)
+	}
+	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale index lock should be removed, err=%v", err)
+	}
+}
+
+func TestRefreshPortableStoreStillDirtyWithoutStaleLock(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	seedPortableThread(t, filepath.Join(remoteDir, dbRel), 1, "portable issue")
+	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("clone portable store: %v", err)
+	}
+
+	checkoutDB := filepath.Join(checkoutDir, dbRel)
+	if err := os.WriteFile(checkoutDB, []byte("dirty portable db"), 0o644); err != nil {
+		t.Fatalf("modify checkout db: %v", err)
+	}
+	if err := refreshPortableStoreForDB(ctx, checkoutDB); !errors.Is(err, errPortableStoreDirty) {
+		t.Fatalf("refresh dirty portable store err=%v, want %v", err, errPortableStoreDirty)
 	}
 }
 
@@ -1510,7 +3387,7 @@ func TestReadCommandRepairsMalformedDirtyPortableStore(t *testing.T) {
 	}
 	run := New()
 	run.configPath = configPath
-	mirrorPath, err := run.portableRuntimeDBPath(checkoutDB)
+	mirrorPath, err := run.portableRuntimeDBPath(ctx, checkoutDB)
 	if err != nil {
 		t.Fatalf("runtime db path: %v", err)
 	}
@@ -1538,6 +3415,238 @@ func TestReadCommandRepairsMalformedDirtyPortableStore(t *testing.T) {
 	}
 	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
 		t.Fatalf("runtime mirror should be healthy after repair: %v", err)
+	}
+}
+
+type portableRepairFailureFixture struct {
+	dir         string
+	checkoutDir string
+	checkoutDB  string
+	dbRel       string
+	configPath  string
+}
+
+func newPortableRepairFailureFixture(t *testing.T) portableRepairFailureFixture {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	seedPortableThread(t, filepath.Join(remoteDir, dbRel), 1, "portable repair fallback")
+	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("clone portable store: %v", err)
+	}
+	return portableRepairFailureFixture{
+		dir:         dir,
+		checkoutDir: checkoutDir,
+		checkoutDB:  filepath.Join(checkoutDir, dbRel),
+		dbRel:       dbRel,
+		configPath:  filepath.Join(dir, "config.toml"),
+	}
+}
+
+func corruptPortableCheckoutIndex(t *testing.T, checkoutDir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(checkoutDir, ".git", "index"), []byte{0x01, 0x02, 0x03, 0x04}, 0o644); err != nil {
+		t.Fatalf("corrupt checkout index: %v", err)
+	}
+	if err := runGit(context.Background(), "", "-C", checkoutDir, "reset", "--hard", "HEAD"); err == nil {
+		t.Fatal("git reset --hard HEAD unexpectedly accepted the corrupt index")
+	}
+}
+
+func countPortableCheckoutMalformedBackups(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, "backups"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0
+		}
+		t.Fatalf("read portable backups: %v", err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "checkout-malformed-") {
+			count++
+		}
+	}
+	return count
+}
+
+func TestPortableRuntimeReclonesWhenRepairFails(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPortableRepairFailureFixture(t)
+	mirrorPath := filepath.Join(fixture.dir, "runtime", fixture.dbRel)
+	statePath := portableStoreRefreshStatePath(mirrorPath)
+	if err := os.WriteFile(fixture.checkoutDB, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatalf("corrupt checkout db: %v", err)
+	}
+	corruptPortableCheckoutIndex(t, fixture.checkoutDir)
+
+	repair, repairErr := repairMalformedPortableStoreForDB(ctx, fixture.checkoutDB, fixture.configPath)
+	if repairErr == nil {
+		t.Fatal("repair unexpectedly succeeded with a corrupt Git index")
+	}
+	recordPortableRepairState(statePath, repair, repairErr)
+	if state := readPortableStoreRefreshState(statePath); state.LastRepairError != repairErr.Error() {
+		t.Fatalf("recorded repair error = %q, want %q", state.LastRepairError, repairErr.Error())
+	}
+
+	changed, err := refreshPortableRuntimeDB(ctx, fixture.checkoutDB, mirrorPath, false, fixture.configPath)
+	if err != nil {
+		t.Fatalf("refresh portable runtime db: %v", err)
+	}
+	if !changed {
+		t.Fatal("successful reclone should refresh the runtime mirror")
+	}
+	if err := sqliteStoreHealth(ctx, fixture.checkoutDB); err != nil {
+		t.Fatalf("recloned checkout db should be healthy: %v", err)
+	}
+	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
+		t.Fatalf("runtime mirror should be healthy: %v", err)
+	}
+	if err := runGit(ctx, "", "-C", fixture.checkoutDir, "status", "--short"); err != nil {
+		t.Fatalf("recloned checkout git status: %v", err)
+	}
+	if got := countPortableCheckoutMalformedBackups(t, fixture.dir); got != 1 {
+		t.Fatalf("recloned checkout backups = %d, want 1", got)
+	}
+	state := readPortableStoreRefreshState(statePath)
+	if state.LastRecloneAttempt == "" {
+		t.Fatal("last_reclone_attempt should be recorded")
+	}
+	if state.LastRepair != "recloned" {
+		t.Fatalf("last_repair = %q, want recloned", state.LastRepair)
+	}
+}
+
+func TestPortableRuntimeRecloneEscalationBacksOff(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPortableRepairFailureFixture(t)
+	mirrorPath := filepath.Join(fixture.dir, "runtime", fixture.dbRel)
+	if err := copyFileAtomic(fixture.checkoutDB, mirrorPath); err != nil {
+		t.Fatalf("seed healthy mirror: %v", err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(mirrorPath, past, past); err != nil {
+		t.Fatalf("age healthy mirror: %v", err)
+	}
+	if err := os.WriteFile(fixture.checkoutDB, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatalf("corrupt checkout db: %v", err)
+	}
+	corruptPortableCheckoutIndex(t, fixture.checkoutDir)
+
+	statePath := portableStoreRefreshStatePath(mirrorPath)
+	recloneAttempt := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := writePortableStoreRefreshState(statePath, portableStoreRefreshState{LastRecloneAttempt: recloneAttempt}); err != nil {
+		t.Fatalf("write reclone backoff state: %v", err)
+	}
+	backupsBefore := countPortableCheckoutMalformedBackups(t, fixture.dir)
+	changed, err := refreshPortableRuntimeDB(ctx, fixture.checkoutDB, mirrorPath, false, fixture.configPath)
+	if err != nil {
+		t.Fatalf("healthy mirror fallback: %v", err)
+	}
+	if changed {
+		t.Fatal("backed-off reclone should keep serving the existing mirror")
+	}
+	if got := countPortableCheckoutMalformedBackups(t, fixture.dir); got != backupsBefore {
+		t.Fatalf("backed-off reclone created checkout backup: %d -> %d", backupsBefore, got)
+	}
+	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
+		t.Fatalf("healthy mirror should remain usable: %v", err)
+	}
+	if err := sqliteStoreHealth(ctx, fixture.checkoutDB); err == nil {
+		t.Fatal("broken checkout database unexpectedly became healthy")
+	}
+	if err := runGit(ctx, "", "-C", fixture.checkoutDir, "status", "--short"); err == nil {
+		t.Fatal("broken checkout Git index unexpectedly became usable")
+	}
+	state := readPortableStoreRefreshState(statePath)
+	if state.LastRecloneAttempt != recloneAttempt {
+		t.Fatalf("last_reclone_attempt = %q, want unchanged %q", state.LastRecloneAttempt, recloneAttempt)
+	}
+	if state.LastRepairError == "" {
+		t.Fatal("failed repair should record last_repair_error")
+	}
+}
+
+func TestPortableRuntimeFailedRecloneStillEstablishesBackoff(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPortableRepairFailureFixture(t)
+	mirrorPath := filepath.Join(fixture.dir, "runtime", fixture.dbRel)
+	if err := copyFileAtomic(fixture.checkoutDB, mirrorPath); err != nil {
+		t.Fatalf("seed healthy mirror: %v", err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(mirrorPath, past, past); err != nil {
+		t.Fatalf("age healthy mirror: %v", err)
+	}
+	if err := os.WriteFile(fixture.checkoutDB, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatalf("corrupt checkout db: %v", err)
+	}
+	// Break repair (corrupt index) AND reclone (unreachable remote) so the
+	// escalation itself fails; the attempt must still stamp the backoff.
+	if err := runGit(ctx, "", "-C", fixture.checkoutDir, "remote", "set-url", "origin", filepath.Join(fixture.dir, "no-such-remote")); err != nil {
+		t.Fatalf("break remote url: %v", err)
+	}
+	corruptPortableCheckoutIndex(t, fixture.checkoutDir)
+
+	statePath := portableStoreRefreshStatePath(mirrorPath)
+	if changed, err := refreshPortableRuntimeDB(ctx, fixture.checkoutDB, mirrorPath, false, fixture.configPath); err != nil || changed {
+		t.Fatalf("failed reclone should fall back to the healthy mirror, changed=%v err=%v", changed, err)
+	}
+	state := readPortableStoreRefreshState(statePath)
+	if state.LastRecloneAttempt == "" {
+		t.Fatal("failed reclone must still record last_reclone_attempt")
+	}
+	firstAttempt := state.LastRecloneAttempt
+
+	if changed, err := refreshPortableRuntimeDB(ctx, fixture.checkoutDB, mirrorPath, false, fixture.configPath); err != nil || changed {
+		t.Fatalf("backed-off retry should keep serving the mirror, changed=%v err=%v", changed, err)
+	}
+	state = readPortableStoreRefreshState(statePath)
+	if state.LastRecloneAttempt != firstAttempt {
+		t.Fatalf("backed-off retry must not re-attempt reclone: %q -> %q", firstAttempt, state.LastRecloneAttempt)
+	}
+}
+
+func TestRecoverMissingPortableSourceReclonesWhenRepairFails(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPortableRepairFailureFixture(t)
+	if err := os.Remove(fixture.checkoutDB); err != nil {
+		t.Fatalf("remove checkout db: %v", err)
+	}
+	corruptPortableCheckoutIndex(t, fixture.checkoutDir)
+
+	statePath := filepath.Join(fixture.dir, "runtime", ".portable-refresh.json")
+	if err := recoverMissingPortableSource(ctx, fixture.checkoutDB, fixture.configPath, statePath); err != nil {
+		t.Fatalf("recover missing portable source: %v", err)
+	}
+	if err := sqliteStoreHealth(ctx, fixture.checkoutDB); err != nil {
+		t.Fatalf("recloned checkout db should be healthy: %v", err)
+	}
+	if err := runGit(ctx, "", "-C", fixture.checkoutDir, "status", "--short"); err != nil {
+		t.Fatalf("recloned checkout git status: %v", err)
+	}
+	state := readPortableStoreRefreshState(statePath)
+	if state.LastRecloneAttempt == "" {
+		t.Fatal("last_reclone_attempt should be recorded")
+	}
+	if state.LastRepair != "recloned" {
+		t.Fatalf("last_repair = %q, want recloned", state.LastRepair)
 	}
 }
 
@@ -1636,7 +3745,7 @@ func TestPortableRuntimePropagatesNonCorruptionSourceErrors(t *testing.T) {
 	checkoutDB := filepath.Join(checkoutDir, dbRel)
 	run := New()
 	run.configPath = filepath.Join(dir, "config.toml")
-	mirrorPath, err := run.portableRuntimeDBPath(checkoutDB)
+	mirrorPath, err := run.portableRuntimeDBPath(ctx, checkoutDB)
 	if err != nil {
 		t.Fatalf("runtime db path: %v", err)
 	}
@@ -1664,6 +3773,113 @@ func TestPortableRuntimePropagatesNonCorruptionSourceErrors(t *testing.T) {
 	}
 	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
 		t.Fatalf("healthy mirror should remain usable: %v", err)
+	}
+}
+
+func TestPortableRuntimeRepairsMissingSourceDB(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	seedPortableThread(t, filepath.Join(remoteDir, dbRel), 1, "portable issue")
+	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("clone portable store: %v", err)
+	}
+
+	checkoutDB := filepath.Join(checkoutDir, dbRel)
+	mirrorPath := filepath.Join(dir, "runtime", dbRel)
+	if err := os.Remove(checkoutDB); err != nil {
+		t.Fatalf("remove checkout db: %v", err)
+	}
+	changed, err := refreshPortableRuntimeDB(ctx, checkoutDB, mirrorPath, false, filepath.Join(dir, "config.toml"))
+	if err != nil {
+		t.Fatalf("refresh portable runtime db: %v", err)
+	}
+	if !changed {
+		t.Fatal("missing source repair should refresh the runtime mirror")
+	}
+	if err := sqliteStoreHealth(ctx, checkoutDB); err != nil {
+		t.Fatalf("checkout db should be restored and healthy: %v", err)
+	}
+	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
+		t.Fatalf("runtime mirror should be created and healthy: %v", err)
+	}
+}
+
+func TestPortableRuntimeServesHealthyMirrorWhenSourceUnrecoverable(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	// The remote never contained the database, so repair and reclone both
+	// complete without restoring it; a healthy mirror must keep serving.
+	if err := os.MkdirAll(filepath.Join(remoteDir, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(remoteDir, "data", ".gitkeep"), nil, 0o644); err != nil {
+		t.Fatalf("write gitkeep: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "add", "."); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "empty store"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("clone portable store: %v", err)
+	}
+
+	checkoutDB := filepath.Join(checkoutDir, dbRel)
+	mirrorPath := filepath.Join(dir, "runtime", dbRel)
+	seedPortableThread(t, mirrorPath, 1, "healthy mirror content")
+
+	changed, err := refreshPortableRuntimeDB(ctx, checkoutDB, mirrorPath, false, filepath.Join(dir, "config.toml"))
+	if err != nil {
+		t.Fatalf("healthy mirror should keep serving when the source is unrecoverable: %v", err)
+	}
+	if changed {
+		t.Fatal("unrecoverable source must not report a refreshed mirror")
+	}
+	if err := sqliteStoreHealth(ctx, mirrorPath); err != nil {
+		t.Fatalf("mirror should remain healthy: %v", err)
+	}
+
+	countBackups := func() int {
+		entries, err := os.ReadDir(filepath.Join(dir, "backups"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				return 0
+			}
+			t.Fatalf("read backups dir: %v", err)
+		}
+		return len(entries)
+	}
+	backupsAfterFirst := countBackups()
+	if backupsAfterFirst == 0 {
+		t.Fatal("first recovery attempt should have run repair/reclone")
+	}
+	if changed, err := refreshPortableRuntimeDB(ctx, checkoutDB, mirrorPath, false, filepath.Join(dir, "config.toml")); err != nil || changed {
+		t.Fatalf("backed-off retry should serve the mirror quietly, changed=%v err=%v", changed, err)
+	}
+	if got := countBackups(); got != backupsAfterFirst {
+		t.Fatalf("recovery must back off instead of repeating per read: backups %d -> %d", backupsAfterFirst, got)
 	}
 }
 
@@ -1705,7 +3921,7 @@ func TestPortableRuntimeRejectsManifestMismatchBeforeReplacingMirror(t *testing.
 	if err := os.WriteFile(portableDBManifestPath(checkoutDB), data, 0o644); err != nil {
 		t.Fatalf("write bad manifest: %v", err)
 	}
-	if err := copySQLiteFileAtomicVerified(ctx, checkoutDB, mirrorPath); err == nil || !strings.Contains(err.Error(), "portable manifest mismatch") {
+	if _, err := copySQLiteFileAtomicVerified(ctx, checkoutDB, mirrorPath); err == nil || !strings.Contains(err.Error(), "portable manifest mismatch") {
 		t.Fatalf("manifest mismatch should fail without copy, err=%v", err)
 	}
 	after, err := fileSHA256(mirrorPath)
@@ -1718,7 +3934,7 @@ func TestPortableRuntimeRejectsManifestMismatchBeforeReplacingMirror(t *testing.
 	if err := os.WriteFile(portableDBManifestPath(checkoutDB), []byte("{}\n"), 0o644); err != nil {
 		t.Fatalf("write incomplete manifest: %v", err)
 	}
-	if err := copySQLiteFileAtomicVerified(ctx, checkoutDB, mirrorPath); err == nil || !strings.Contains(err.Error(), "schema missing") {
+	if _, err := copySQLiteFileAtomicVerified(ctx, checkoutDB, mirrorPath); err == nil || !strings.Contains(err.Error(), "schema missing") {
 		t.Fatalf("incomplete manifest should fail without copy, err=%v", err)
 	}
 	info, err := os.Stat(checkoutDB)
@@ -1781,6 +3997,53 @@ func TestPortableRuntimeRejectsManifestMismatchBeforeReplacingMirror(t *testing.
 	}
 }
 
+func TestSyncCreatesLocalDatabaseBelowUnrelatedGitMetadata(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dataRoot := filepath.Join(dir, "data-root")
+	if err := os.MkdirAll(filepath.Join(dataRoot, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir unrelated git metadata: %v", err)
+	}
+
+	dbPath := filepath.Join(dataRoot, "gitcrawl", "gitcrawl.db")
+	configPath := filepath.Join(dir, "config.toml")
+	app := New()
+	if err := app.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/openclaw/openclaw":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 12345, "full_name": "openclaw/openclaw"})
+		case "/repos/openclaw/openclaw/issues/101":
+			_ = json.NewEncoder(w).Encode(githubIssueJSON(101, "issue", "Git metadata regression"))
+		default:
+			t.Fatalf("unexpected GitHub path: %s", r.URL.String())
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "test-gh-token")
+	t.Setenv("GITCRAWL_GITHUB_BASE_URL", server.URL)
+
+	if err := New().Run(ctx, []string{"--config", configPath, "sync", "openclaw/openclaw", "--numbers", "101", "--json"}); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	st, err := store.OpenReadOnly(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open local database: %v", err)
+	}
+	defer st.Close()
+	status, err := st.Status(ctx)
+	if err != nil {
+		t.Fatalf("local database status: %v", err)
+	}
+	if status.ThreadCount != 1 {
+		t.Fatalf("local database thread count = %d, want 1", status.ThreadCount)
+	}
+}
+
 func TestWritableRuntimeUsesPortableMirror(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -1794,8 +4057,12 @@ func TestWritableRuntimeUsesPortableMirror(t *testing.T) {
 		t.Fatalf("git init: %v", err)
 	}
 	seedPortableThread(t, filepath.Join(remoteDir, dbRel), 1, "portable issue")
+	prunePortableTestStore(t, filepath.Join(remoteDir, dbRel))
 	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
 		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "add", portableDBManifestPath(filepath.Join(remoteDir, dbRel))); err != nil {
+		t.Fatalf("git add seed manifest: %v", err)
 	}
 	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
 		t.Fatalf("git commit seed: %v", err)
@@ -1849,6 +4116,42 @@ func TestWritableRuntimeUsesPortableMirror(t *testing.T) {
 	if !gitWorktreeClean(ctx, checkoutDir) {
 		t.Fatal("portable checkout should stay clean after writable runtime command")
 	}
+	statePath := portableStoreRefreshStatePath(rt.Config.DBPath)
+	legacyState := readPortableStoreRefreshState(statePath)
+	if legacyState.MirrorHealthSourceSHA256 == "" {
+		t.Fatal("portable refresh state should start with a source hash")
+	}
+	legacyState.MirrorHealthSourceSHA256 = ""
+	if err := writePortableStoreRefreshState(statePath, legacyState); err != nil {
+		t.Fatalf("write legacy portable refresh state: %v", err)
+	}
+
+	legacyRead := New()
+	legacyRead.configPath = configPath
+	legacyRT, err := legacyRead.openLocalRuntimeReadOnly(ctx)
+	if err != nil {
+		t.Fatalf("open runtime with legacy refresh state: %v", err)
+	}
+	if _, _, err := legacyRT.Store.ThreadVectorByNumber(ctx, store.ThreadVectorQuery{
+		RepoID:     repo.ID,
+		Model:      "text-embedding-3-small",
+		Basis:      "title_original",
+		Dimensions: 3,
+	}, 1); err != nil {
+		t.Fatalf("read runtime vector after legacy state migration: %v", err)
+	}
+	if err := legacyRT.Store.Close(); err != nil {
+		t.Fatalf("close runtime after legacy state migration: %v", err)
+	}
+	if got := readPortableStoreRefreshState(statePath).MirrorHealthSourceSHA256; got == "" {
+		t.Fatal("legacy portable refresh state source hash was not migrated")
+	}
+
+	manifestPath := portableDBManifestPath(filepath.Join(checkoutDir, dbRel))
+	manifestTime := time.Now().Add(time.Hour)
+	if err := os.Chtimes(manifestPath, manifestTime, manifestTime); err != nil {
+		t.Fatalf("rewrite portable manifest metadata: %v", err)
+	}
 
 	read := New()
 	read.configPath = configPath
@@ -1856,7 +4159,6 @@ func TestWritableRuntimeUsesPortableMirror(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open read-only runtime: %v", err)
 	}
-	defer readRT.Store.Close()
 	if _, _, err := readRT.Store.ThreadVectorByNumber(ctx, store.ThreadVectorQuery{
 		RepoID:     repo.ID,
 		Model:      "text-embedding-3-small",
@@ -1864,6 +4166,111 @@ func TestWritableRuntimeUsesPortableMirror(t *testing.T) {
 		Dimensions: 3,
 	}, 1); err != nil {
 		t.Fatalf("read runtime vector: %v", err)
+	}
+	if err := readRT.Store.Close(); err != nil {
+		t.Fatalf("close read-only runtime: %v", err)
+	}
+
+	doctorPayload := runDoctorJSON(t, ctx, configPath)
+	if got := doctorMap(t, doctorPayload, "db_schema")["state"]; got != "current" {
+		t.Fatalf("db_schema.state = %#v, payload=%#v", got, doctorPayload)
+	}
+	if got := doctorMap(t, doctorPayload, "runtime_db_health")["health"]; got != "ok" {
+		t.Fatalf("runtime_db_health.health = %#v, payload=%#v", got, doctorPayload)
+	}
+	sourceSchema := doctorMap(t, doctorPayload, "source_db_schema")
+	if got := sourceSchema["state"]; got != "current" {
+		t.Fatalf("source_db_schema.state = %#v, payload=%#v", got, doctorPayload)
+	}
+	if got := sourceSchema["portable"]; got != true {
+		t.Fatalf("source_db_schema.portable = %#v, payload=%#v", got, doctorPayload)
+	}
+}
+
+func TestDoctorLeavesCanonicalPortableStoreClean(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	remoteDB := filepath.Join(remoteDir, dbRel)
+	if err := os.MkdirAll(filepath.Dir(remoteDB), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	seedPortableThread(t, remoteDB, 1, "portable issue")
+	prunePortableTestStore(t, remoteDB)
+	if err := runGit(ctx, remoteDir, "add", dbRel, portableDBManifestPath(remoteDB)); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+	if _, err := syncPortableStore(ctx, remoteDir, checkoutDir); err != nil {
+		t.Fatalf("clone portable store: %v", err)
+	}
+
+	checkoutDB := filepath.Join(checkoutDir, dbRel)
+	configPath := filepath.Join(dir, "config.toml")
+	if err := New().Run(ctx, []string{"--config", configPath, "init", "--db", checkoutDB}); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+	if !gitWorktreeClean(ctx, checkoutDir) {
+		t.Fatal("portable checkout should start clean")
+	}
+
+	payload := runDoctorJSON(t, ctx, configPath)
+	if got := doctorMap(t, payload, "source_db_schema")["state"]; got != "current" {
+		t.Fatalf("source_db_schema.state = %#v, payload=%#v", got, payload)
+	}
+	if !gitWorktreeClean(ctx, checkoutDir) {
+		t.Fatal("doctor should leave the portable checkout clean")
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(checkoutDB + suffix); !os.IsNotExist(err) {
+			t.Fatalf("doctor left portable SQLite sidecar %s: %v", suffix, err)
+		}
+	}
+}
+
+func TestDoctorPortableProbeFailureDoesNotCreateSidecars(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "data", "gitcrawl.db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Remove(dbPath + suffix); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("remove setup sidecar %s: %v", suffix, err)
+		}
+	}
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatalf("mkdir malformed git metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("write malformed git head: %v", err)
+	}
+	configPath := writeDoctorTestConfig(t, dir, dbPath)
+
+	err = New().Run(ctx, []string{"--config", configPath, "doctor", "--json"})
+	if err == nil || !strings.Contains(err.Error(), "verify portable store candidate") {
+		t.Fatalf("doctor error = %v, want portable probe failure", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(dbPath + suffix); !os.IsNotExist(err) {
+			t.Fatalf("doctor probe failure left SQLite sidecar %s: %v", suffix, err)
+		}
 	}
 }
 
@@ -1918,6 +4325,316 @@ func TestDoctorRefreshesPortableStore(t *testing.T) {
 	}
 }
 
+func TestDoctorJSONReportsCurrentSchemaDiagnosticsWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	configPath := writeDoctorTestConfig(t, dir, dbPath)
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db before: %v", err)
+	}
+
+	payload := runDoctorJSON(t, ctx, configPath)
+	schema := doctorMap(t, payload, "db_schema")
+	if got := schema["state"]; got != "current" {
+		t.Fatalf("db_schema.state = %#v, payload=%#v", got, schema)
+	}
+	if got := schema["current_version"]; got != float64(16) {
+		t.Fatalf("db_schema.current_version = %#v, payload=%#v", got, schema)
+	}
+	if got := schema["supported_version"]; got != float64(16) {
+		t.Fatalf("db_schema.supported_version = %#v, payload=%#v", got, schema)
+	}
+	if got := schema["child_observation_reservations"]; got != true {
+		t.Fatalf("db_schema.child_observation_reservations = %#v, payload=%#v", got, schema)
+	}
+	prDetails := doctorMap(t, schema, "pr_details")
+	if got := prDetails["duplicate_path_files_supported"]; got != true {
+		t.Fatalf("pr_details.duplicate_path_files_supported = %#v, payload=%#v", got, prDetails)
+	}
+	runtime := doctorMap(t, payload, "runtime")
+	if runtime["version"] != version || strings.TrimSpace(fmt.Sprint(runtime["executable_path"])) == "" {
+		t.Fatalf("runtime identity = %#v", runtime)
+	}
+	if strings.TrimSpace(fmt.Sprint(payload["executable_path"])) == "" {
+		t.Fatalf("top-level executable_path missing: %#v", payload)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db after: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("doctor schema diagnostics mutated current database bytes")
+	}
+}
+
+func TestDoctorJSONReportsMissingSchemaWithoutCreatingDB(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "missing", "gitcrawl.db")
+	configPath := writeDoctorTestConfig(t, dir, dbPath)
+
+	payload := runDoctorJSON(t, ctx, configPath)
+	schema := doctorMap(t, payload, "db_schema")
+	if got := schema["state"]; got != "missing" {
+		t.Fatalf("db_schema.state = %#v, payload=%#v", got, schema)
+	}
+	if got := schema["exists"]; got != false {
+		t.Fatalf("db_schema.exists = %#v, payload=%#v", got, schema)
+	}
+	if len(doctorStringList(t, schema, "next_steps")) == 0 {
+		t.Fatalf("db_schema.next_steps empty: %#v", schema)
+	}
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Fatalf("doctor created missing db: %v", err)
+	}
+}
+
+func TestDoctorJSONReportsNewerSchemaWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `pragma user_version = 99`); err != nil {
+		_ = st.Close()
+		t.Fatalf("set newer schema: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	configPath := writeDoctorTestConfig(t, dir, dbPath)
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db before: %v", err)
+	}
+
+	doctor := New()
+	var stdout bytes.Buffer
+	doctor.Stdout = &stdout
+	err = doctor.Run(ctx, []string{"--config", configPath, "doctor", "--json"})
+	if err == nil {
+		t.Fatalf("newer schema doctor unexpectedly succeeded: %s", stdout.String())
+	}
+	var payload map[string]any
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &payload); jsonErr != nil {
+		t.Fatalf("parse doctor json: %v\n%s", jsonErr, stdout.String())
+	}
+	schema := doctorMap(t, payload, "db_schema")
+	if got := schema["state"]; got != "newer" {
+		t.Fatalf("db_schema.state = %#v, payload=%#v", got, schema)
+	}
+	if got := schema["newer"]; got != true {
+		t.Fatalf("db_schema.newer = %#v, payload=%#v", got, schema)
+	}
+	if got := schema["current_version"]; got != float64(99) {
+		t.Fatalf("db_schema.current_version = %#v, payload=%#v", got, schema)
+	}
+	if strings.TrimSpace(fmt.Sprint(payload["runtime_open_error"])) == "" {
+		t.Fatalf("runtime_open_error missing: %#v", payload)
+	}
+	if len(doctorStringList(t, schema, "next_steps")) == 0 {
+		t.Fatalf("db_schema.next_steps empty: %#v", schema)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db after: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("doctor schema diagnostics mutated newer database bytes")
+	}
+	if got := doctorUserVersion(t, ctx, dbPath); got != 99 {
+		t.Fatalf("user_version = %d, want 99", got)
+	}
+}
+
+func TestDoctorJSONReportsRuntimeEnvSchemaFailureWithoutConfig(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `pragma user_version = 99`); err != nil {
+		_ = st.Close()
+		t.Fatalf("set newer schema: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	t.Setenv("GITCRAWL_DB_PATH", dbPath)
+
+	doctor := New()
+	var stdout bytes.Buffer
+	doctor.Stdout = &stdout
+	err = doctor.Run(ctx, []string{"--config", filepath.Join(dir, "missing.toml"), "doctor", "--json"})
+	if err == nil {
+		t.Fatalf("newer runtime-env schema unexpectedly succeeded: %s", stdout.String())
+	}
+	var payload map[string]any
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &payload); jsonErr != nil {
+		t.Fatalf("parse doctor json: %v\n%s", jsonErr, stdout.String())
+	}
+	if strings.TrimSpace(fmt.Sprint(payload["runtime_open_error"])) == "" {
+		t.Fatalf("runtime_open_error missing: %#v", payload)
+	}
+	schema := doctorMap(t, payload, "db_schema")
+	if got := schema["state"]; got != "newer" {
+		t.Fatalf("db_schema.state = %#v, payload=%#v", got, schema)
+	}
+}
+
+func TestDoctorJSONReportsStatusFailureWithSchemaDrift(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open seed db: %v", err)
+	}
+	_, err = db.ExecContext(ctx, `
+		create table repositories (id integer primary key);
+		create table threads (id integer primary key, state text);
+		pragma user_version = 4;
+	`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("seed schema drift: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close seed db: %v", err)
+	}
+	configPath := writeDoctorTestConfig(t, dir, dbPath)
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db before: %v", err)
+	}
+
+	doctor := New()
+	var stdout bytes.Buffer
+	doctor.Stdout = &stdout
+	err = doctor.Run(ctx, []string{"--config", configPath, "doctor", "--json"})
+	if err == nil {
+		t.Fatalf("schema-drift status unexpectedly succeeded: %s", stdout.String())
+	}
+	var payload map[string]any
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &payload); jsonErr != nil {
+		t.Fatalf("parse doctor json: %v\n%s", jsonErr, stdout.String())
+	}
+	if strings.TrimSpace(fmt.Sprint(payload["runtime_status_error"])) == "" {
+		t.Fatalf("runtime_status_error missing: %#v", payload)
+	}
+	schema := doctorMap(t, payload, "db_schema")
+	if got := schema["state"]; got != "pending_migration" {
+		t.Fatalf("db_schema.state = %#v, payload=%#v", got, schema)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db after: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("doctor mutated schema-drift database")
+	}
+}
+
+func TestDoctorJSONRuntimeOpenErrorReturnsFailureWithPayload(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	if err := os.WriteFile(dbPath, []byte("not a sqlite database"), 0o644); err != nil {
+		t.Fatalf("write corrupt db: %v", err)
+	}
+	configPath := writeDoctorTestConfig(t, dir, dbPath)
+
+	doctor := New()
+	var stdout bytes.Buffer
+	doctor.Stdout = &stdout
+	err := doctor.Run(ctx, []string{"--config", configPath, "doctor", "--json"})
+	if err == nil {
+		t.Fatalf("doctor unexpectedly succeeded: %s", stdout.String())
+	}
+
+	var payload map[string]any
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &payload); jsonErr != nil {
+		t.Fatalf("parse doctor json: %v\n%s", jsonErr, stdout.String())
+	}
+	if strings.TrimSpace(fmt.Sprint(payload["runtime_open_error"])) == "" {
+		t.Fatalf("runtime_open_error missing: %#v", payload)
+	}
+	schema := doctorMap(t, payload, "db_schema")
+	if got := schema["state"]; got != "error" {
+		t.Fatalf("db_schema.state = %#v, payload=%#v", got, schema)
+	}
+}
+
+func TestDoctorJSONReportsLegacyPendingSchemaWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	seedDoctorLegacyPullRequestFilesSchema(t, ctx, dbPath)
+	configPath := writeDoctorTestConfig(t, dir, dbPath)
+	before, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db before: %v", err)
+	}
+
+	payload := runDoctorJSON(t, ctx, configPath)
+	schema := doctorMap(t, payload, "db_schema")
+	if got := schema["state"]; got != "pending_migration" {
+		t.Fatalf("db_schema.state = %#v, payload=%#v", got, schema)
+	}
+	if got := schema["pending_migration"]; got != true {
+		t.Fatalf("db_schema.pending_migration = %#v, payload=%#v", got, schema)
+	}
+	prDetails := doctorMap(t, schema, "pr_details")
+	if got := prDetails["files_position_key"]; got != false {
+		t.Fatalf("pr_details.files_position_key = %#v, payload=%#v", got, prDetails)
+	}
+	if got := prDetails["duplicate_path_files_supported"]; got != false {
+		t.Fatalf("pr_details.duplicate_path_files_supported = %#v, payload=%#v", got, prDetails)
+	}
+	pending := doctorStringList(t, schema, "pending_migrations")
+	if !doctorListContains(pending, "schema_version_3_to_16") ||
+		!doctorListContains(pending, "pull_request_files_position_key") ||
+		!doctorListContains(pending, "thread_child_observation_reservations_table") {
+		t.Fatalf("pending_migrations = %#v", pending)
+	}
+	if len(doctorStringList(t, schema, "next_steps")) == 0 {
+		t.Fatalf("db_schema.next_steps empty: %#v", schema)
+	}
+	after, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatalf("read db after: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("doctor schema diagnostics mutated legacy database bytes")
+	}
+	if got := doctorUserVersion(t, ctx, dbPath); got != 3 {
+		t.Fatalf("user_version = %d, want 3", got)
+	}
+	if doctorPullRequestFilesPositionKey(t, ctx, dbPath) {
+		t.Fatal("doctor migrated pull_request_files primary key")
+	}
+}
+
 func seedPortableThread(t *testing.T, dbPath string, number int, title string) {
 	t.Helper()
 	ctx := context.Background()
@@ -1961,6 +4678,170 @@ func seedPortableThread(t *testing.T, dbPath string, number int, title string) {
 	}
 }
 
+func prunePortableTestStore(t *testing.T, dbPath string) {
+	t.Helper()
+	ctx := context.Background()
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open portable store for prune: %v", err)
+	}
+	stats, err := st.PrunePortablePayloads(ctx, store.PortablePruneOptions{
+		BodyChars: 256,
+		Vacuum:    false,
+	})
+	if closeErr := st.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("prune portable test store: %v", err)
+	}
+	if _, _, err := writePortableDBManifest(stats); err != nil {
+		t.Fatalf("write portable test manifest: %v", err)
+	}
+}
+
+func writeDoctorTestConfig(t *testing.T, dir, dbPath string) string {
+	t.Helper()
+	configPath := filepath.Join(dir, "config.toml")
+	cfg := config.Default()
+	cfg.DBPath = dbPath
+	cfg.CacheDir = filepath.Join(dir, "cache")
+	cfg.VectorDir = filepath.Join(dir, "vectors")
+	cfg.LogDir = filepath.Join(dir, "logs")
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	return configPath
+}
+
+func runDoctorJSON(t *testing.T, ctx context.Context, configPath string) map[string]any {
+	t.Helper()
+	doctor := New()
+	var stdout bytes.Buffer
+	doctor.Stdout = &stdout
+	if err := doctor.Run(ctx, []string{"--config", configPath, "doctor", "--json"}); err != nil {
+		t.Fatalf("doctor: %v\n%s", err, stdout.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("parse doctor json: %v\n%s", err, stdout.String())
+	}
+	return payload
+}
+
+func doctorMap(t *testing.T, payload map[string]any, key string) map[string]any {
+	t.Helper()
+	value, ok := payload[key].(map[string]any)
+	if !ok {
+		t.Fatalf("%s = %#v, want object", key, payload[key])
+	}
+	return value
+}
+
+func doctorStringList(t *testing.T, payload map[string]any, key string) []string {
+	t.Helper()
+	raw, ok := payload[key].([]any)
+	if !ok {
+		t.Fatalf("%s = %#v, want array", key, payload[key])
+	}
+	out := make([]string, 0, len(raw))
+	for _, value := range raw {
+		out = append(out, fmt.Sprint(value))
+	}
+	return out
+}
+
+func doctorListContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func seedDoctorLegacyPullRequestFilesSchema(t *testing.T, ctx context.Context, dbPath string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer db.Close()
+	_, err = db.ExecContext(ctx, `
+		drop index if exists idx_pull_request_files_path;
+		drop index if exists idx_pull_request_files_thread_path;
+		alter table pull_request_files rename to pull_request_files_current;
+		create table pull_request_files (
+			thread_id integer not null references threads(id) on delete cascade,
+			path text not null,
+			status text,
+			additions integer not null default 0,
+			deletions integer not null default 0,
+			changes integer not null default 0,
+			previous_path text,
+			patch text,
+			raw_json text not null,
+			fetched_at text not null,
+			primary key(thread_id, path)
+		);
+		insert into pull_request_files(thread_id, path, status, additions, deletions, changes, previous_path, patch, raw_json, fetched_at)
+			select thread_id, path, status, additions, deletions, changes, previous_path, patch, raw_json, fetched_at
+			from pull_request_files_current;
+		drop table pull_request_files_current;
+		create index if not exists idx_pull_request_files_path on pull_request_files(path);
+		drop table thread_child_observation_reservations;
+		pragma user_version = 3;
+	`)
+	if err != nil {
+		t.Fatalf("seed legacy pull_request_files table: %v", err)
+	}
+}
+
+func doctorUserVersion(t *testing.T, ctx context.Context, dbPath string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRowContext(ctx, `pragma user_version`).Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	return version
+}
+
+func doctorPullRequestFilesPositionKey(t *testing.T, ctx context.Context, dbPath string) bool {
+	t.Helper()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, `pragma table_info(pull_request_files)`)
+	if err != nil {
+		t.Fatalf("read pull_request_files schema: %v", err)
+	}
+	defer rows.Close()
+	pk := map[string]int{}
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatalf("scan pull_request_files schema: %v", err)
+		}
+		if primaryKey > 0 {
+			pk[name] = primaryKey
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate pull_request_files schema: %v", err)
+	}
+	return pk["thread_id"] == 1 && pk["position"] == 2
+}
+
 func TestPortablePruneCommand(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
@@ -1985,6 +4866,416 @@ func TestPortablePruneCommand(t *testing.T) {
 	}
 	if err := validatePortableSQLiteFile(context.Background(), dbPath, dbPath); err != nil {
 		t.Fatalf("portable prune should leave valid db + manifest: %v", err)
+	}
+	if payload["db_target"] != "direct" || payload["db_target_path"] != dbPath || payload["published"] != false {
+		t.Fatalf("direct portable prune target = %#v", payload)
+	}
+}
+
+func TestPortableExportCommandCreatesCurrentStateGenerationFromLiveWAL(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "source.db")
+	if err := New().Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	seedPortableThread(t, dbPath, 7, "live WAL title")
+	writer, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	defer writer.Close()
+	writer.DB().SetMaxOpenConns(1)
+	if _, err := writer.DB().ExecContext(ctx, `pragma wal_autocheckpoint = 0`); err != nil {
+		t.Fatalf("disable WAL autocheckpoint: %v", err)
+	}
+	if _, err := writer.DB().ExecContext(ctx, `update threads set title = 'committed WAL title' where number = 7`); err != nil {
+		t.Fatalf("write live WAL state: %v", err)
+	}
+
+	outputDir := filepath.Join(dir, "artifact.next")
+	app := New()
+	var stdout, stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+	if err := app.Run(ctx, []string{
+		"--config", configPath,
+		"portable", "export",
+		"--profile", "current-state-v1",
+		"--body-chars", "32",
+		"--output-dir", outputDir,
+		"--database-name", "openclaw__openclaw.sync.db",
+		"--public-path", "data/openclaw__openclaw.sync.db",
+		"--repository", "openclaw/openclaw",
+		"--compression", "gzip",
+		"--max-archive-bytes", "99999999",
+		"--json",
+	}); err != nil {
+		t.Fatalf("portable export: %v", err)
+	}
+	var payload struct {
+		Profile        string `json:"profile"`
+		PortableSchema string `json:"portable_schema"`
+		SourceDBPath   string `json:"source_db_path"`
+		OutputDir      string `json:"output_dir"`
+		DatabasePath   string `json:"database_path"`
+		ManifestPath   string `json:"manifest_path"`
+		PublicPath     string `json:"public_path"`
+		Repository     struct {
+			ID       int64  `json:"id"`
+			Owner    string `json:"owner"`
+			Name     string `json:"name"`
+			FullName string `json:"fullName"`
+		} `json:"repository"`
+		BodyChars            int    `json:"body_chars"`
+		BytesAfter           int64  `json:"bytes_after"`
+		Compression          string `json:"compression"`
+		ArchivePath          string `json:"archive_path"`
+		ArchiveBytes         int64  `json:"archive_bytes"`
+		MaxArchiveBytes      int64  `json:"max_archive_bytes"`
+		ArchiveByteBudgetOK  bool   `json:"archive_byte_budget_ok"`
+		ArtifactID           string `json:"artifact_id"`
+		ArtifactIDProfile    string `json:"artifact_id_profile"`
+		SHA256               string `json:"sha256"`
+		QuickCheck           string `json:"quick_check"`
+		IntegrityCheck       string `json:"integrity_check"`
+		ForeignKeyViolations int    `json:"foreign_key_violations"`
+		ArtifactCommitted    bool   `json:"artifact_committed"`
+		ColumnProfile        string `json:"column_profile"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("parse portable export JSON: %v\n%s", err, stdout.String())
+	}
+	if payload.Profile != "current-state-v1" || payload.PortableSchema != "gitcrawl-portable-sync-v2" ||
+		payload.SourceDBPath != dbPath || payload.OutputDir != outputDir || payload.PublicPath != "data/openclaw__openclaw.sync.db" ||
+		payload.Repository.Owner != "openclaw" || payload.Repository.Name != "openclaw" || payload.Repository.FullName != "openclaw/openclaw" ||
+		payload.BodyChars != 32 || payload.Compression != "gzip" || payload.ArchiveBytes <= 0 || payload.MaxArchiveBytes != 99999999 || !payload.ArchiveByteBudgetOK ||
+		payload.BytesAfter <= 0 || payload.ArtifactID == payload.SHA256 ||
+		payload.ArtifactIDProfile != portableexport.CurrentStateSemanticV1 ||
+		payload.QuickCheck != "ok" || payload.IntegrityCheck != "ok" || payload.ForeignKeyViolations != 0 || !payload.ArtifactCommitted ||
+		payload.ColumnProfile != store.PortableColumnProfileSanitizedCompatibility {
+		t.Fatalf("portable export payload = %+v", payload)
+	}
+	if _, err := os.Stat(payload.DatabasePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("compressed export retained raw database: %v", err)
+	}
+	if _, err := os.Stat(payload.ArchivePath); err != nil {
+		t.Fatalf("compressed export archive missing: %v", err)
+	}
+	materializedPath, err := stagePortableSQLiteSourceTemp(payload.DatabasePath, filepath.Join(dir, "materialized.db"), 0o600)
+	if err != nil {
+		t.Fatalf("materialize compressed export through portable reader: %v", err)
+	}
+	defer os.Remove(materializedPath)
+	artifact, err := sql.Open("sqlite", materializedPath)
+	if err != nil {
+		t.Fatalf("open artifact: %v", err)
+	}
+	defer artifact.Close()
+	var title, sourcePath string
+	if err := artifact.QueryRowContext(ctx, `select title from threads where number = 7`).Scan(&title); err != nil {
+		t.Fatalf("read exported thread: %v", err)
+	}
+	if err := artifact.QueryRowContext(ctx, `select value from portable_metadata where key = 'source_path'`).Scan(&sourcePath); err != nil {
+		t.Fatalf("read portable source path: %v", err)
+	}
+	if title != "committed WAL title" || sourcePath != payload.PublicPath || strings.Contains(sourcePath, dir) {
+		t.Fatalf("artifact title/source = %q / %q", title, sourcePath)
+	}
+	if _, err := os.Stat(payload.ManifestPath); err != nil {
+		t.Fatalf("manifest missing: %v", err)
+	}
+	for _, stage := range []string{
+		"snapshot", "repository scope", "profile omissions", "canonical shaping",
+		"canonical shaping: thread bodies",
+		"canonical shaping: comment and review bodies",
+		"canonical shaping: metadata and raw payload cleanup",
+		"canonical shaping: fingerprints and summaries",
+		"canonical shaping: discarded tables and failure ledger",
+		"canonical shaping: canonical schema finalization",
+		"canonical shaping: canonical schema finalization: disposable table drop",
+		"canonical shaping: threads rebuild: preflight",
+		"canonical shaping: threads rebuild: foreign key proof",
+		"canonical shaping: threads rebuild: compact copy",
+		"canonical shaping: threads rebuild: schema swap",
+		"canonical shaping: threads rebuild: schema restore",
+		"index removal", "final vacuum", "validation", "artifact identity", "compression", "manifest", "artifact commit", "complete",
+	} {
+		prefix := "gitcrawl: portable export: stage=" + stage + " "
+		var progressLine string
+		for _, line := range strings.Split(stderr.String(), "\n") {
+			if strings.HasPrefix(line, prefix) {
+				progressLine = line
+				break
+			}
+		}
+		if progressLine == "" || !strings.Contains(progressLine, "after=") || !strings.Contains(progressLine, "total=") {
+			t.Fatalf("timed progress missing for %q:\n%s", stage, stderr.String())
+		}
+		if strings.Contains(stdout.String(), prefix) {
+			t.Fatalf("progress leaked to JSON stdout: %s", stdout.String())
+		}
+	}
+}
+
+func TestPortableExportCommandValidatesProfileBeforeOpeningSource(t *testing.T) {
+	app := New()
+	err := app.Run(context.Background(), []string{
+		"--config", filepath.Join(t.TempDir(), "missing.toml"),
+		"portable", "export", "--profile", "future-v2", "--output-dir", filepath.Join(t.TempDir(), "out"),
+	})
+	if err == nil || !strings.Contains(err.Error(), `unsupported portable export profile "future-v2"`) {
+		t.Fatalf("unknown profile error = %v", err)
+	}
+	err = app.Run(context.Background(), []string{
+		"--config", filepath.Join(t.TempDir(), "missing.toml"),
+		"portable", "export", "--profile", "current-state-v1", "--output-dir", filepath.Join(t.TempDir(), "out"), "--repository", "openclaw",
+	})
+	if err == nil || !strings.Contains(err.Error(), `repository: expected owner/repo, got "openclaw"`) {
+		t.Fatalf("invalid repository error = %v", err)
+	}
+	err = app.Run(context.Background(), []string{
+		"--config", filepath.Join(t.TempDir(), "missing.toml"),
+		"portable", "export", "--profile", "current-state-v1", "--output-dir", filepath.Join(t.TempDir(), "out"), "--repository", "openclaw /gitcrawl",
+	})
+	if err == nil || !strings.Contains(err.Error(), `repository: expected owner/repo, got "openclaw /gitcrawl"`) {
+		t.Fatalf("non-canonical repository error = %v", err)
+	}
+	err = app.Run(context.Background(), []string{
+		"--config", filepath.Join(t.TempDir(), "missing.toml"),
+		"portable", "export", "--profile", "current-state-v1", "--output-dir", filepath.Join(t.TempDir(), "out"), "--compression", "brotli",
+	})
+	if err == nil || !strings.Contains(err.Error(), `--compression must be "gzip"`) {
+		t.Fatalf("unsupported compression error = %v", err)
+	}
+	err = app.Run(context.Background(), []string{
+		"--config", filepath.Join(t.TempDir(), "missing.toml"),
+		"portable", "export", "--profile", "current-state-v1", "--output-dir", filepath.Join(t.TempDir(), "out"), "--max-archive-bytes", "99999999",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--max-archive-bytes requires --compression") {
+		t.Fatalf("archive budget without compression error = %v", err)
+	}
+}
+
+type portablePruneTestFixture struct {
+	configPath string
+	checkoutDB string
+	mirrorDB   string
+}
+
+func newPortablePruneTestFixture(t *testing.T) portablePruneTestFixture {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	remoteDir := filepath.Join(dir, "remote")
+	checkoutDir := filepath.Join(dir, "checkout")
+	dbRel := filepath.Join("data", "openclaw__openclaw.sync.db")
+	remoteDB := filepath.Join(remoteDir, dbRel)
+	if err := os.MkdirAll(filepath.Dir(remoteDB), 0o755); err != nil {
+		t.Fatalf("mkdir remote data: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "init", "-b", "main"); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	seedPortableThread(t, remoteDB, 1, strings.Repeat("portable publish payload ", 32))
+	if err := runGit(ctx, remoteDir, "add", dbRel); err != nil {
+		t.Fatalf("git add seed: %v", err)
+	}
+	if err := runGit(ctx, remoteDir, "-c", "user.email=test@example.com", "-c", "user.name=Test", "commit", "-m", "seed store"); err != nil {
+		t.Fatalf("git commit seed: %v", err)
+	}
+
+	configPath := filepath.Join(dir, "config.toml")
+	initApp := New()
+	initApp.Stdout = io.Discard
+	initApp.Stderr = io.Discard
+	if err := initApp.Run(ctx, []string{
+		"--config", configPath,
+		"init",
+		"--portable-store", remoteDir,
+		"--portable-db", filepath.ToSlash(dbRel),
+		"--store-dir", checkoutDir,
+	}); err != nil {
+		t.Fatalf("init portable store: %v", err)
+	}
+	checkoutDB := filepath.Join(checkoutDir, dbRel)
+	pathApp := New()
+	pathApp.configPath = configPath
+	mirrorDB, err := pathApp.portableRuntimeDBPath(ctx, checkoutDB)
+	if err != nil {
+		t.Fatalf("portable runtime db path: %v", err)
+	}
+	return portablePruneTestFixture{configPath: configPath, checkoutDB: checkoutDB, mirrorDB: mirrorDB}
+}
+
+func TestPortablePrunePublishesRuntimeMirrorToCheckout(t *testing.T) {
+	ctx := context.Background()
+	fixture := newPortablePruneTestFixture(t)
+	if err := os.Chmod(fixture.checkoutDB, 0o600); err != nil {
+		t.Fatalf("restrict checkout db mode: %v", err)
+	}
+	before, err := os.ReadFile(fixture.checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db before prune: %v", err)
+	}
+	app := New()
+	var stdout, stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+	if err := app.Run(ctx, []string{"--config", fixture.configPath, "portable", "prune", "--json"}); err != nil {
+		t.Fatalf("portable prune: %v\nstderr:\n%s", err, stderr.String())
+	}
+	var payload struct {
+		DBTarget              string `json:"db_target"`
+		DBTargetPath          string `json:"db_target_path"`
+		PortableSourceDB      string `json:"portable_source_db"`
+		Published             bool   `json:"published"`
+		PublishedDBPath       string `json:"published_db_path"`
+		PublishedManifestPath string `json:"published_manifest_path"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("parse portable prune json: %v\n%s", err, stdout.String())
+	}
+	if payload.DBTarget != "runtime-mirror" || payload.DBTargetPath != fixture.mirrorDB || payload.PortableSourceDB != fixture.checkoutDB {
+		t.Fatalf("portable prune target = %+v, mirror=%s source=%s", payload, fixture.mirrorDB, fixture.checkoutDB)
+	}
+	wantManifest := portableDBManifestPath(fixture.checkoutDB)
+	if !payload.Published || payload.PublishedDBPath != fixture.checkoutDB || payload.PublishedManifestPath != wantManifest {
+		t.Fatalf("portable prune publish result = %+v", payload)
+	}
+	after, err := os.ReadFile(fixture.checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db after prune: %v", err)
+	}
+	if bytes.Equal(after, before) {
+		t.Fatal("published checkout database bytes did not change")
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(fixture.checkoutDB + suffix); !os.IsNotExist(err) {
+			t.Fatalf("published checkout sidecar %s still exists: %v", suffix, err)
+		}
+	}
+	if err := validatePortableSQLiteSourceFile(ctx, fixture.checkoutDB, fixture.checkoutDB); err != nil {
+		t.Fatalf("validate published checkout db: %v", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(fixture.checkoutDB + suffix); !os.IsNotExist(err) {
+			t.Fatalf("checkout sidecar %s exists after validation: %v", suffix, err)
+		}
+	}
+	for _, path := range []string{fixture.checkoutDB, wantManifest} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat published file %s: %v", path, err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("published file %s mode = %o, want the preserved 600", path, info.Mode().Perm())
+		}
+	}
+	wantNotice := fmt.Sprintf("gitcrawl: portable store checkout detected; writes go to the runtime mirror at %s, not the checkout database %s. Run 'gitcrawl portable prune' to publish.", fixture.mirrorDB, fixture.checkoutDB)
+	if strings.Count(stderr.String(), wantNotice) != 1 {
+		t.Fatalf("redirect notice count = %d, want 1\nstderr:\n%s", strings.Count(stderr.String(), wantNotice), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "published pruned database to "+fixture.checkoutDB) || !strings.Contains(stderr.String(), wantManifest) {
+		t.Fatalf("publish notice missing paths:\n%s", stderr.String())
+	}
+	t.Logf("portable prune JSON: %s", strings.TrimSpace(stdout.String()))
+}
+
+func TestPortablePruneNoPublishLeavesCheckoutUnchanged(t *testing.T) {
+	fixture := newPortablePruneTestFixture(t)
+	before, err := os.ReadFile(fixture.checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db before prune: %v", err)
+	}
+	app := New()
+	var stdout, stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+	if err := app.Run(context.Background(), []string{"--config", fixture.configPath, "portable", "prune", "--no-publish", "--json"}); err != nil {
+		t.Fatalf("portable prune --no-publish: %v\nstderr:\n%s", err, stderr.String())
+	}
+	var payload struct {
+		Published             bool   `json:"published"`
+		PublishedDBPath       string `json:"published_db_path"`
+		PublishedManifestPath string `json:"published_manifest_path"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("parse portable prune json: %v\n%s", err, stdout.String())
+	}
+	if payload.Published || payload.PublishedDBPath != "" || payload.PublishedManifestPath != "" {
+		t.Fatalf("no-publish result = %+v", payload)
+	}
+	after, err := os.ReadFile(fixture.checkoutDB)
+	if err != nil {
+		t.Fatalf("read checkout db after prune: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("--no-publish changed checkout database bytes")
+	}
+	if _, err := os.Stat(portableDBManifestPath(fixture.checkoutDB)); !os.IsNotExist(err) {
+		t.Fatalf("--no-publish wrote checkout manifest: %v", err)
+	}
+}
+
+func TestPortablePruneCommandCanIncludeRedactedSyncFailures(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	if err := New().Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, store.Repository{
+		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl", RawJSON: "{}", UpdatedAt: "2026-07-16T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("upsert repository: %v", err)
+	}
+	if _, err := st.RecordSyncAttemptFailure(ctx, store.SyncAttemptFailure{
+		RepoID: repoID, Number: 90, Operation: "pull_request_details", ErrorClass: "network",
+		ErrorMessage: "private endpoint detail", FirstSeenAt: "2026-07-16T00:00:00Z", LastSeenAt: "2026-07-16T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("record sync failure: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	app := New()
+	var stdout bytes.Buffer
+	app.Stdout = &stdout
+	if err := app.Run(ctx, []string{"--config", configPath, "portable", "prune", "--include-sync-failures", "--no-vacuum", "--json"}); err != nil {
+		t.Fatalf("portable prune: %v", err)
+	}
+	var payload struct {
+		Included     bool  `json:"sync_failures_included"`
+		Redacted     int64 `json:"sync_failure_errors_redacted"`
+		Vacuumed     bool  `json:"vacuumed"`
+		VacuumForced bool  `json:"sync_failure_vacuum_forced"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("parse prune json: %v\n%s", err, stdout.String())
+	}
+	if !payload.Included || payload.Redacted != 1 || !payload.Vacuumed || !payload.VacuumForced {
+		t.Fatalf("portable prune payload = %+v", payload)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open portable db: %v", err)
+	}
+	defer db.Close()
+	var message string
+	if err := db.QueryRowContext(ctx, `select error_message from sync_attempt_failures`).Scan(&message); err != nil {
+		t.Fatalf("read portable sync failure: %v", err)
+	}
+	if message != "[redacted for portable export]" || strings.Contains(message, "private endpoint detail") {
+		t.Fatalf("portable error message = %q", message)
 	}
 }
 
@@ -2144,19 +5435,16 @@ func TestAppOutputModesAndUsageBranches(t *testing.T) {
 	if _, err := parseOptionalPositiveInt("0"); err == nil {
 		t.Fatal("zero int should fail")
 	}
-	if _, err := parseOptionalPositiveIntList("1, 0"); err == nil {
-		t.Fatal("bad int list should fail")
-	}
 	if owner, repo, err := parseOwnerRepo("https://github.com/openclaw/openclaw/issues/78601"); err != nil || owner != "openclaw" || repo != "openclaw" {
 		t.Fatalf("full issue URL owner/repo = %q/%q err=%v", owner, repo, err)
 	}
-	if got, err := parseOptionalThreadNumber("https://github.com/openclaw/openclaw/issues/78601"); err != nil || got != 78601 {
+	if got, err := parseOptionalThreadNumber("https://github.com/openclaw/openclaw/issues/78601", "openclaw/openclaw"); err != nil || got != 78601 {
 		t.Fatalf("full issue URL number = %d err=%v", got, err)
 	}
-	if got, err := parseOptionalThreadNumber("https://github.com/openclaw/openclaw/pull/78602#issuecomment-1"); err != nil || got != 78602 {
+	if got, err := parseOptionalThreadNumber("https://github.com/openclaw/openclaw/pull/78602#issuecomment-1", "openclaw/openclaw"); err != nil || got != 78602 {
 		t.Fatalf("full pull URL number = %d err=%v", got, err)
 	}
-	if got, err := parseOptionalThreadNumberList("https://github.com/openclaw/openclaw/issues/78601, openclaw/openclaw#78602, pull/78603, #78604"); err != nil || len(got) != 4 || got[0] != 78601 || got[1] != 78602 || got[2] != 78603 || got[3] != 78604 {
+	if got, err := parseOptionalThreadNumberList("https://github.com/openclaw/openclaw/issues/78601, openclaw/openclaw#78602, pull/78603, #78604", "openclaw/openclaw"); err != nil || len(got) != 4 || got[0] != 78601 || got[1] != 78602 || got[2] != 78603 || got[3] != 78604 {
 		t.Fatalf("thread ref list = %#v err=%v", got, err)
 	}
 	if _, _, _, err := parseClusterShapeOptions("test", "bad", "1", "0.5"); err == nil {
@@ -2173,6 +5461,13 @@ func TestAppOutputModesAndUsageBranches(t *testing.T) {
 	if got := openAIBaseURL(); got != "https://gitcrawl-openai.example/v1" {
 		t.Fatalf("openAIBaseURL override = %q", got)
 	}
+	if got := embedBaseURL(config.Config{}); got != "https://gitcrawl-openai.example/v1" {
+		t.Fatalf("embedBaseURL fallback = %q", got)
+	}
+	embedCfg := config.Config{OpenAI: config.OpenAIConfig{EmbedBaseURL: " https://embed.example/v1 "}}
+	if got := embedBaseURL(embedCfg); got != "https://embed.example/v1" {
+		t.Fatalf("embedBaseURL override = %q", got)
+	}
 	t.Setenv("GITHUB_BASE_URL", "https://github.example")
 	if got := githubBaseURL(); got != "https://github.example" {
 		t.Fatalf("githubBaseURL fallback = %q", got)
@@ -2183,6 +5478,95 @@ func TestAppOutputModesAndUsageBranches(t *testing.T) {
 	}
 	if got := formatOptionalTime(time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)); got == "" {
 		t.Fatal("non-zero optional time should be formatted")
+	}
+}
+
+func TestConfigureEmbedBaseURL(t *testing.T) {
+	ctx := context.Background()
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	var stdout bytes.Buffer
+	app := New()
+	app.Stdout = &stdout
+	if err := app.Run(ctx, []string{"--config", configPath, "configure", "--embed-base-url", "https://embed.example/v1", "--json"}); err != nil {
+		t.Fatalf("configure embed base URL: %v", err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.OpenAI.EmbedBaseURL != "https://embed.example/v1" {
+		t.Fatalf("saved embed_base_url = %q", cfg.OpenAI.EmbedBaseURL)
+	}
+	if !strings.Contains(stdout.String(), `"embed_base_url": "https://embed.example/v1"`) {
+		t.Fatalf("configure output = %q", stdout.String())
+	}
+
+	if err := app.Run(ctx, []string{"--config", configPath, "configure", "--embed-base-url", ""}); err != nil {
+		t.Fatalf("clear embed base URL: %v", err)
+	}
+	cfg, err = config.Load(configPath)
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if cfg.OpenAI.EmbedBaseURL != "" {
+		t.Fatalf("cleared embed_base_url = %q", cfg.OpenAI.EmbedBaseURL)
+	}
+}
+
+func TestEmbedUsesConfiguredBaseURL(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	if err := New().Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	seedCommandFlowStore(t, dbPath)
+
+	var configuredCalls atomic.Int64
+	configured := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		configuredCalls.Add(1)
+		if r.URL.Path != "/embeddings" {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		var request struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || len(request.Input) == 0 {
+			http.Error(w, "missing input", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"index": 0, "embedding": []float64{0.25, 0.75}}},
+		})
+	}))
+	defer configured.Close()
+	var sharedCalls atomic.Int64
+	shared := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sharedCalls.Add(1)
+		http.Error(w, "shared endpoint should not be used", http.StatusInternalServerError)
+	}))
+	defer shared.Close()
+
+	configure := New()
+	if err := configure.Run(ctx, []string{"--config", configPath, "configure", "--embed-base-url", configured.URL}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	t.Setenv("OPENAI_API_KEY", "x")
+	t.Setenv("GITCRAWL_OPENAI_BASE_URL", shared.URL)
+	var stdout bytes.Buffer
+	embed := New()
+	embed.Stdout = &stdout
+	if err := embed.Run(ctx, []string{"--config", configPath, "embed", "openclaw/openclaw", "--limit", "1", "--json"}); err != nil {
+		t.Fatalf("embed: %v", err)
+	}
+	if configuredCalls.Load() != 1 || sharedCalls.Load() != 0 {
+		t.Fatalf("endpoint calls: configured=%d shared=%d", configuredCalls.Load(), sharedCalls.Load())
+	}
+	if !strings.Contains(stdout.String(), `"embedded": 1`) {
+		t.Fatalf("embed output = %q", stdout.String())
 	}
 }
 
@@ -2418,6 +5802,109 @@ func TestTUIInfersRepository(t *testing.T) {
 	}
 }
 
+func TestSyncFailuresListsUnresolvedAndHistory(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	app := New()
+	if err := app.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, store.Repository{
+		Owner:     "openclaw",
+		Name:      "gitcrawl",
+		FullName:  "openclaw/gitcrawl",
+		RawJSON:   "{}",
+		UpdatedAt: "2026-06-06T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("seed repository: %v", err)
+	}
+	for _, number := range []int{83, 84} {
+		threadID, err := st.UpsertThread(ctx, store.Thread{
+			RepoID: repoID, GitHubID: strconv.Itoa(number), Number: number, Kind: "pull_request", State: "open",
+			Title: "hydration failure", HTMLURL: fmt.Sprintf("https://github.com/openclaw/gitcrawl/pull/%d", number),
+			LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: "{}", ContentHash: fmt.Sprintf("h%d", number), UpdatedAt: "2026-06-06T00:00:00Z",
+		})
+		if err != nil {
+			t.Fatalf("seed thread %d: %v", number, err)
+		}
+		if _, err := st.RecordSyncAttemptFailure(ctx, store.SyncAttemptFailure{
+			RepoID: repoID, ThreadID: threadID, Number: number, Operation: "pull_request_details", ErrorClass: "error",
+			ErrorMessage: fmt.Sprintf("failure %d", number), FirstSeenAt: "2026-06-06T00:00:00Z", LastSeenAt: "2026-06-06T00:00:00Z",
+		}); err != nil {
+			t.Fatalf("seed failure %d: %v", number, err)
+		}
+		if number == 83 {
+			if _, err := st.ResolveSyncAttemptFailures(ctx, repoID, number, "2026-06-06T00:05:00Z"); err != nil {
+				t.Fatalf("resolve failure %d: %v", number, err)
+			}
+		}
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	run := New()
+	var stdout bytes.Buffer
+	run.Stdout = &stdout
+	if err := run.Run(ctx, []string{"--config", configPath, "--json", "sync-failures", "openclaw/gitcrawl"}); err != nil {
+		t.Fatalf("sync-failures: %v", err)
+	}
+	var active struct {
+		Failures []store.SyncAttemptFailure `json:"failures"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &active); err != nil {
+		t.Fatalf("decode active failures: %v\n%s", err, stdout.String())
+	}
+	if len(active.Failures) != 1 || active.Failures[0].Number != 84 || active.Failures[0].ResolvedAt != "" {
+		t.Fatalf("active failures = %+v", active.Failures)
+	}
+
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "--json", "sync-failures", "openclaw/gitcrawl", "--include-resolved"}); err != nil {
+		t.Fatalf("sync-failures history: %v", err)
+	}
+	var history struct {
+		Failures []store.SyncAttemptFailure `json:"failures"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &history); err != nil {
+		t.Fatalf("decode failure history: %v\n%s", err, stdout.String())
+	}
+	if len(history.Failures) != 2 {
+		t.Fatalf("history failures = %+v", history.Failures)
+	}
+
+	st, err = store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	if _, err := st.ResolveSyncAttemptFailures(ctx, repoID, 84, "2026-06-06T00:10:00Z"); err != nil {
+		t.Fatalf("resolve final failure: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close resolved store: %v", err)
+	}
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "--json", "sync-failures", "openclaw/gitcrawl"}); err != nil {
+		t.Fatalf("sync-failures empty: %v", err)
+	}
+	var empty struct {
+		Failures []store.SyncAttemptFailure `json:"failures"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &empty); err != nil {
+		t.Fatalf("decode empty failures: %v\n%s", err, stdout.String())
+	}
+	if empty.Failures == nil || len(empty.Failures) != 0 {
+		t.Fatalf("empty failures = %+v; JSON = %s", empty.Failures, stdout.String())
+	}
+}
+
 func TestTUIJSONUsesDefaultsWhenConfigMissing(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -2620,7 +6107,7 @@ func TestCommandFlowCoversSearchEmbedNeighborsClusterDetailRunsAndRefresh(t *tes
 			t.Fatalf("unexpected OpenAI path: %s", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer test-openai-key" {
-			t.Fatalf("authorization = %q", got)
+			t.Fatalf("authorization mismatch: present=%t length=%d", got != "", len(got))
 		}
 		var payload struct {
 			Input []string `json:"input"`
@@ -3061,6 +6548,7 @@ func TestSyncCommandUsesConfiguredGitHubBaseURLAndHydratesComments(t *testing.T)
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.toml")
 	dbPath := filepath.Join(dir, "gitcrawl.db")
+	progressPath := filepath.Join(dir, "sync-progress.json")
 	init := New()
 	if err := init.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
 		t.Fatalf("init: %v", err)
@@ -3068,7 +6556,7 @@ func TestSyncCommandUsesConfiguredGitHubBaseURLAndHydratesComments(t *testing.T)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-gh-token" {
-			t.Fatalf("authorization = %q", got)
+			t.Fatalf("authorization mismatch: present=%t length=%d", got != "", len(got))
 		}
 		switch r.URL.Path {
 		case "/repos/openclaw/openclaw":
@@ -3098,19 +6586,49 @@ func TestSyncCommandUsesConfiguredGitHubBaseURLAndHydratesComments(t *testing.T)
 	run := New()
 	var stdout bytes.Buffer
 	run.Stdout = &stdout
-	if err := run.Run(ctx, []string{"--config", configPath, "sync", "openclaw/openclaw", "--numbers", "101,102", "--include-comments", "--json"}); err != nil {
+	if err := run.Run(ctx, []string{
+		"--config", configPath,
+		"sync", "openclaw/openclaw",
+		"--numbers", "101,102",
+		"--include-comments",
+		"--progress-file", progressPath,
+		"--json",
+	}); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
 	var stats struct {
-		ThreadsSynced      int `json:"threads_synced"`
-		PullRequestsSynced int `json:"pull_requests_synced"`
-		CommentsSynced     int `json:"comments_synced"`
+		ThreadsSynced      int    `json:"threads_synced"`
+		PullRequestsSynced int    `json:"pull_requests_synced"`
+		CommentsSynced     int    `json:"comments_synced"`
+		DBTarget           string `json:"db_target"`
+		DBTargetPath       string `json:"db_target_path"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &stats); err != nil {
 		t.Fatalf("decode sync stats: %v\n%s", err, stdout.String())
 	}
 	if stats.ThreadsSynced != 2 || stats.PullRequestsSynced != 1 || stats.CommentsSynced != 4 {
 		t.Fatalf("sync stats = %+v", stats)
+	}
+	if stats.DBTarget != "direct" || stats.DBTargetPath != dbPath {
+		t.Fatalf("sync db target = %+v", stats)
+	}
+	progressData, err := os.ReadFile(progressPath)
+	if err != nil {
+		t.Fatalf("read sync progress: %v", err)
+	}
+	var syncProgress syncProgressSnapshot
+	if err := json.Unmarshal(progressData, &syncProgress); err != nil {
+		t.Fatalf("decode sync progress: %v", err)
+	}
+	if syncProgress.Schema != syncProgressSchemaV1 ||
+		syncProgress.Repository != "openclaw/openclaw" ||
+		syncProgress.State != syncProgressSucceeded ||
+		syncProgress.Stage != syncProgressFinalizing ||
+		syncProgress.IssuesReceived != 1 ||
+		syncProgress.PullRequestsReceived != 1 ||
+		syncProgress.CommentsReceived != 4 ||
+		syncProgress.ObservedAt == "" {
+		t.Fatalf("sync progress = %+v", syncProgress)
 	}
 
 	st, err := store.Open(ctx, dbPath)
@@ -3125,6 +6643,473 @@ func TestSyncCommandUsesConfiguredGitHubBaseURLAndHydratesComments(t *testing.T)
 	if status.ThreadCount != 2 || status.RepositoryCount != 1 {
 		t.Fatalf("status after sync = %+v", status)
 	}
+}
+
+func TestSyncCommandPublishesSanitizedFailureProgress(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	progressPath := filepath.Join(dir, "sync-progress.json")
+	if err := New().Run(ctx, []string{
+		"--config", configPath, "init", "--db", dbPath,
+	}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		http.Error(w, "private upstream diagnostic", http.StatusBadGateway)
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "test-gh-token")
+	t.Setenv("GITCRAWL_GITHUB_BASE_URL", server.URL)
+
+	err := New().Run(ctx, []string{
+		"--config", configPath,
+		"sync", "openclaw/gitcrawl",
+		"--progress-file", progressPath,
+	})
+	if err == nil {
+		t.Fatal("sync unexpectedly succeeded")
+	}
+	data, readErr := os.ReadFile(progressPath)
+	if readErr != nil {
+		t.Fatalf("read progress: %v", readErr)
+	}
+	var progress syncProgressSnapshot
+	if err := json.Unmarshal(data, &progress); err != nil {
+		t.Fatalf("decode progress: %v", err)
+	}
+	if progress.State != syncProgressFailed ||
+		progress.Stage != syncProgressConnecting {
+		t.Fatalf("failure progress = %+v", progress)
+	}
+	if strings.Contains(string(data), "diagnostic") ||
+		strings.Contains(string(data), "test-gh-token") {
+		t.Fatalf("failure progress retained sensitive data: %s", data)
+	}
+}
+
+func TestFillPRDetailsHydratesMissingPullRequestDetails(t *testing.T) {
+	testFillPRDetailsHydratesMissingPullRequestDetails(t, "")
+}
+
+func testFillPRDetailsHydratesMissingPullRequestDetails(t *testing.T, tokenCommand string) {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	cacheDir := filepath.Join(dir, "cache")
+	init := New()
+	if err := init.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	configureTestGitHubCache(t, configPath, cacheDir, "test-gh-token")
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	now := "2026-06-20T12:00:00Z"
+	repoID, err := st.UpsertRepository(ctx, store.Repository{Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl", RawJSON: "{}", UpdatedAt: now})
+	if err != nil {
+		t.Fatalf("repo: %v", err)
+	}
+	if _, err := st.UpsertThread(ctx, store.Thread{
+		RepoID: repoID, GitHubID: "102", Number: 102, Kind: "pull_request", State: "open",
+		Title: "Fill details", HTMLURL: "https://github.com/openclaw/gitcrawl/pull/102",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: "{}", ContentHash: "h102",
+		UpdatedAtGitHub: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("thread: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	expectedToken := "test-gh-token"
+	if tokenCommand != "" {
+		expectedToken = "managed-fill-token"
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+expectedToken {
+			t.Fatalf("authorization mismatch: present=%t length=%d", got != "", len(got))
+		}
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4990")
+		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10))
+		switch r.URL.Path {
+		case "/rate_limit":
+			resetAt := time.Now().Add(time.Hour).Unix()
+			_ = json.NewEncoder(w).Encode(map[string]any{"resources": map[string]any{
+				"core":    map[string]any{"limit": 5000, "remaining": 4990, "reset": resetAt},
+				"graphql": map[string]any{"limit": 5000, "remaining": 4990, "reset": resetAt},
+			}})
+		case "/repos/openclaw/gitcrawl":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 12345, "full_name": "openclaw/gitcrawl"})
+		case "/repos/openclaw/gitcrawl/issues/102":
+			row := githubIssueJSON(102, "pull_request", "Fill details")
+			row["html_url"] = "https://github.com/openclaw/gitcrawl/pull/102"
+			row["pull_request"] = map[string]any{"url": githubServerURL(r) + "/repos/openclaw/gitcrawl/pulls/102"}
+			row["updated_at"] = "2026-06-20T12:01:00Z"
+			_ = json.NewEncoder(w).Encode(row)
+		case "/graphql":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"repository": map[string]any{
+						"pullRequest": map[string]any{
+							"reviewThreads": map[string]any{
+								"nodes":    []map[string]any{},
+								"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+							},
+						},
+					},
+				},
+			})
+		case "/repos/openclaw/gitcrawl/pulls/102":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number":          102,
+				"base":            map[string]any{"sha": "base-sha"},
+				"head":            map[string]any{"sha": "head-sha", "ref": "fill-details", "repo": map[string]any{"full_name": "openclaw/gitcrawl"}},
+				"mergeable_state": "clean",
+				"additions":       3,
+				"deletions":       1,
+				"changed_files":   1,
+			})
+		case "/repos/openclaw/gitcrawl/pulls/102/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"filename": "internal/cli/app.go", "status": "modified", "additions": 3, "deletions": 1, "changes": 4}})
+		case "/repos/openclaw/gitcrawl/pulls/102/commits":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"sha": "commit-sha", "commit": map[string]any{"message": "feat: fill details", "author": map[string]any{"name": "Andy", "date": now}}, "html_url": "https://github.com/openclaw/gitcrawl/commit/commit-sha"}})
+		case "/repos/openclaw/gitcrawl/commits/head-sha/check-runs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []map[string]any{{"name": "CI", "status": "completed", "conclusion": "success", "details_url": "https://example.invalid/check"}}})
+		case "/repos/openclaw/gitcrawl/actions/runs":
+			if r.URL.Query().Get("head_sha") != "head-sha" {
+				t.Fatalf("workflow runs query = %s", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]any{{"id": 99, "run_number": 7, "head_sha": "head-sha", "status": "completed", "conclusion": "success", "name": "CI", "html_url": "https://example.invalid/run", "created_at": now, "updated_at": now}}})
+		default:
+			t.Fatalf("unexpected GitHub path: %s", r.URL.String())
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "test-gh-token")
+	t.Setenv("GITCRAWL_GITHUB_BASE_URL", server.URL)
+	t.Setenv("GITCRAWL_GH_RATE_LIMIT_MAX_AGE", "1m")
+	writeFillPRDetailsRateLimitState(t, cacheDir, "test-gh-token", 1, time.Now().Add(-time.Minute), time.Now().Add(-time.Hour))
+
+	run := New()
+	var stdout, stderr bytes.Buffer
+	run.Stdout = &stdout
+	run.Stderr = &stderr
+	args := []string{"--config", configPath, "fill-pr-details", "openclaw/gitcrawl", "--limit", "1", "--batch-size", "1", "--reserve-rate-limit", "10", "--json-progress", "--json"}
+	if tokenCommand != "" {
+		args = append([]string{"--github-token-command", tokenCommand}, args...)
+	}
+	if err := run.Run(ctx, args); err != nil {
+		t.Fatalf("fill-pr-details: %v\nstderr=%s", err, stderr.String())
+	}
+	var result struct {
+		Selected     int    `json:"selected"`
+		Filled       int    `json:"filled"`
+		DBTarget     string `json:"db_target"`
+		DBTargetPath string `json:"db_target_path"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode fill result: %v\n%s", err, stdout.String())
+	}
+	if result.Selected != 1 || result.Filled != 1 {
+		t.Fatalf("fill result = %+v", result)
+	}
+	if result.DBTarget != "direct" || result.DBTargetPath != dbPath {
+		t.Fatalf("fill db target = %+v", result)
+	}
+	if !strings.Contains(stderr.String(), `"event":"batch_start"`) || !strings.Contains(stderr.String(), `"event":"batch_done"`) {
+		t.Fatalf("missing json progress events: %s", stderr.String())
+	}
+	st, err = store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st.Close()
+	cache, err := st.PullRequestCache(ctx, repoID, 102)
+	if err != nil {
+		t.Fatalf("pull request cache: %v", err)
+	}
+	if cache.Detail.HeadSHA != "head-sha" || len(cache.Files) != 1 || len(cache.Commits) != 1 || len(cache.Checks) != 1 {
+		t.Fatalf("cache after fill = %+v", cache)
+	}
+}
+
+func TestFillPRDetailsDefaultRateLimitFloorUsesLiveSharedQuota(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	cacheDir := filepath.Join(dir, "cache")
+	init := New()
+	if err := init.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	configureTestGitHubCache(t, configPath, cacheDir, "test-gh-token")
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	now := "2026-06-20T12:00:00Z"
+	repoID, err := st.UpsertRepository(ctx, store.Repository{Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl", RawJSON: "{}", UpdatedAt: now})
+	if err != nil {
+		t.Fatalf("repo: %v", err)
+	}
+	if _, err := st.UpsertThread(ctx, store.Thread{
+		RepoID: repoID, GitHubID: "103", Number: 103, Kind: "pull_request", State: "open",
+		Title: "Fill details", HTMLURL: "https://github.com/openclaw/gitcrawl/pull/103",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: "{}", ContentHash: "h103",
+		UpdatedAtGitHub: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("thread: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	t.Setenv("GITHUB_TOKEN", "test-gh-token")
+	resetAt := time.Now().Add(time.Hour)
+	var rateStatusCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rate_limit" {
+			t.Fatalf("unexpected request after low shared quota: %s", r.URL.Path)
+		}
+		rateStatusCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{"resources": map[string]any{
+			"core":    map[string]any{"limit": 5000, "remaining": 1500, "reset": resetAt.Unix()},
+			"graphql": map[string]any{"limit": 5000, "remaining": 5000, "reset": resetAt.Unix()},
+		}})
+	}))
+	defer server.Close()
+	t.Setenv("GITCRAWL_GITHUB_BASE_URL", server.URL)
+	t.Setenv("GITCRAWL_GH_RATE_LIMIT_MAX_AGE", "1m")
+	writeFillPRDetailsRateLimitState(t, cacheDir, "test-gh-token", 5000, time.Now().Add(time.Hour), time.Now())
+
+	run := New()
+	var stdout bytes.Buffer
+	run.Stdout = &stdout
+	var reserveErr *gh.RateLimitReserveError
+	if err := run.Run(ctx, []string{"--config", configPath, "fill-pr-details", "openclaw/gitcrawl", "--limit", "1", "--json"}); !errors.As(err, &reserveErr) {
+		t.Fatalf("incomplete fill must return quota failure: %v", err)
+	}
+	var result struct {
+		Selected      int                  `json:"selected"`
+		Filled        int                  `json:"filled"`
+		Remaining     int                  `json:"remaining"`
+		StoppedReason string               `json:"stopped_reason"`
+		RateLimit     *fillRateLimitResult `json:"rate_limit"`
+		Floor         int                  `json:"reserve_rate_limit"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode fill result: %v\n%s", err, stdout.String())
+	}
+	if result.Selected != 1 || result.Filled != 0 || result.Remaining != 1 || result.StoppedReason != "rate-limit-reserve" {
+		t.Fatalf("fill result = %+v", result)
+	}
+	if result.RateLimit == nil || result.RateLimit.Remaining != 1500 || result.Floor != 1500 {
+		t.Fatalf("rate limit = %+v", result.RateLimit)
+	}
+	if got := rateStatusCalls.Load(); got != 1 {
+		t.Fatalf("rate status calls = %d, want 1", got)
+	}
+}
+
+func TestCurrentFillRateLimitUsesConfiguredAPIHost(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	cacheDir := filepath.Join(dir, "cache")
+	if err := New().Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	configureTestGitHubCache(t, configPath, cacheDir, "test-gh-token")
+	t.Setenv("GH_HOST", "")
+	t.Setenv("GITCRAWL_GITHUB_BASE_URL", "https://ghe.example/api/v3")
+	t.Setenv("GITCRAWL_GH_RATE_LIMIT_MAX_AGE", "1h")
+
+	app := New()
+	app.configPath = configPath
+	resetAt := time.Now().Add(time.Hour).UTC()
+	if err := app.writeSharedRateLimit(ctx, "test-gh-token", gh.RateLimitSnapshot{
+		Host:      "ghe.example",
+		Limit:     5000,
+		Remaining: 7,
+		ResetAt:   resetAt,
+		Resource:  "core",
+	}, "test"); err != nil {
+		t.Fatalf("write rate limit: %v", err)
+	}
+
+	rate, ok := app.currentFillRateLimit(ctx, 10)
+	if !ok || rate.Host != "ghe.example" || rate.Remaining != 7 || !rate.Low || rate.ResetAt != resetAt.Format(time.RFC3339) {
+		t.Fatalf("current fill rate limit = %+v ok=%v", rate, ok)
+	}
+}
+
+func TestFillPRDetailsReserveRateLimitStopsBeforeCrossingDuringBatch(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	cacheDir := filepath.Join(dir, "cache")
+	init := New()
+	if err := init.Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	configureTestGitHubCache(t, configPath, cacheDir, "test-gh-token")
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	now := "2026-06-20T12:00:00Z"
+	repoID, err := st.UpsertRepository(ctx, store.Repository{Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl", RawJSON: "{}", UpdatedAt: now})
+	if err != nil {
+		t.Fatalf("repo: %v", err)
+	}
+	if _, err := st.UpsertThread(ctx, store.Thread{
+		RepoID: repoID, GitHubID: "104", Number: 104, Kind: "pull_request", State: "open",
+		Title: "Fill details", HTMLURL: "https://github.com/openclaw/gitcrawl/pull/104",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: "{}", ContentHash: "h104",
+		UpdatedAtGitHub: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("thread: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	resetAt := time.Now().Add(time.Hour).Unix()
+	var rateStatusCalls atomic.Int32
+	var coreCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-gh-token" {
+			t.Fatalf("authorization mismatch: present=%t length=%d", got != "", len(got))
+		}
+		if r.URL.Path == "/rate_limit" {
+			remaining := 12 - int(rateStatusCalls.Add(1))
+			_ = json.NewEncoder(w).Encode(map[string]any{"resources": map[string]any{
+				"core":    map[string]any{"limit": 5000, "remaining": remaining, "reset": resetAt},
+				"graphql": map[string]any{"limit": 5000, "remaining": 11, "reset": resetAt},
+			}})
+			return
+		}
+		call := coreCalls.Add(1)
+		remaining := 11 - int(call)
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(resetAt, 10))
+		w.Header().Set("X-RateLimit-Resource", "core")
+		if call > 1 {
+			http.Error(w, "request crossed configured reserve", http.StatusInternalServerError)
+			return
+		}
+		if r.URL.Path != "/repos/openclaw/gitcrawl" {
+			t.Fatalf("first guarded request path = %q", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 12345, "full_name": "openclaw/gitcrawl"})
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_TOKEN", "test-gh-token")
+	t.Setenv("GITCRAWL_GITHUB_BASE_URL", server.URL)
+	writeFillPRDetailsRateLimitState(t, cacheDir, "test-gh-token", 11, time.Unix(resetAt, 0), time.Now())
+
+	run := New()
+	var stdout bytes.Buffer
+	run.Stdout = &stdout
+	var reserveErr *gh.RateLimitReserveError
+	if err := run.Run(ctx, []string{"--config", configPath, "fill-pr-details", "openclaw/gitcrawl", "--limit", "1", "--reserve-rate-limit", "10", "--json"}); !errors.As(err, &reserveErr) {
+		t.Fatalf("incomplete fill must return quota failure: %v", err)
+	}
+	var result struct {
+		Selected      int                  `json:"selected"`
+		Filled        int                  `json:"filled"`
+		Remaining     int                  `json:"remaining"`
+		StoppedReason string               `json:"stopped_reason"`
+		RateLimit     *fillRateLimitResult `json:"rate_limit"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode fill result: %v\n%s", err, stdout.String())
+	}
+	if result.Selected != 1 || result.Filled != 0 || result.Remaining != 1 || result.StoppedReason != "rate-limit-reserve" {
+		t.Fatalf("fill result = %+v", result)
+	}
+	if result.RateLimit == nil || result.RateLimit.Resource != "core" || result.RateLimit.Remaining != 10 {
+		t.Fatalf("rate limit = %+v", result.RateLimit)
+	}
+	if got := rateStatusCalls.Load(); got != 2 {
+		t.Fatalf("rate status calls = %d, want 2", got)
+	}
+	if got := coreCalls.Load(); got != 1 {
+		t.Fatalf("core requests = %d, want 1", got)
+	}
+	st, err = store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen store after reserve stop: %v", err)
+	}
+	defer st.Close()
+	if _, err := st.PullRequestCache(ctx, repoID, 104); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("pull request cache after reserve stop error = %v, want no detail row", err)
+	}
+}
+
+func configureTestGitHubCache(t *testing.T, configPath, cacheDir, token string) {
+	t.Helper()
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	cfg.CacheDir = cacheDir
+	if cfg.Env == nil {
+		cfg.Env = map[string]string{}
+	}
+	cfg.Env["GITHUB_TOKEN"] = token
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+}
+
+func writeFillPRDetailsRateLimitState(t *testing.T, cacheDir, token string, remaining int, resetAt, updatedAt time.Time) {
+	t.Helper()
+	dir := filepath.Join(cacheDir, "octopool-migrated-gh")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("create cache dir: %v", err)
+	}
+	state := ghSharedRateLimitState{
+		Host:      "github.com",
+		TokenHash: ghRateLimitTokenHash(token),
+		Limit:     5000,
+		Remaining: remaining,
+		ResetAt:   resetAt.UTC(),
+		Resource:  "core",
+		UpdatedAt: updatedAt.UTC(),
+		Source:    "test",
+		Low:       true,
+		Threshold: 10,
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal rate limit state: %v", err)
+	}
+	path := filepath.Join(dir, ghSharedRateLimitFilePrefix+"github.com_"+ghRateLimitTokenHash(token)+".json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write rate limit state: %v", err)
+	}
+}
+
+func githubServerURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
 }
 
 func TestRefreshRunsSyncEmbedAndClusterWithLocalServers(t *testing.T) {
@@ -3144,12 +7129,38 @@ func TestRefreshRunsSyncEmbedAndClusterWithLocalServers(t *testing.T) {
 		case "/repos/openclaw/openclaw/issues":
 			_ = json.NewEncoder(w).Encode([]map[string]any{
 				githubIssueJSON(201, "issue", "Gateway reconnect loop"),
-				githubIssueJSON(202, "issue", "Gateway reconnect timeout"),
+				githubIssueJSON(202, "pull_request", "Gateway reconnect timeout"),
 			})
 		case "/repos/openclaw/openclaw/issues/201/comments":
 			_ = json.NewEncoder(w).Encode([]map[string]any{githubCommentJSON(2001, "same reconnect loop")})
 		case "/repos/openclaw/openclaw/issues/202/comments":
 			_ = json.NewEncoder(w).Encode([]map[string]any{githubCommentJSON(2002, "same reconnect timeout")})
+		case "/repos/openclaw/openclaw/pulls/202/reviews",
+			"/repos/openclaw/openclaw/pulls/202/comments":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		case "/repos/openclaw/openclaw/pulls/202":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number":          202,
+				"head":            map[string]any{"sha": "head-202", "ref": "feature", "repo": map[string]any{"full_name": "openclaw/openclaw"}},
+				"base":            map[string]any{"sha": "base-202"},
+				"mergeable_state": "clean",
+				"changed_files":   1,
+			})
+		case "/repos/openclaw/openclaw/pulls/202/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"filename": "internal/gateway.go", "status": "modified", "patch": "@@ gateway"}})
+		case "/repos/openclaw/openclaw/pulls/202/commits":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"sha":    "commit-202",
+				"commit": map[string]any{"message": "fix: reconnect timeout"},
+			}})
+		case "/repos/openclaw/openclaw/commits/head-202/check-runs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []map[string]any{}})
+		case "/repos/openclaw/openclaw/actions/runs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"workflow_runs": []map[string]any{}})
+		case "/graphql":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"repository": map[string]any{"pullRequest": map[string]any{
+				"reviewThreads": map[string]any{"nodes": []map[string]any{}, "pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""}},
+			}}}})
 		default:
 			t.Fatalf("unexpected GitHub path: %s", r.URL.String())
 		}
@@ -3182,14 +7193,19 @@ func TestRefreshRunsSyncEmbedAndClusterWithLocalServers(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	run.Stdout = &stdout
 	run.Stderr = &stderr
-	if err := run.Run(ctx, []string{"--config", configPath, "refresh", "openclaw/openclaw", "--include-comments", "--limit", "2", "--threshold", "0.5", "--min-size", "1", "--json"}); err != nil {
+	if err := run.Run(ctx, []string{"--config", configPath, "refresh", "openclaw/openclaw", "--include-comments", "--with", "pr-details", "--limit", "2", "--threshold", "0.5", "--min-size", "1", "--json"}); err != nil {
 		t.Fatalf("refresh: %v\nstderr=%s", err, stderr.String())
 	}
 	var payload refreshResult
 	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
 		t.Fatalf("decode refresh: %v\n%s", err, stdout.String())
 	}
-	if payload.Sync == nil || payload.Sync.ThreadsSynced != 2 || payload.Sync.CommentsSynced != 2 {
+	if payload.Sync == nil ||
+		payload.Sync.ThreadsSynced != 2 ||
+		payload.Sync.CommentsSynced != 2 ||
+		payload.Sync.PRDetailsSynced != 1 ||
+		payload.Sync.PRFilesSynced != 1 ||
+		payload.Sync.PRCommitsSynced != 1 {
 		t.Fatalf("sync payload = %+v", payload.Sync)
 	}
 	if payload.Embed == nil || payload.Embed.Embedded != 2 {
@@ -3197,6 +7213,9 @@ func TestRefreshRunsSyncEmbedAndClusterWithLocalServers(t *testing.T) {
 	}
 	if payload.Cluster == nil || int(payload.Cluster["vector_count"].(float64)) != 2 {
 		t.Fatalf("cluster payload = %+v", payload.Cluster)
+	}
+	if payload.DBTarget != "direct" || payload.DBTargetPath != dbPath {
+		t.Fatalf("refresh db target = %+v", payload.dbTargetInfo)
 	}
 	for _, want := range []string{"[refresh] sync", "[refresh] embed", "[refresh] cluster"} {
 		if !strings.Contains(stderr.String(), want) {
@@ -3413,7 +7432,7 @@ func TestTruncatedEmbeddingTaskCount(t *testing.T) {
 }
 
 func githubIssueJSON(number int, kind string, title string) map[string]any {
-	return map[string]any{
+	row := map[string]any{
 		"id":         number + 10000,
 		"number":     number,
 		"state":      "open",
@@ -3426,6 +7445,11 @@ func githubIssueJSON(number int, kind string, title string) map[string]any {
 		"created_at": "2026-04-30T01:00:00Z",
 		"updated_at": "2026-04-30T02:00:00Z",
 	}
+	if kind == "pull_request" {
+		row["html_url"] = fmt.Sprintf("https://github.com/openclaw/openclaw/pull/%d", number)
+		row["pull_request"] = map[string]any{"url": fmt.Sprintf("https://api.github.com/repos/openclaw/openclaw/pulls/%d", number)}
+	}
+	return row
 }
 
 func githubCommentJSON(id int, body string) map[string]any {
@@ -4108,10 +8132,20 @@ func TestClusterCommandPersistsDurableClusters(t *testing.T) {
 		t.Fatalf("seed third thread: %v", err)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tasks, err := st.ListEmbeddingTasks(ctx, store.EmbeddingTaskOptions{
+		RepoID: repoID, Basis: "title_original", Model: "text-embedding-3-small", Force: true,
+	})
+	if err != nil {
+		t.Fatalf("list embedding tasks: %v", err)
+	}
+	hashByThread := map[int64]string{}
+	for _, task := range tasks {
+		hashByThread[task.ThreadID] = task.ContentHash
+	}
 	for _, vector := range []store.ThreadVector{
-		{ThreadID: firstID, Basis: "title_original", Model: "text-embedding-3-small", Dimensions: 2, ContentHash: "hash-91", Vector: []float64{1, 0}, CreatedAt: now, UpdatedAt: now},
-		{ThreadID: secondID, Basis: "title_original", Model: "text-embedding-3-small", Dimensions: 2, ContentHash: "hash-92", Vector: []float64{0.95, 0.05}, CreatedAt: now, UpdatedAt: now},
-		{ThreadID: thirdID, Basis: "title_original", Model: "text-embedding-3-small", Dimensions: 2, ContentHash: "hash-93", Vector: []float64{0, 1}, CreatedAt: now, UpdatedAt: now},
+		{ThreadID: firstID, Basis: "title_original", Model: "text-embedding-3-small", Dimensions: 2, ContentHash: hashByThread[firstID], Vector: []float64{1, 0}, CreatedAt: now, UpdatedAt: now},
+		{ThreadID: secondID, Basis: "title_original", Model: "text-embedding-3-small", Dimensions: 2, ContentHash: hashByThread[secondID], Vector: []float64{0.95, 0.05}, CreatedAt: now, UpdatedAt: now},
+		{ThreadID: thirdID, Basis: "title_original", Model: "text-embedding-3-small", Dimensions: 2, ContentHash: hashByThread[thirdID], Vector: []float64{0, 1}, CreatedAt: now, UpdatedAt: now},
 	} {
 		if err := st.UpsertThreadVector(ctx, vector); err != nil {
 			t.Fatalf("upsert vector: %v", err)
@@ -4154,6 +8188,11 @@ func TestClusterCommandPersistsDurableClusters(t *testing.T) {
 	if err := run.Run(ctx, []string{"--config", configPath, "cluster", "openclaw/openclaw", "--threshold", "0.90", "--limit", "2", "--json"}); err != nil {
 		t.Fatalf("limited cluster: %v", err)
 	}
+	if !strings.Contains(stdout.String(), `"processed": 2`) ||
+		!strings.Contains(stdout.String(), `"partial": true`) ||
+		!strings.Contains(stdout.String(), `"complete": false`) {
+		t.Fatalf("limited cluster coverage output = %q", stdout.String())
+	}
 	st, err = store.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("reopen store after limited cluster: %v", err)
@@ -4172,13 +8211,32 @@ func TestClusterCommandPersistsDurableClusters(t *testing.T) {
 	if err := run.Run(ctx, []string{"--config", configPath, "configure", "--embed-model", "text-embedding-3-large"}); err != nil {
 		t.Fatalf("configure new embed model: %v", err)
 	}
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "cluster", "openclaw/openclaw", "--threshold", "0.90", "--json"}); err != nil {
+		t.Fatalf("compatible model fallback cluster: %v", err)
+	}
+	if !strings.Contains(stdout.String(), `"fallback": true`) ||
+		!strings.Contains(stdout.String(), `"partial": true`) ||
+		!strings.Contains(stdout.String(), `"complete": false`) {
+		t.Fatalf("compatible model fallback coverage output = %q", stdout.String())
+	}
 	st, err = store.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("reopen store before model migration cluster: %v", err)
 	}
+	tasks, err = st.ListEmbeddingTasks(ctx, store.EmbeddingTaskOptions{
+		RepoID: repoID, Basis: "title_original", Model: "text-embedding-3-large", Force: true,
+	})
+	if err != nil {
+		t.Fatalf("list migrated embedding tasks: %v", err)
+	}
+	hashByThread = map[int64]string{}
+	for _, task := range tasks {
+		hashByThread[task.ThreadID] = task.ContentHash
+	}
 	for _, vector := range []store.ThreadVector{
-		{ThreadID: firstID, Basis: "title_original", Model: "text-embedding-3-large", Dimensions: 2, ContentHash: "hash-91-large", Vector: []float64{1, 0}, CreatedAt: now, UpdatedAt: now},
-		{ThreadID: secondID, Basis: "title_original", Model: "text-embedding-3-large", Dimensions: 2, ContentHash: "hash-92-large", Vector: []float64{0.95, 0.05}, CreatedAt: now, UpdatedAt: now},
+		{ThreadID: firstID, Basis: "title_original", Model: "text-embedding-3-large", Dimensions: 2, ContentHash: hashByThread[firstID], Vector: []float64{1, 0}, CreatedAt: now, UpdatedAt: now},
+		{ThreadID: secondID, Basis: "title_original", Model: "text-embedding-3-large", Dimensions: 2, ContentHash: hashByThread[secondID], Vector: []float64{0.95, 0.05}, CreatedAt: now, UpdatedAt: now},
 	} {
 		if err := st.UpsertThreadVector(ctx, vector); err != nil {
 			t.Fatalf("upsert migrated vector: %v", err)
@@ -4190,7 +8248,12 @@ func TestClusterCommandPersistsDurableClusters(t *testing.T) {
 
 	stdout.Reset()
 	if err := run.Run(ctx, []string{"--config", configPath, "cluster", "openclaw/openclaw", "--threshold", "0.90", "--json"}); err != nil {
-		t.Fatalf("model migration cluster: %v", err)
+		t.Fatalf("compatible partial model migration cluster: %v", err)
+	}
+	if !strings.Contains(stdout.String(), `"complete": false`) ||
+		!strings.Contains(stdout.String(), `"partial": true`) ||
+		!strings.Contains(stdout.String(), `"missing": 1`) {
+		t.Fatalf("compatible partial cluster coverage output = %q", stdout.String())
 	}
 	st, err = store.Open(ctx, dbPath)
 	if err != nil {
@@ -4201,10 +8264,25 @@ func TestClusterCommandPersistsDurableClusters(t *testing.T) {
 		t.Fatalf("list clusters after model migration run: %v", err)
 	}
 	if len(clusters) != 2 {
-		t.Fatalf("partial model migration run should not retire clusters without new vectors, got %#v", clusters)
+		t.Fatalf("failed model migration run should preserve clusters, got %#v", clusters)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatalf("close store after model migration cluster: %v", err)
+	}
+
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "cluster", "openclaw/openclaw", "--threshold", "0.90", "--strict-vectors", "--json"}); err == nil || !strings.Contains(err.Error(), "vector coverage is incomplete") {
+		t.Fatalf("strict model migration cluster error = %v", err)
+	}
+
+	stdout.Reset()
+	if err := run.Run(ctx, []string{"--config", configPath, "cluster", "openclaw/openclaw", "--threshold", "0.90", "--limit", "2", "--json"}); err != nil {
+		t.Fatalf("explicit partial model migration cluster: %v", err)
+	}
+	if !strings.Contains(stdout.String(), `"complete": false`) ||
+		!strings.Contains(stdout.String(), `"partial": true`) ||
+		!strings.Contains(stdout.String(), `"missing": 1`) {
+		t.Fatalf("partial cluster coverage output = %q", stdout.String())
 	}
 
 	st, err = store.Open(ctx, dbPath)
@@ -4235,6 +8313,59 @@ func TestClusterCommandPersistsDurableClusters(t *testing.T) {
 	}
 	if err := st.Close(); err != nil {
 		t.Fatalf("close store after close-all cluster: %v", err)
+	}
+}
+
+func TestClusterAndRefreshStrictVectorsRejectMissingCoverageBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	dbPath := filepath.Join(dir, "gitcrawl.db")
+	if err := New().Run(ctx, []string{"--config", configPath, "init", "--db", dbPath}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	repoID, err := st.UpsertRepository(ctx, store.Repository{
+		Owner: "openclaw", Name: "openclaw", FullName: "openclaw/openclaw", RawJSON: "{}", UpdatedAt: "2026-07-12T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("repository: %v", err)
+	}
+	if _, err := st.UpsertThread(ctx, store.Thread{
+		RepoID: repoID, GitHubID: "1", Number: 1, Kind: "issue", State: "open",
+		Title: "missing vector", Body: "body",
+		HTMLURL:    "https://github.com/openclaw/openclaw/issues/1",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: "{}", ContentHash: "thread", UpdatedAt: "2026-07-12T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("thread: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	for _, args := range [][]string{
+		{"--config", configPath, "cluster", "openclaw/openclaw", "--strict-vectors", "--json"},
+		{"--config", configPath, "refresh", "openclaw/openclaw", "--no-sync", "--no-embed", "--strict-vectors", "--json"},
+	} {
+		err := New().Run(ctx, args)
+		if err == nil || !strings.Contains(err.Error(), "no fresh vectors are available") {
+			t.Fatalf("%v error = %v", args, err)
+		}
+	}
+	st, err = store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st.Close()
+	var runs int
+	if err := st.DB().QueryRowContext(ctx, `select count(*) from cluster_runs`).Scan(&runs); err != nil {
+		t.Fatalf("cluster runs: %v", err)
+	}
+	if runs != 0 {
+		t.Fatalf("cluster runs = %d, want no mutation", runs)
 	}
 }
 
@@ -4299,12 +8430,12 @@ func TestCompleteClusterVectorCoverageRequiresFreshVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list vectors: %v", err)
 	}
-	complete, err := completeClusterVectorCoverage(ctx, st, query, vectors)
+	coverage, fresh, err := evaluateClusterVectorCoverage(ctx, st, query, vectors)
 	if err != nil {
 		t.Fatalf("stale older coverage: %v", err)
 	}
-	if complete {
-		t.Fatal("stale older vector should not complete cluster coverage")
+	if coverage.Complete || coverage.Stale != 1 || len(fresh) != 1 {
+		t.Fatalf("stale older coverage = %+v fresh=%d", coverage, len(fresh))
 	}
 
 	if err := st.UpsertThreadVector(ctx, store.ThreadVector{
@@ -4317,12 +8448,12 @@ func TestCompleteClusterVectorCoverageRequiresFreshVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list fresh vectors: %v", err)
 	}
-	complete, err = completeClusterVectorCoverage(ctx, st, query, vectors)
+	coverage, fresh, err = evaluateClusterVectorCoverage(ctx, st, query, vectors)
 	if err != nil {
 		t.Fatalf("fresh complete coverage: %v", err)
 	}
-	if !complete {
-		t.Fatal("fresh vectors should complete cluster coverage")
+	if !coverage.Complete || coverage.Fresh != 2 || len(fresh) != 2 {
+		t.Fatalf("fresh complete coverage = %+v fresh=%d", coverage, len(fresh))
 	}
 
 	firstThread.Body = "changed body"
@@ -4331,16 +8462,16 @@ func TestCompleteClusterVectorCoverageRequiresFreshVectors(t *testing.T) {
 	if _, err := st.UpsertThread(ctx, firstThread); err != nil {
 		t.Fatalf("update thread: %v", err)
 	}
-	complete, err = completeClusterVectorCoverage(ctx, st, query, vectors)
+	coverage, fresh, err = evaluateClusterVectorCoverage(ctx, st, query, vectors)
 	if err != nil {
 		t.Fatalf("stale complete coverage: %v", err)
 	}
-	if complete {
-		t.Fatal("stale vector should not complete cluster coverage")
+	if coverage.Complete || coverage.Stale != 1 || len(fresh) != 1 {
+		t.Fatalf("stale updated coverage = %+v fresh=%d", coverage, len(fresh))
 	}
 }
 
-func TestCompleteClusterVectorCoverageAllowsUnembeddableSummaryThreads(t *testing.T) {
+func TestClusterVectorCoverageRejectsMissingSummaryInputs(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
 	if err != nil {
@@ -4362,18 +8493,24 @@ func TestCompleteClusterVectorCoverageAllowsUnembeddableSummaryThreads(t *testin
 	if err != nil {
 		t.Fatalf("seed first thread: %v", err)
 	}
-	if _, err := st.UpsertThread(ctx, store.Thread{
+	secondID, err := st.UpsertThread(ctx, store.Thread{
 		RepoID: repoID, GitHubID: "512", Number: 512, Kind: "issue", State: "open",
 		Title: "No key summary", Body: "body",
 		HTMLURL: "https://github.com/openclaw/openclaw/issues/512", LabelsJSON: "[]", AssigneesJSON: "[]",
 		RawJSON: "{}", ContentHash: "hash-512", UpdatedAt: now,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("seed second thread: %v", err)
 	}
 	if _, err := st.DB().ExecContext(ctx, `
-		insert into thread_revisions(thread_id, source_updated_at, content_hash, title_hash, body_hash, labels_hash, created_at)
-		values(?, ?, 'content', 'title', 'body', 'labels', ?)
-	`, firstID, now, now); err != nil {
+		insert into thread_revisions(
+			thread_id, source_updated_at, observation_sequence,
+			content_hash, title_hash, body_hash, labels_hash, created_at
+		)
+		select id, ?, observation_sequence, 'content', 'title', 'body', 'labels', ?
+		from threads
+		where id = ?
+	`, now, now, firstID); err != nil {
 		t.Fatalf("seed revision: %v", err)
 	}
 	var revisionID int64
@@ -4401,16 +8538,78 @@ func TestCompleteClusterVectorCoverageAllowsUnembeddableSummaryThreads(t *testin
 	}); err != nil {
 		t.Fatalf("upsert summary vector: %v", err)
 	}
+	if err := st.UpsertThreadVector(ctx, store.ThreadVector{
+		ThreadID: secondID, Basis: query.Basis, Model: query.Model, Dimensions: 2,
+		ContentHash: "stale-summary-vector", Vector: []float64{0, 1}, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("upsert stale summary vector: %v", err)
+	}
 	vectors, err := st.ListThreadVectorsFiltered(ctx, query)
 	if err != nil {
 		t.Fatalf("list vectors: %v", err)
 	}
-	complete, err := completeClusterVectorCoverage(ctx, st, query, vectors)
+	coverage, fresh, err := evaluateClusterVectorCoverage(ctx, st, query, vectors)
 	if err != nil {
 		t.Fatalf("summary coverage: %v", err)
 	}
-	if !complete {
-		t.Fatal("unembeddable summary thread should not block complete cluster coverage")
+	if coverage.Complete || coverage.Eligible != 2 || coverage.Fresh != 1 || coverage.Missing != 0 || coverage.MissingInput != 1 || coverage.Stale != 1 || len(fresh) != 1 {
+		t.Fatalf("summary coverage = %+v fresh=%d", coverage, len(fresh))
+	}
+	err = clusterVectorCoverageError("openclaw", "openclaw", query, coverage, "vector coverage is incomplete")
+	if !strings.Contains(err.Error(), "populate missing key summaries") || !strings.Contains(err.Error(), "missing_input=1") {
+		t.Fatalf("summary recovery error = %v", err)
+	}
+}
+
+func TestClusterFallbackDropsStaleSupportedVectorsBeforeDeduplication(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	now := "2026-07-12T03:00:00Z"
+	repoID, err := st.UpsertRepository(ctx, store.Repository{
+		Owner: "openclaw", Name: "gitcrawl", FullName: "openclaw/gitcrawl", RawJSON: "{}", UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("seed repository: %v", err)
+	}
+	threadID, err := st.UpsertThread(ctx, store.Thread{
+		RepoID: repoID, GitHubID: "520", Number: 520, Kind: "issue", State: "open",
+		Title: "Fresh fallback vector", Body: "body",
+		HTMLURL:    "https://github.com/openclaw/gitcrawl/issues/520",
+		LabelsJSON: "[]", AssigneesJSON: "[]", RawJSON: "{}", ContentHash: "thread", UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("seed thread: %v", err)
+	}
+	tasks, err := st.ListEmbeddingTasks(ctx, store.EmbeddingTaskOptions{
+		RepoID: repoID, Basis: "title_original", Model: "legacy-model", Force: true,
+	})
+	if err != nil {
+		t.Fatalf("list embedding tasks: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("embedding tasks = %+v", tasks)
+	}
+	vectors := []store.ThreadVector{
+		{
+			ThreadID: threadID, Basis: "title_original", Model: "configured-model", Dimensions: 2,
+			ContentHash: "stale", Vector: []float64{1, 0}, CreatedAt: now, UpdatedAt: "2026-07-12T03:02:00Z",
+		},
+		{
+			ThreadID: threadID, Basis: "title_original", Model: "legacy-model", Dimensions: 2,
+			ContentHash: tasks[0].ContentHash, Vector: []float64{0, 1}, CreatedAt: now, UpdatedAt: "2026-07-12T03:01:00Z",
+		},
+	}
+	fresh, err := freshFallbackClusterVectors(ctx, st, store.ThreadVectorQuery{RepoID: repoID}, vectors)
+	if err != nil {
+		t.Fatalf("fresh fallback vectors: %v", err)
+	}
+	if len(fresh) != 1 || fresh[0].Model != "legacy-model" || fresh[0].ContentHash != tasks[0].ContentHash {
+		t.Fatalf("fresh fallback vectors = %+v", fresh)
 	}
 }
 
@@ -4473,6 +8672,9 @@ func TestClusterCommandAllowsExplicitUnsupportedBasisWithoutRetirement(t *testin
 	}
 	if !strings.Contains(stdout.String(), `"cluster_count": 1`) {
 		t.Fatalf("configured cluster output = %q", stdout.String())
+	}
+	if err := configured.Run(ctx, []string{"--config", configPath, "cluster", "openclaw/openclaw", "--strict-vectors", "--json"}); err == nil || !strings.Contains(err.Error(), "vector coverage cannot be verified") {
+		t.Fatalf("strict custom basis error = %v", err)
 	}
 }
 
@@ -4760,6 +8962,95 @@ func TestBuildDurableClusterInputsIgnoresCrossRepoQualifiedReferences(t *testing
 	}
 	if edgeCount != 0 || len(inputs) != 0 {
 		t.Fatalf("cross-repo qualified refs should not form evidence edges, edges=%d inputs=%#v", edgeCount, inputs)
+	}
+}
+
+func TestBuildDurableClusterInputsScopesURLReferencesToRepository(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		body      string
+		wantEdges int
+	}{
+		{name: "cross-repo pull URL", body: "Bumps fast-uri from 3.0.5 to 3.0.6, see https://redirect.github.com/fastify/fast-uri/pull/901 for the upstream change.", wantEdges: 0},
+		{name: "cross-repo issues URL", body: "Upstream breakage is tracked in https://github.com/fastify/fast-uri/issues/901 before this bump.", wantEdges: 0},
+		{name: "same-repo issues URL", body: "Fixes https://github.com/openclaw/openclaw/issues/901 by preserving the device-token scope during upgrade.", wantEdges: 1},
+		{name: "same-repo pull URL", body: "Supersedes https://github.com/openclaw/openclaw/pull/901 by preserving the device-token scope during upgrade.", wantEdges: 1},
+		{name: "same-repo qualified ref", body: "Fixes openclaw/openclaw#901 by preserving the device-token scope during upgrade.", wantEdges: 1},
+		{name: "same-repo bare ref", body: "Fixes #901 by preserving the device-token scope during upgrade.", wantEdges: 1},
+		{name: "unqualified issues path", body: "Fixes issues/901 by preserving the device-token scope during upgrade.", wantEdges: 1},
+		{name: "unqualified pull path", body: "Supersedes pull/901 by preserving the device-token scope during upgrade.", wantEdges: 1},
+		{name: "unqualified rooted issues path", body: "Fixes /issues/901 by preserving the device-token scope during upgrade.", wantEdges: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			st, err := store.Open(ctx, filepath.Join(t.TempDir(), "gitcrawl.db"))
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			defer st.Close()
+			repoID, err := st.UpsertRepository(ctx, store.Repository{
+				Owner:     "openclaw",
+				Name:      "openclaw",
+				FullName:  "openclaw/openclaw",
+				RawJSON:   "{}",
+				UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			})
+			if err != nil {
+				t.Fatalf("seed repository: %v", err)
+			}
+			issueID, err := st.UpsertThread(ctx, store.Thread{
+				RepoID:        repoID,
+				GitHubID:      "901",
+				Number:        901,
+				Kind:          "issue",
+				State:         "open",
+				Title:         "Gateway token regression",
+				Body:          "Users cannot authorize device tokens.",
+				HTMLURL:       "https://github.com/openclaw/openclaw/issues/901",
+				LabelsJSON:    "[]",
+				AssigneesJSON: "[]",
+				RawJSON:       "{}",
+				ContentHash:   "hash-901",
+				UpdatedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+			})
+			if err != nil {
+				t.Fatalf("seed issue: %v", err)
+			}
+			prID, err := st.UpsertThread(ctx, store.Thread{
+				RepoID:        repoID,
+				GitHubID:      "902",
+				Number:        902,
+				Kind:          "pull_request",
+				State:         "open",
+				Title:         "Repair auth scope migration",
+				Body:          tc.body,
+				HTMLURL:       "https://github.com/openclaw/openclaw/pull/902",
+				LabelsJSON:    "[]",
+				AssigneesJSON: "[]",
+				RawJSON:       "{}",
+				ContentHash:   "hash-902",
+				UpdatedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+			})
+			if err != nil {
+				t.Fatalf("seed pull request: %v", err)
+			}
+			inputs, edgeCount, err := buildDurableClusterInputs(ctx, st, repoID, []store.ThreadVector{
+				{ThreadID: issueID, Vector: []float64{1, 0}},
+				{ThreadID: prID, Vector: []float64{0, 1}},
+			}, clusterBuildOptions{
+				Threshold:          0.99,
+				MinSize:            2,
+				MaxClusterSize:     defaultClusterMaxSize,
+				Fanout:             16,
+				CrossKindThreshold: 0.99,
+			})
+			if err != nil {
+				t.Fatalf("build inputs: %v", err)
+			}
+			if edgeCount != tc.wantEdges || len(inputs) != tc.wantEdges {
+				t.Fatalf("edges=%d inputs=%#v, want %d evidence edges", edgeCount, inputs, tc.wantEdges)
+			}
+		})
 	}
 }
 
@@ -5102,6 +9393,13 @@ func TestRefreshEmbedsAndClustersWithoutSync(t *testing.T) {
 	}
 	if !strings.Contains(out, `"cluster_count": 2`) {
 		t.Fatalf("refresh did not persist cluster: %q", out)
+	}
+	var target dbTargetInfo
+	if err := json.Unmarshal(stdout.Bytes(), &target); err != nil {
+		t.Fatalf("decode refresh db target: %v", err)
+	}
+	if target.DBTarget != "direct" || target.DBTargetPath != dbPath {
+		t.Fatalf("no-sync refresh db target = %+v", target)
 	}
 
 	st, err = store.Open(ctx, dbPath)

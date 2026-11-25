@@ -22,6 +22,7 @@ actions, detail rendering, and status chrome wherever the data model allows it.
 
 ```bash
 gitcrawl tui owner/repo
+gitcrawl --no-color tui owner/repo # disable terminal colors
 gitcrawl tui                      # infers the most recently updated local repo
 gitcrawl tui --min-size 5         # default; show clusters with ≥5 active members
 gitcrawl tui --sort recent        # alternate sort
@@ -63,6 +64,9 @@ The view auto-refreshes from the local store every 15 seconds. There is no GitHu
 | `q` | Quit |
 
 The action menu opened with `a` mirrors the right-click menu, so every mouse action has a keyboard equivalent.
+
+Neighbor loading can use the saved embedding of a selected closed thread as
+well as an open thread. Results contain open, locally active neighbors.
 
 Jump input accepts the same thread references as the CLI: bare numbers, `#123`,
 `issues/123`, `pull/123`, `owner/repo#123`, and full GitHub issue or pull

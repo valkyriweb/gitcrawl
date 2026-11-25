@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	crawlremote "github.com/openclaw/crawlkit/remote"
+	"github.com/openclaw/gitcrawl/internal/config"
 )
 
 func TestRemoteResultHelpersMapRowsAndCoerceTypes(t *testing.T) {
@@ -79,7 +81,13 @@ func TestPollRemoteLoginStates(t *testing.T) {
 			t.Fatalf("poll login: %v", err)
 		}
 		if result.Token != "session-token" || polls != 2 {
-			t.Fatalf("result=%#v polls=%d", result, polls)
+			t.Fatalf(
+				"poll result mismatch: status=%q token_present=%t token_length=%d polls=%d",
+				result.Status,
+				result.Token != "",
+				len(result.Token),
+				polls,
+			)
 		}
 	})
 
@@ -152,10 +160,154 @@ func TestSendIngestRowsBatchesAndFinalizes(t *testing.T) {
 		t.Fatalf("requests len = %d", len(requests))
 	}
 	if requests[0].Cursor != "" || requests[0].Final || len(requests[0].Rows) != gitcrawlCloudBatchSize {
-		t.Fatalf("first request = %#v", requests[0])
+		t.Fatalf("first request mismatch: cursor=%q final=%t rows=%d", requests[0].Cursor, requests[0].Final, len(requests[0].Rows))
 	}
 	if requests[1].Cursor != "250" || !requests[1].Final || len(requests[1].Rows) != 1 {
-		t.Fatalf("second request = %#v", requests[1])
+		t.Fatalf("second request mismatch: cursor=%q final=%t rows=%d", requests[1].Cursor, requests[1].Final, len(requests[1].Rows))
+	}
+}
+
+func TestSendSnapshotIngestRowsRotatesMutationTokens(t *testing.T) {
+	ctx := context.Background()
+	var requests []crawlremote.IngestRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body crawlremote.IngestRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		requests = append(requests, body)
+		token := fmt.Sprintf("generation-%d", len(requests))
+		_ = json.NewEncoder(w).Encode(crawlremote.IngestResult{
+			SnapshotID:    body.Manifest.SnapshotID,
+			MutationToken: token,
+			RowsAccepted:  int64(len(body.Rows)),
+			Complete:      body.Final,
+		})
+	}))
+	defer server.Close()
+
+	client, err := crawlremote.NewClientFromConfig(crawlremote.Config{Endpoint: server.URL}, crawlremote.Options{
+		TokenProvider: crawlremote.StaticToken("publish-token"),
+	})
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	rows := make([][]any, gitcrawlCloudBatchSize+1)
+	for i := range rows {
+		rows[i] = []any{i}
+	}
+	progress, err := sendSnapshotIngestRows(
+		ctx,
+		client,
+		"gitcrawl",
+		"gitcrawl/openclaw",
+		crawlremote.IngestManifest{App: "gitcrawl", SnapshotID: strings.Repeat("a", 64)},
+		"threads",
+		[]string{"id"},
+		rows,
+		"previous-dataset",
+		true,
+	)
+	if err != nil {
+		t.Fatalf("send snapshot ingest: %v", err)
+	}
+	if progress.RowsAccepted != int64(len(rows)) || progress.MutationToken != "generation-2" {
+		t.Fatalf("progress mismatch: rows_accepted=%d mutation_token_present=%t mutation_token_length=%d", progress.RowsAccepted, progress.MutationToken != "", len(progress.MutationToken))
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests length = %d, want 2", len(requests))
+	}
+	if requests[0].Cursor != "" || requests[0].MutationToken != "previous-dataset" {
+		t.Fatalf("first request mismatch: cursor=%q mutation_token_present=%t mutation_token_length=%d", requests[0].Cursor, requests[0].MutationToken != "", len(requests[0].MutationToken))
+	}
+	if requests[1].Cursor != "250" || requests[1].MutationToken != "generation-1" || !requests[1].Final {
+		t.Fatalf("second request mismatch: cursor=%q final=%t mutation_token_present=%t mutation_token_length=%d", requests[1].Cursor, requests[1].Final, requests[1].MutationToken != "", len(requests[1].MutationToken))
+	}
+}
+
+func TestSendIngestRowsDrainsRemoteResetBeforeRetry(t *testing.T) {
+	ctx := context.Background()
+	var requests []crawlremote.IngestRequest
+	var drainRequests []crawlremote.IngestRequest
+	resetCalls := 0
+	rejectedFirstBatch := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.EscapedPath() != "/v1/apps/gitcrawl/archives/gitcrawl%2Fopenclaw/ingest" {
+			http.NotFound(w, r)
+			return
+		}
+		var body crawlremote.IngestRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("content-type", "application/json")
+		if len(body.Rows) == 0 {
+			drainRequests = append(drainRequests, body)
+			resetCalls++
+			_ = json.NewEncoder(w).Encode(crawlremote.IngestResult{
+				MutationToken:   body.MutationToken,
+				ResetIncomplete: resetCalls == 1,
+				ResetDeleted:    10000,
+			})
+			return
+		}
+		if body.Cursor == "" && !rejectedFirstBatch {
+			rejectedFirstBatch = true
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error":   "reset_incomplete",
+				"message": "archive table reset is still in progress",
+			})
+			return
+		}
+		requests = append(requests, body)
+		_ = json.NewEncoder(w).Encode(crawlremote.IngestResult{
+			MutationToken: body.MutationToken,
+			RowsAccepted:  int64(len(body.Rows)),
+			Complete:      body.Final,
+		})
+	}))
+	defer server.Close()
+
+	client, err := crawlremote.NewClientFromConfig(crawlremote.Config{Endpoint: server.URL}, crawlremote.Options{
+		TokenProvider: crawlremote.StaticToken("publish-token"),
+	})
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	progress, err := sendSnapshotIngestRows(
+		ctx,
+		client,
+		"gitcrawl",
+		"gitcrawl/openclaw",
+		crawlremote.IngestManifest{App: "gitcrawl"},
+		"threads",
+		[]string{"id"},
+		[][]any{{1}},
+		"generation-current",
+		true,
+	)
+	if err != nil {
+		t.Fatalf("send ingest: %v", err)
+	}
+	if progress.RowsAccepted != 1 || progress.MutationToken != "generation-current" {
+		t.Fatalf("progress mismatch: rows_accepted=%d mutation_token_present=%t mutation_token_length=%d", progress.RowsAccepted, progress.MutationToken != "", len(progress.MutationToken))
+	}
+	if resetCalls != 2 {
+		t.Fatalf("resetCalls = %d", resetCalls)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("data requests length = %d, want 1", len(requests))
+	}
+	if requests[0].Cursor != "" || !requests[0].Final {
+		t.Fatalf("data request mismatch: cursor=%q final=%t", requests[0].Cursor, requests[0].Final)
+	}
+	for index, request := range drainRequests {
+		if request.MutationToken != "generation-current" {
+			t.Fatalf("drain request %d mutation token mismatch: present=%t length=%d", index, request.MutationToken != "", len(request.MutationToken))
+		}
 	}
 }
 
@@ -172,5 +324,23 @@ func TestRemoteAndCloudCommandDispatchErrors(t *testing.T) {
 	}
 	if err := app.runCloud(context.Background(), []string{"unknown"}); err == nil || !strings.Contains(err.Error(), "unknown cloud subcommand") {
 		t.Fatalf("cloud unknown err = %v", err)
+	}
+}
+
+func TestRemoteClientRejectsBearerAuthOverRemoteHTTP(t *testing.T) {
+	const tokenEnv = "GITCRAWL_TEST_REMOTE_HTTP_TOKEN"
+	t.Setenv(tokenEnv, "test-token")
+
+	cfg := config.Default()
+	cfg.Remote = crawlremote.Config{
+		Mode:     crawlremote.ModeCloud,
+		Endpoint: "http://remote.example.test",
+		Archive:  "gitcrawl/example",
+		TokenEnv: tokenEnv,
+	}
+
+	_, err := New().remoteClient(cfg)
+	if err == nil || !strings.Contains(err.Error(), "cannot use bearer auth over http") {
+		t.Fatalf("remoteClient error = %v", err)
 	}
 }

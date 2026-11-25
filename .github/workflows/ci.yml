@@ -18,19 +18,22 @@ jobs:
   test:
     name: Go / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest
-          - macos-15
+          - xcode-27
 
     steps:
       - name: Check out
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -39,11 +42,13 @@ jobs:
         run: go mod download
 
       - name: Check module tidiness
+        if: ${{ matrix.os == 'ubuntu-latest' }}
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
       - name: Check formatting
+        if: ${{ matrix.os == 'ubuntu-latest' }}
         run: |
           unformatted="$(gofmt -l .)"
           if [ -n "$unformatted" ]; then
@@ -54,10 +59,13 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Vulnerability scan
+        run: GOWORK=off go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
       - name: Deadcode
         run: |
           output_file=$(mktemp)
-          go run golang.org/x/tools/cmd/deadcode@v0.45.0 -test ./... > "$output_file"
+          go run golang.org/x/tools/cmd/deadcode@v0.52.0 -test ./... > "$output_file"
           if [ -s "$output_file" ]; then
             cat "$output_file"
             exit 1
@@ -70,8 +78,19 @@ jobs:
           echo "total coverage: ${total}%"
           awk -v total="$total" 'BEGIN { if (total + 0 < 85.0) { printf("coverage %.1f%% is below 85.0%%\n", total); exit 1 } }'
 
+      - name: Test portable SIMD and scalar fallback
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          # Release binaries are built with this experiment, so test everything they ship.
+          GOEXPERIMENT=simd go test ./...
+          GOEXPERIMENT=simd GODEBUG=simd=0 go test ./internal/vector ./internal/cli
+
       - name: Build
         run: go build -ldflags "-X github.com/openclaw/gitcrawl/internal/cli.version=${GITHUB_SHA:0:7}" -o bin/gitcrawl ./cmd/gitcrawl
+
+      - name: Verify macOS deployment target
+        if: runner.os == 'macOS'
+        run: ./scripts/check-macos-minimum.sh bin/gitcrawl
 
       - name: Smoke test TUI help
         run: |
@@ -83,9 +102,41 @@ jobs:
           printf '%s\n' "$output"
           printf '%s' "$output" | grep -q "gitcrawl tui"
 
+      - name: Test release scripts
+        run: ./scripts/test-release.sh
+
       - name: Snapshot release build
-        uses: goreleaser/goreleaser-action@v7.2.2
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: "v2.18.2"
           args: release --snapshot --clean --skip=publish
+
+  portable-windows:
+    name: Portable filesystem / windows
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Test exclusive publication and long paths
+        run: go test ./internal/cli -run '^TestPortableExclusiveRename' -count=1
+      - name: Build and smoke test CLI
+        run: |
+          go build -o gitcrawl.exe ./cmd/gitcrawl
+          ./gitcrawl.exe --version
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Build documentation and validate links
+        run: make docs

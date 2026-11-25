@@ -15,6 +15,7 @@ func TestSharedRateLimitStateRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
+	t.Setenv("GITHUB_TOKEN", "")
 	cfg := config.Default()
 	cfg.CacheDir = filepath.Join(dir, "cache")
 	cfg.Env = map[string]string{"GITHUB_TOKEN": "gh-token"}
@@ -60,8 +61,8 @@ func TestSharedRateLimitStateRoundTrip(t *testing.T) {
 	if state, ok := app.sharedRateLimitLow(ctx); !ok || state.Remaining != 5 {
 		t.Fatalf("shared low = %#v ok=%v", state, ok)
 	}
-	observer := app.observeGitHubRateLimit(ctx, "gh-token")
-	observer(gh.RateLimitSnapshot{Host: "github.com", Limit: 5000, Remaining: 6, ResetAt: resetAt, Resource: "core"})
+	observer := app.observeGitHubRateLimit(ctx)
+	observer("gh-token", gh.RateLimitSnapshot{Host: "github.com", Limit: 5000, Remaining: 6, ResetAt: resetAt, Resource: "core"})
 	if state, ok := app.sharedRateLimitStateForTokenHost("gh-token", "github.com"); !ok || state.Remaining != 6 {
 		t.Fatalf("observed state = %#v ok=%v", state, ok)
 	}

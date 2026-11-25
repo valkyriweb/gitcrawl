@@ -11,21 +11,38 @@ builds:
     binary: gitcrawl
     env:
       - CGO_ENABLED=0
+      - GOEXPERIMENT=simd
+    ldflags:
+      - -s -w -X github.com/openclaw/gitcrawl/internal/cli.version={{ .Version }}
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - windows_amd64
+      - windows_arm64
+  - id: gitcrawl_darwin
+    main: ./cmd/gitcrawl
+    binary: gitcrawl
+    hooks:
+      post: ./scripts/check-macos-minimum.sh "{{ .Path }}" "{{ .IsSnapshot }}"
+    env:
+      - CGO_ENABLED=0
+      - GOEXPERIMENT=simd
+      - MACOSX_DEPLOYMENT_TARGET=13.0
     ldflags:
       - -s -w -X github.com/openclaw/gitcrawl/internal/cli.version={{ .Version }}
     targets:
       - darwin_amd64
       - darwin_arm64
-      - linux_amd64
-      - linux_arm64
-      - windows_amd64
-      - windows_arm64
-
 archives:
   - ids:
       - gitcrawl
+      - gitcrawl_darwin
     formats:
       - tar.gz
+    files:
+      - CHANGELOG.md
+      - LICENSE
+      - README.md
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows

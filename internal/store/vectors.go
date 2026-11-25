@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"strings"
+	"time"
 	"unicode"
 )
 
@@ -30,6 +30,15 @@ type ThreadVectorQuery struct {
 	Basis         string
 	Dimensions    int
 	IncludeClosed bool
+	// OpenAt keeps rows created at or before the time and not closed by then.
+	OpenAt time.Time
+	// CreatedAfter keeps rows created after the time.
+	CreatedAfter time.Time
+	// CreatedAfterNumber keeps rows numbered above it. GitHub numbers issues
+	// and pull requests in creation order, so no clock is involved.
+	CreatedAfterNumber int
+	// MergedAfter keeps pull requests merged after the time.
+	MergedAfter time.Time
 }
 
 func (s *Store) UpsertThreadVector(ctx context.Context, vector ThreadVector) error {
@@ -96,6 +105,19 @@ func (s *Store) ListThreadVectorsFiltered(ctx context.Context, query ThreadVecto
 	return out, nil
 }
 
+func (s *Store) CountThreadVectorScope(ctx context.Context, query ThreadVectorQuery) (int, error) {
+	where := `repo_id = ?`
+	args := []any{query.RepoID}
+	if !query.IncludeClosed {
+		where += ` and state = 'open' and closed_at_local is null`
+	}
+	var count int
+	if err := s.q().QueryRowContext(ctx, `select count(*) from threads where `+where, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count thread vector scope: %w", err)
+	}
+	return count, nil
+}
+
 func (s *Store) ThreadVectorByNumber(ctx context.Context, query ThreadVectorQuery, number int) (Thread, ThreadVector, error) {
 	if !s.hasTable(ctx, "thread_vectors") {
 		return Thread{}, ThreadVector{}, fmt.Errorf("thread #%d was not found with an embedding", number)
@@ -125,17 +147,13 @@ func (s *Store) ThreadsByIDs(ctx context.Context, repoID int64, ids []int64) (ma
 	if len(ids) == 0 {
 		return map[int64]Thread{}, nil
 	}
-	placeholders := make([]string, 0, len(ids))
-	args := []any{repoID}
-	for _, id := range ids {
-		placeholders = append(placeholders, "?")
-		args = append(args, id)
-	}
+	// Integer slices always marshal successfully; one JSON parameter avoids SQLite's bind limit.
+	idJSON, _ := json.Marshal(ids)
 	rows, err := s.db.QueryContext(ctx, `
 		select `+s.threadSelectColumns(ctx, "")+`
 		from threads
-		where repo_id = ? and id in (`+strings.Join(placeholders, ",")+`)
-	`, args...)
+		where repo_id = ? and id in (select value from json_each(?))
+	`, repoID, string(idJSON))
 	if err != nil {
 		return nil, fmt.Errorf("select threads by id: %w", err)
 	}
@@ -173,6 +191,24 @@ func threadVectorWhere(query ThreadVectorQuery) (string, []any) {
 		where += ` and tv.dimensions = ?`
 		args = append(args, query.Dimensions)
 	}
+	if !query.OpenAt.IsZero() {
+		at := query.OpenAt.UTC().Format(time.RFC3339Nano)
+		where += ` and julianday(t.created_at_gh) <= julianday(?)` +
+			` and (coalesce(t.closed_at_gh, '') = '' or julianday(t.closed_at_gh) > julianday(?))`
+		args = append(args, at, at)
+	}
+	if !query.CreatedAfter.IsZero() {
+		where += ` and julianday(t.created_at_gh) > julianday(?)`
+		args = append(args, query.CreatedAfter.UTC().Format(time.RFC3339Nano))
+	}
+	if !query.MergedAfter.IsZero() {
+		where += ` and julianday(t.merged_at_gh) > julianday(?)`
+		args = append(args, query.MergedAfter.UTC().Format(time.RFC3339Nano))
+	}
+	if query.CreatedAfterNumber > 0 {
+		where += ` and t.number > ?`
+		args = append(args, query.CreatedAfterNumber)
+	}
 	return where, args
 }
 
@@ -181,11 +217,11 @@ func scanThreadVector(row interface {
 }) (Thread, ThreadVector, error) {
 	var thread Thread
 	var vector ThreadVector
-	var body, authorLogin, authorType, rawJSON, createdAt, updatedAtGH, closedAt, mergedAt, firstPulled, lastPulled, closedLocal, closeReason sql.NullString
+	var body, authorLogin, authorType, authorAssociation, rawJSON, createdAt, updatedAtGH, closedAt, mergedAt, firstPulled, lastPulled, closedLocal, closeReason sql.NullString
 	var isDraft int
 	var raw []byte
 	if err := row.Scan(&thread.ID, &thread.RepoID, &thread.GitHubID, &thread.Number, &thread.Kind, &thread.State, &thread.Title,
-		&body, &authorLogin, &authorType, &thread.HTMLURL, &thread.LabelsJSON, &thread.AssigneesJSON, &rawJSON,
+		&body, &authorLogin, &authorType, &authorAssociation, &thread.HTMLURL, &thread.LabelsJSON, &thread.AssigneesJSON, &rawJSON,
 		&thread.ContentHash, &isDraft, &createdAt, &updatedAtGH, &closedAt, &mergedAt, &firstPulled, &lastPulled, &thread.UpdatedAt,
 		&closedLocal, &closeReason,
 		&vector.ThreadID, &vector.Basis, &vector.Model, &vector.Dimensions, &vector.ContentHash, &raw, &vector.Backend, &vector.CreatedAt, &vector.UpdatedAt); err != nil {
@@ -194,6 +230,7 @@ func scanThreadVector(row interface {
 	thread.Body = body.String
 	thread.AuthorLogin = authorLogin.String
 	thread.AuthorType = authorType.String
+	thread.AuthorAssociation = authorAssociation.String
 	thread.CreatedAtGitHub = createdAt.String
 	thread.UpdatedAtGitHub = updatedAtGH.String
 	thread.ClosedAtGitHub = closedAt.String

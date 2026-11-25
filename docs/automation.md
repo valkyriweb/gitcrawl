@@ -18,7 +18,7 @@ Stable JSON contracts, agent recipes, and patterns for keeping the local mirror 
 Every command supports `--json` (or the global `--format json`). The resulting payload is pretty-printed with stable field names so you can pipe it directly into `jq` or feed it to an agent as structured context.
 
 ```bash
-gitcrawl sync owner/repo --json | jq '{run_id, inserted, updated}'
+gitcrawl sync owner/repo --json | jq '{threads_synced, comments_synced, finished_at}'
 gitcrawl clusters owner/repo --json --sort size --min-size 5 \
   | jq '.clusters[] | {id, members: .member_count, latest: .latest_thread_number}'
 ```
@@ -59,6 +59,26 @@ Run `gitcrawl refresh owner/repo` on a cron, systemd timer, or `launchd` agent e
 ```
 
 For multiple repos, loop in a small shell script — gitcrawl is happy to run sequentially against a shared SQLite file.
+
+### Portable subscribers
+
+After one-time initialization, schedule `portable refresh`, not repeated
+`init` or `doctor`. It retains configuration and refuses unsafe checkout state:
+
+```bash
+gitcrawl --config /path/to/config.toml portable refresh \
+  --expected-remote https://github.com/example/archive-store.git \
+  --git /absolute/path/to/git --timeout 2m \
+  --min-free-bytes 2147483648 --max-growth-bytes 2147483648 \
+  --json > refresh.json 2> refresh.log
+```
+
+Treat nonzero exits as refusals requiring inspection. Do not automatically
+delete locks, temporary packs, backups or SQLite sidecars and retry. A `partial`
+result identifies an interrupted advancement, not a rollback. A
+`mirror_result` of `preserved-local` means local runtime writes remain intact.
+See [Portable stores](/portable-stores/#routine-subscriber-refresh) for the
+admission rules, sampled growth budget and exact JSON contract.
 
 ## Agent recipes
 
@@ -155,7 +175,7 @@ Run gitcrawl in CI to validate a portable store's freshness, sanity-check cluste
     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-- uses: actions/upload-artifact@v4
+- uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
   with: { name: triage, path: "*.json" }
 ```
 
