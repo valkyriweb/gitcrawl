@@ -21,9 +21,9 @@ permalink: /installation/
 gitcrawl runs on macOS 13 Ventura or newer and Linux. Windows is not actively tested.
 
 CrawlKit v0.17.0 requires Go 1.27. The module keeps Go 1.27.2 as its language
-minimum and selects the patched Go 1.27.3 toolchain for source builds; keep
+minimum and selects the patched Go 1.27.4 toolchain for source builds; keep
 `GOTOOLCHAIN=auto` (the default) to allow that download. Docker also builds with
-Go 1.27.3. This fixes the reachable crypto/x509 vulnerability GO-2026-6809.
+Go 1.27.4. This fixes reachable crypto/x509 (GO-2026-6809) and net/http vulnerabilities.
 Go 1.27 also raises the minimum macOS version for newly built binaries
 to macOS 13; the previous Go 1.26 build baseline no longer applies.
 
