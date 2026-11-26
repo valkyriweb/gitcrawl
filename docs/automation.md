@@ -80,6 +80,65 @@ result identifies an interrupted advancement, not a rollback. A
 See [Portable stores](/portable-stores/#routine-subscriber-refresh) for the
 admission rules, sampled growth budget and exact JSON contract.
 
+## One publisher, readers without GitHub credentials
+
+Use a repository-scoped portable export when readers need issue, PR, or CI
+observations but do not need a live GitHub session. The publisher owns the
+GitHub credential and writable database. Readers receive only a validated
+snapshot over a transport with its own access controls. This is not a GitHub
+proxy, a write relay, or a substitute for a live merge check.
+
+Start with one explicitly allowed public repository. Use a dedicated publisher
+runtime and a new output directory for each export. Supply GitHub authentication
+only to the publisher; do not copy its profile, database, or runtime directory
+onto the reader.
+
+```bash
+umask 077
+config=/absolute/path/to/publisher/config.toml
+generation=/absolute/path/to/new/generation
+repo=owner/repo
+
+# One-time setup; use a new directory for this pilot.
+gitcrawl --config "$config" init --runtime-dir /absolute/path/to/publisher
+
+# Select known PRs for a bounded smoke run; add --include-comments only if needed.
+gitcrawl --config "$config" sync "$repo" --numbers 123,456 --with pr-details --json &&
+gitcrawl --config "$config" portable export --profile current-state-v1 \
+  --repository "$repo" --database-name archive.db --output-dir "$generation" --json
+```
+
+Deliver only the completed export, including its manifest. Keep the previous
+verified generation until the replacement passes. Set transport permissions for
+the data, not just the publisher: repository scoping and body excerpts do not
+make private data public. For an untrusted delivery location, verify against a
+digest from a trusted publisher channel, not just the accompanying manifest.
+Never copy an active database with its WAL or SHM sidecars as a snapshot.
+
+On the reader, verify the SHA-256, run SQLite's read-only `PRAGMA quick_check`,
+and confirm the repository before using the database. For a Git-backed store,
+use [strict portable refresh](/portable-stores/#routine-subscriber-refresh) to
+validate and advance the configured mirror instead of moving files into it.
+A one-shot reader can inspect the observation without invoking GitHub:
+
+```bash
+generation=/absolute/path/to/received/generation
+sqlite3 -readonly "$generation/archive.db" <<'SQL'
+SELECT r.full_name, t.number, t.state, t.merged_at_gh, d.head_sha, d.fetched_at
+FROM threads t
+JOIN repositories r ON r.id=t.repo_id
+JOIN pull_request_details d ON d.thread_id=t.id
+WHERE r.full_name='owner/repo' AND t.number=123;
+SQL
+```
+
+A targeted export does not cover every issue or PR. An absent row is not proof
+of absence on GitHub. Use the source observation time for the requested data,
+not the artifact export time, to judge freshness. If the data is missing or too
+old for the decision, request a publisher refresh or route the decision to an
+authorized live reader. Keep writes and final PR head or CI verification on
+the live GitHub path.
+
 ## Agent recipes
 
 ### "Look up an issue without burning quota"
