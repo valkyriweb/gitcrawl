@@ -86,6 +86,7 @@ body:not(.home) .doc>h1:first-child{display:none}
 .doc code{font-family:"JetBrains Mono","SF Mono",ui-monospace,monospace;font-size:.84em;background:var(--line-soft);border:1px solid var(--line);border-radius:5px;padding:.08em .35em;color:var(--ink)}
 .doc pre{position:relative;overflow:auto;background:var(--code-bg);color:var(--code-fg);border-radius:8px;padding:14px 18px;margin:1.3em 0;font-size:.85em;line-height:1.6;scrollbar-width:thin;scrollbar-color:var(--code-scroll) transparent;border:1px solid var(--code-border)}
 .doc pre::-webkit-scrollbar{height:8px;width:8px}
+.doc [data-markdown="code-header"]{display:none}
 .doc pre::-webkit-scrollbar-thumb{background:var(--code-scroll);border-radius:8px}
 .doc pre code{display:block;background:transparent;border:0;color:inherit;padding:0;font-size:1em;white-space:pre}
 .doc pre .hl-comment{color:var(--hl-comment);font-style:italic}
