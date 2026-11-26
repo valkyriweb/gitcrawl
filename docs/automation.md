@@ -122,6 +122,7 @@ validate and advance the configured mirror instead of moving files into it.
 A one-shot reader can inspect the observation without invoking GitHub:
 
 ```bash
+generation=/absolute/path/to/received/generation
 sqlite3 -readonly "$generation/archive.db" <<'SQL'
 SELECT r.full_name, t.number, t.state, t.merged_at_gh, d.head_sha, d.fetched_at
 FROM threads t
